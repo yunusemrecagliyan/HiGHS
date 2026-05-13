@@ -1295,6 +1295,14 @@ class Highs {
   void setGlobalSubSolverCallTime(
       HighsSubSolverCallTime* global_sub_solver_call_time = nullptr);
 
+  // Ensure sub_solver_call_time_ is initialised with this instance's timer,
+  // e.g. when used as a worker LP solver that may not have a valid external
+  // global_sub_solver_call_time_
+  void initOwnSubSolverCallTime() {
+    sub_solver_call_time_.initialise(timer_);
+    setGlobalSubSolverCallTime(&sub_solver_call_time_);
+  }
+
   // Start of advanced methods: only for internal use!
 
   // Nested methods below Highs::run()

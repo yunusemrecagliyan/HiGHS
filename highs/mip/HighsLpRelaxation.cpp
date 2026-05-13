@@ -1140,6 +1140,7 @@ void HighsLpRelaxation::setObjectiveLimit(double objlim) {
 }
 
 HighsLpRelaxation::Status HighsLpRelaxation::run(bool resolve_on_error) {
+  lpsolver.initOwnSubSolverCallTime();
   const HighsInfo& info = lpsolver.getInfo();
   const double this_time_limit =
       std::max(lpsolver.getRunTime() + mipsolver.options_mip_->time_limit -
