@@ -168,7 +168,7 @@ struct HighsSimplexInfo {
   // DSE iterations, used to detect bimodal DSE solve densities that the
   // smoothed average-based cost test cannot see
   double raw_row_DSE_density;
-  std::vector<HighsBool> costly_dse_ring_;
+  std::vector<bool> costly_dse_ring_;
   HighsInt costly_dse_in_window_;
 
   double average_log_low_DSE_weight_error;

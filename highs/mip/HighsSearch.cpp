@@ -1778,7 +1778,15 @@ bool HighsSearch::backtrackPlunge() {
     }
 
     nodelb = std::max(nodelb, localdom.getObjectiveLowerBound());
-    bool nodeToQueue = nodelb > mipworker.getOptimalityLimit();
+    // On tiny models the aggressive plunge of the redesigned search
+  // explores too much (neos-911970: 3809 nodes vs 557 with the classic
+  // queue-driven search), so every open node goes to the queue there,
+  // restoring the classic behaviour. Larger models keep the plunge
+  // (neos-1396125: plunge solves in 17.5s vs 21s with the classic
+  // search; traininstance2 benefits from the plunge as well)
+  bool nodeToQueue =
+      nodelb > mipworker.getOptimalityLimit() ||
+      mipworker.getMipSolver().numRow() < 1000;
 
     if (nodeToQueue) {
       // if (!mipsolver.submip) printf("node goes to queue\n");
