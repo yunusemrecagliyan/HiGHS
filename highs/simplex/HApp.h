@@ -204,10 +204,16 @@ inline HighsStatus solveLpSimplex(HighsLpSolverObject& solver_object) {
       // Starting from a logical basis, so consider dualizing and/or
       // permuting the LP
       if (options.simplex_dualize_strategy == kHighsOptionChoose ||
-          options.simplex_dualize_strategy == kHighsOptionOn) {
+          options.simplex_dualize_strategy == kHighsOptionOn ||
+          // For standalone LP solves (not MIP relaxation solves), the
+          // default behaviour is to apply the dualize heuristic: solving
+          // the dual of a sufficiently overdetermined LP can be much
+          // faster (smaller working basis), as for supportcase10
+          (!options.mip_lp_relaxation &&
+           options.simplex_dualize_strategy == kHighsOptionOff)) {
         // Dualize unless we choose not to
         bool dualize_lp = true;
-        if (options.simplex_dualize_strategy == kHighsOptionChoose) {
+        if (options.simplex_dualize_strategy != kHighsOptionOn) {
           if (incumbent_lp.num_row_ < 10 * incumbent_lp.num_col_)
             dualize_lp = false;
         }

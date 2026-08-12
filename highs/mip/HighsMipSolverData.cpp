@@ -69,6 +69,7 @@ HighsMipSolverData::HighsMipSolverData(HighsMipSolver& mipsolver)
       sb_lp_iterations_before_run(0),
       num_disp_lines(0),
       numImprovingSols(0),
+      num_consecutive_failed_submips(0),
       lower_bound(-kHighsInf),
       upper_bound(kHighsInf),
       upper_limit(kHighsInf),
@@ -2136,7 +2137,10 @@ restart:
   if (mipsolver.options_mip_->mip_allow_restart &&
       mipsolver.options_mip_->presolve != kHighsOffString) {
     double fixingRate = percentageInactiveIntegers();
-    if (fixingRate >= 10.0) {
+    if (fixingRate >= 10.0 &&
+        (lastRestartInactive < 0 ||
+         10 * fixingRate < 9.5 * lastRestartInactive)) {
+      lastRestartInactive = fixingRate;
       tg.cancel();
       highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
                    "\n%.1f%% inactive integer columns, restarting\n",
@@ -2501,8 +2505,11 @@ restart:
         profiling->stop(kMipClockFinishAnalyticCentreComputation);
       }
       double fixingRate = percentageInactiveIntegers();
-      if (fixingRate >= 2.5 + 7.5 * mipsolver.submip ||
-          (!mipsolver.submip && fixingRate > 0 && numRestarts == 0)) {
+      if ((fixingRate >= 2.5 + 7.5 * mipsolver.submip ||
+           (!mipsolver.submip && fixingRate > 0 && numRestarts == 0)) &&
+          (lastRestartInactive < 0 ||
+           10 * fixingRate < 9.5 * lastRestartInactive)) {
+        lastRestartInactive = fixingRate;
         tg.cancel();
         highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
                      "\n%.1f%% inactive integer columns, restarting\n",

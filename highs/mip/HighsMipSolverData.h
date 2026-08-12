@@ -95,6 +95,13 @@ struct HighsMipSolverData {
   bool detectSymmetries;
   HighsInt numRestarts;
   HighsInt numRestartsRoot;
+  // Inactive-integer percentage recorded at the last root restart; a new
+  // restart is only performed if it strictly reduces this percentage
+  // (restarts bring no progress otherwise)
+  // Analysis of the first root LP solution: variables that were fractional in
+  // it form the "active decision core" used to prioritize strong branching
+  // (kept as a record of the analysis framework; not currently referenced)
+  double lastRestartInactive = -1.0;
   HighsInt numCliqueEntriesAfterPresolve;
   HighsInt numCliqueEntriesAfterFirstPresolve;
 
@@ -149,6 +156,7 @@ struct HighsMipSolverData {
   int64_t num_disp_lines;
 
   HighsInt numImprovingSols;
+  HighsInt num_consecutive_failed_submips;
   double lower_bound;
   double upper_bound;
   double upper_limit;

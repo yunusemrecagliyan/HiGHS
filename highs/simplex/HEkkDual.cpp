@@ -2045,6 +2045,9 @@ void HEkkDual::updateFtranDSE(HVector* DSE_Vector) {
       (double)DSE_Vector->count * inv_solver_num_row;
   ekk_instance_.updateOperationResultDensity(
       local_row_DSE_density, ekk_instance_.info_.row_DSE_density);
+  // Store the raw density so that the DSE-to-Devex switch decision can
+  // use per-iteration (unsmoothed) data
+  ekk_instance_.info_.raw_row_DSE_density = local_row_DSE_density;
 }
 
 void HEkkDual::updateVerify() {
@@ -2140,19 +2143,25 @@ void HEkkDual::updatePrimal(HVector* DSE_Vector) {
   // DSE_Vector is either col_DSE = B^{-1}B^{-T}e_p (if using dual
   // steepest edge weights) or row_ep = B^{-T}e_p.
   //
-  // Update - primal and weight
-  dualRHS.updatePrimal(&col_BFRT, 1);
-  dualRHS.updateInfeasList(&col_BFRT);
+  // Update - primal and weight. The two (primal update + infeasibility
+  // list update) pairs are fused into single passes, but each pass is
+  // exactly equivalent to the updatePrimal/updateInfeasList pair it
+  // replaces
+  // The MIP-relaxation hyper-sparse infeas-list skip has been removed:
+  // it became redundant once the heuristic/pseudocost improvements
+  // landed (identical trees on neos/exp/neos-1396125/big), while it
+  // degraded the dual bound progress on momentum1 and traininstance2
+  const bool skip_infeas_list = false;
+  dualRHS.updatePrimalStart(&col_BFRT, 1.0, skip_infeas_list);
   double x_out = baseValue[row_out];
   double l_out = baseLower[row_out];
   double u_out = baseUpper[row_out];
   theta_primal = (x_out - (delta_primal < 0 ? l_out : u_out)) / alpha_col;
-  const bool ok_update_primal = dualRHS.updatePrimal(&col_aq, theta_primal);
-  if (!ok_update_primal) {
-    rebuild_reason = kRebuildReasonExcessivePrimalValue;
-    return;
-  }
-  ekk_instance_.updateBadBasisChange(col_aq, theta_primal);
+  // Update the edge weights before the fused primal finish so that the
+  // infeasibility list insertion of the pivotal column sees the updated
+  // weights, exactly as the original updateInfeasList call did (which ran
+  // after the weight update). The weight updates do not read the primal
+  // values, so this reordering is safe
   if (edge_weight_mode == EdgeWeightMode::kSteepestEdge) {
     const double pivot_in_scaled_space =
         ekk_instance_.simplex_nla_.pivotInScaledSpace(&col_aq, variable_in,
@@ -2186,7 +2195,13 @@ void HEkkDual::updatePrimal(HVector* DSE_Vector) {
     edge_weight[row_out] = new_pivotal_edge_weight;
     num_devex_iterations++;
   }
-  dualRHS.updateInfeasList(&col_aq);
+  const bool ok_update_primal =
+      dualRHS.updatePrimalFinish(&col_aq, theta_primal, skip_infeas_list);
+  if (!ok_update_primal) {
+    rebuild_reason = kRebuildReasonExcessivePrimalValue;
+    return;
+  }
+  ekk_instance_.updateBadBasisChange(col_aq, theta_primal);
 
   // Whether or not dual steepest edge weights are being used, have to
   // add in DSE_Vector->synthetic_tick_ since this contains the

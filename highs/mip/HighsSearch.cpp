@@ -7,6 +7,7 @@
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 #include "mip/HighsSearch.h"
 
+#include <algorithm>
 #include <numeric>
 #include <tuple>
 
@@ -326,6 +327,15 @@ HighsInt HighsSearch::selectBranchingCandidate(int64_t maxSbIters,
   std::vector<HighsInt> evalqueue;
   evalqueue.resize(numfrac);
   std::iota(evalqueue.begin(), evalqueue.end(), 0);
+  // Evaluate the most promising candidates first: strong branching is
+  // usually stopped by the first candidate whose child LP decides the
+  // node, so the evaluation order determines how much strong branching
+  // work is done at the node. Order by descending pseudocost score.
+  std::stable_sort(evalqueue.begin(), evalqueue.end(), [&](HighsInt a,
+                                                          HighsInt b) {
+    return pseudocost.getScore(fracints[a].first, fracints[a].second) >
+           pseudocost.getScore(fracints[b].first, fracints[b].second);
+  });
 
   auto numNodesUp = [&](HighsInt k) {
     return getNodeQueue().numNodesUp(fracints[k].first);
@@ -398,6 +408,7 @@ HighsInt HighsSearch::selectBranchingCandidate(int64_t maxSbIters,
 
     if ((upscorereliable[candidate] && downscorereliable[candidate]) ||
         mustStop) {
+      if (candidate >= 0) playground.skipRerunOnExit();
       downNodeLb = downbound[candidate];
       upNodeLb = upbound[candidate];
       return candidate;
@@ -994,6 +1005,21 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
       }
 
       if (result == NodeResult::kOpen) {
+        // If all bound changes derived from the dual/red-cost information
+        // leave the current LP solution feasible, re-solving the LP cannot
+        // change the solution: keep the fixings in the domain and skip the
+        // re-evaluation
+        auto redcostFixingsInactiveForLpSolution = [&]() {
+          const std::vector<double>& sol = lp->getSolution().col_value;
+          for (HighsInt c : localdom.getChangedCols()) {
+            double v = sol[c];
+            if (v < localdom.col_lower_[c] - getFeasTol() ||
+                v > localdom.col_upper_[c] + getFeasTol())
+              return false;
+          }
+          return true;
+        };
+
         if (lp->unscaledDualFeasible(status)) {
           currnode.lower_bound =
               std::max(currnode.lp_objective, currnode.lower_bound);
@@ -1028,7 +1054,16 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
               localdom.conflictAnalysis(
                   getConflictPool(), mipworker.getGlobalDomain(), pseudocost);
             } else if (!localdom.getChangedCols().empty()) {
-              return evaluateNode();
+              if (!mipsolver.submip && !inheuristic) {
+                if (redcostFixingsInactiveForLpSolution()) {
+                  lp->flushDomain(localdom);
+                  localdom.clearChangedCols();
+                } else {
+                  return evaluateNode();
+                }
+              } else {
+                return evaluateNode();
+              }
             }
           } else {
             if (!inheuristic) {
@@ -1051,7 +1086,16 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
                 localdom.conflictAnalysis(
                     getConflictPool(), mipworker.getGlobalDomain(), pseudocost);
               } else if (!localdom.getChangedCols().empty()) {
-                return evaluateNode();
+                if (!mipsolver.submip && !inheuristic) {
+                  if (redcostFixingsInactiveForLpSolution()) {
+                    lp->flushDomain(localdom);
+                    localdom.clearChangedCols();
+                  } else {
+                    return evaluateNode();
+                  }
+                } else {
+                  return evaluateNode();
+                }
               }
             }
           }

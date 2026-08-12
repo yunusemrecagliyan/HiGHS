@@ -120,6 +120,8 @@ class HighsPseudocost {
   HighsPseudocost() = default;
   HighsPseudocost(const HighsMipSolver& mipsolver);
 
+  HighsInt getNumCol() const { return pseudocostup.size(); }
+
   void increaseConflictWeight() {
     conflict_weight *= 1.02;
 

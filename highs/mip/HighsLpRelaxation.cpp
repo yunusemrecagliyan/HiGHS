@@ -179,6 +179,7 @@ double HighsLpRelaxation::slackUpper(HighsInt row,
 HighsLpRelaxation::HighsLpRelaxation(const HighsMipSolver& mipsolver)
     : mipsolver(mipsolver), worker_(nullptr) {
   lpsolver.setOptionValue("output_flag", false);
+  lpsolver.setOptionValue("mip_lp_relaxation", true);
   lpsolver.setOptionValue("random_seed", mipsolver.options_mip_->random_seed);
   // Set primal feasibility tolerance for LP solves according to
   // mip_feasibility_tolerance, and smaller tolerance for dual
@@ -218,6 +219,7 @@ HighsLpRelaxation::HighsLpRelaxation(const HighsLpRelaxation& other)
       adjustSymBranchingCol(other.adjustSymBranchingCol),
       worker_(nullptr) {
   lpsolver.setOptionValue("output_flag", false);
+  lpsolver.setOptionValue("mip_lp_relaxation", true);
   lpsolver.passOptions(other.lpsolver.getOptions());
   lpsolver.passModel(other.lpsolver.getLp());
   lpsolver.setBasis(other.lpsolver.getBasis());

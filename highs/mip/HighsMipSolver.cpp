@@ -690,7 +690,7 @@ restart:
 
   auto separateAndStoreBasis = [&](const HighsInt i, bool& infeasible) -> void {
     HighsMipWorker& worker = mipdata_->workers[i];
-    if (options_mip_->mip_allow_cut_separation_at_nodes) {
+    if (options_mip_->mip_allow_cut_separation_at_nodes && !submip) {
       if (!mipdata_->parallelLockActive())
         profiling_->start(kMipClockNodeSearchSeparation);
       worker.sepa_ptr_->separate(worker.search_ptr_->getLocalDomain());
@@ -775,6 +775,15 @@ restart:
         profiling_->stop(kMipClockDiveRandomizedRounding);
     }
     if (mipdata_->incumbent.empty()) {
+      if (options_mip_->mip_heuristic_run_diving) {
+        if (!mipdata_->parallelLockActive())
+          profiling_->start(kMipClockDiveRandomizedRounding);
+        mipdata_->heuristics.diving(worker);
+        if (!mipdata_->parallelLockActive())
+          profiling_->stop(kMipClockDiveRandomizedRounding);
+      }
+    }
+    if (mipdata_->incumbent.empty()) {
       if (options_mip_->mip_heuristic_run_rens) {
         if (!mipdata_->parallelLockActive())
           profiling_->start(kMipClockDiveRens);
@@ -789,6 +798,15 @@ restart:
         if (!mipdata_->parallelLockActive())
           profiling_->start(kMipClockDiveRins);
         mipdata_->heuristics.RINS(
+            worker,
+            worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+        if (!mipdata_->parallelLockActive())
+          profiling_->stop(kMipClockDiveRins);
+      }
+      if (options_mip_->mip_heuristic_run_local_branching) {
+        if (!mipdata_->parallelLockActive())
+          profiling_->start(kMipClockDiveRins);
+        mipdata_->heuristics.localBranching(
             worker,
             worker.getLpRelaxation().getLpSolver().getSolution().col_value);
         if (!mipdata_->parallelLockActive())

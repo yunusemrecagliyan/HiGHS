@@ -43,6 +43,11 @@ class HighsPrimalHeuristics {
 
   void rootReducedCost(HighsMipWorker& worker);
 
+  void diving(HighsMipWorker& worker);
+
+  void localBranching(HighsMipWorker& worker,
+                      const std::vector<double>& relaxationsol);
+
   void RENS(HighsMipWorker& worker, const std::vector<double>& relaxationsol);
 
   void RINS(HighsMipWorker& worker, const std::vector<double>& relaxationsol);

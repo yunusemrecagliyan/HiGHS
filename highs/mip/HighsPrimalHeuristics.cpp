@@ -79,6 +79,7 @@ bool HighsPrimalHeuristics::solveSubMip(
     double fixingRate, std::vector<double> colLower,
     std::vector<double> colUpper, HighsInt maxleaves, HighsInt maxnodes,
     HighsInt stallnodes) {
+  if (mipsolver.submip_level >= 2) return false;
   HighsOptions submipoptions = *mipsolver.options_mip_;
   HighsLp submip = lp;
 
@@ -168,6 +169,13 @@ bool HighsPrimalHeuristics::solveSubMip(
   // Ensure that sub-solver call time data accumulate in the sub-MIP record
   mipsolver.profiling_->setSubMip(true);
   submipsolver.run();
+  // TEMP: transfer pseudocost observations gathered in the sub-MIP back to
+  // the calling solver (more reliable pseudocosts -> less strong branching)
+  if (submipsolver.mipdata_ &&
+      submipsolver.mipdata_->getPseudoCost().getNumCol() ==
+          mipsolver.mipdata_->getPseudoCost().getNumCol())
+    mipsolver.mipdata_->getPseudoCost().flushPseudoCost(
+        submipsolver.mipdata_->getPseudoCost());
   if (mipsolver.profiling_->sub_solver_)
     printf(
         "HighsPrimalHeuristics::solveSubMip After  run() for %sMIP at depth "
@@ -241,6 +249,12 @@ bool HighsPrimalHeuristics::solveSubMip(
   if (worker.upper_limit < oldUpperLimit) {
     // remember fixing rate as good
     worker.updateHeurStatsSuccessObservations(fixingRate);
+    if (!mipsolver.submip && !mipsolver.mipdata_->parallelLockActive())
+      mipsolver.mipdata_->num_consecutive_failed_submips = 0;
+  } else if (!mipsolver.submip && !mipsolver.mipdata_->parallelLockActive()) {
+    // Track the streak of sub-MIPs that failed to improve the incumbent
+    // so that heuristic spawning can be throttled adaptively
+    ++mipsolver.mipdata_->num_consecutive_failed_submips;
   }
 
   return true;
@@ -310,6 +324,138 @@ class HeuristicNeighbourhood {
     if (fixedCols.size()) fixedCols.clear();
   }
 };
+
+void HighsPrimalHeuristics::diving(HighsMipWorker& worker) {
+  // Guided fractional diving: repeatedly solve the LP relaxation, fix the
+  // most fractional integer variable to its nearest integer and re-solve,
+  // until an integer feasible solution is found or the LP is infeasible.
+  // This classical primal heuristic (used by commercial solvers) finds
+  // feasible solutions quickly by constructing a shallow search path.
+  HighsDomain localdom = worker.getGlobalDomain();
+
+  HighsLpRelaxation lprelax(mipsolver);
+  lprelax.setMipWorker(worker);
+  lprelax.setProfiling(mipsolver.profiling_);
+  lprelax.loadModel();
+  lprelax.setIterationLimit(
+      std::max(int64_t{10000}, 2 * mipsolver.mipdata_->firstrootlpiters));
+  lprelax.getLpSolver().changeColsBounds(0, mipsolver.numCol() - 1,
+                                         localdom.col_lower_.data(),
+                                         localdom.col_upper_.data());
+  if (mipsolver.options_mip_->mip_root_presolve_only)
+    lprelax.getLpSolver().setOptionValue("presolve", kHighsOffString);
+  else if ((5 * intcols.size()) / mipsolver.numCol() >= 1)
+    lprelax.getLpSolver().setOptionValue("presolve", kHighsOnString);
+  else
+    lprelax.getLpSolver().setOptionValue("presolve", kHighsOffString);
+
+  // Dive: solve the LP, fix the most fractional integer variable to its
+  // nearest integer, re-solve, until the LP solution is integral or the
+  // LP becomes infeasible. The dive is bounded by the relaxation's
+  // iteration limit
+  const double feastol = mipsolver.mipdata_->feastol;
+  while (true) {
+    const HighsLpRelaxation::Status status = lprelax.run();
+    if (status != HighsLpRelaxation::Status::kOptimal) return;
+    const std::vector<double>& sol =
+        lprelax.getLpSolver().getSolution().col_value;
+    double best_frac = feastol;
+    HighsInt best_col = -1;
+    for (HighsInt i : intcols) {
+      if (localdom.col_lower_[i] == localdom.col_upper_[i]) continue;
+      const double val = sol[i];
+      const double frac = std::abs(val - std::floor(val + 0.5));
+      if (frac > best_frac) {
+        best_frac = frac;
+        best_col = i;
+      }
+    }
+    if (best_col == -1) {
+      // All integer variables are integral: try the resulting solution
+      trySolution(sol, kSolutionSourceHeuristic, worker);
+      return;
+    }
+    const double fixval = std::floor(sol[best_col] + 0.5);
+    localdom.fixCol(best_col, fixval, HighsDomain::Reason::branching());
+    if (localdom.infeasible()) return;
+    lprelax.getLpSolver().changeColsBounds(best_col, best_col, &fixval,
+                                           &fixval);
+  }
+}
+
+void HighsPrimalHeuristics::localBranching(
+    HighsMipWorker& worker, const std::vector<double>& lpsol) {
+  // Local branching (Fischetti & Lodi): explore a small neighbourhood
+  // around the incumbent. Binary variables in which the LP relaxation
+  // disagrees with the incumbent are candidates for a flip; all but the
+  // k most promising ones (largest disagreement) are fixed to the
+  // incumbent value and the restricted sub-MIP is solved.
+  if (worker.getGlobalDomain().infeasible()) return;
+  if (lpsol.size() != static_cast<size_t>(mipsolver.numCol())) return;
+  const auto& incumbent = mipsolver.mipdata_->incumbent;
+  if (incumbent.empty()) return;
+  if (mipsolver.submip && mipsolver.mipdata_->numImprovingSols != 0) return;
+
+  HighsDomain localdom = worker.getGlobalDomain();
+  std::vector<HighsInt> differs;
+  for (HighsInt j : intcols) {
+    if (localdom.variableType(j) != HighsVarType::kInteger) continue;
+    if (localdom.col_lower_[j] != 0.0 || localdom.col_upper_[j] != 1.0)
+      continue;
+    const double lpv = std::floor(lpsol[j] + 0.5);
+    if (std::fabs(lpv - incumbent[j]) > 0.5) differs.push_back(j);
+  }
+  if (differs.empty()) return;
+  // keep the variables with the largest disagreement free
+  std::sort(differs.begin(), differs.end(), [&](HighsInt a, HighsInt b) {
+    return std::fabs(lpsol[a] - incumbent[a]) >
+           std::fabs(lpsol[b] - incumbent[b]);
+  });
+  // allow half of the disagreeing variables to flip; fix the rest
+  const HighsInt k = std::max<HighsInt>(1, (HighsInt)(differs.size() / 2));
+
+  for (size_t i = k; i != differs.size(); ++i) {
+    const HighsInt col = differs[i];
+    localdom.fixCol(col, incumbent[col], HighsDomain::Reason::branching());
+    if (localdom.infeasible()) return;
+  }
+  localdom.propagate();
+  if (localdom.infeasible()) return;
+
+  HighsInt numTotal = 0;
+  HighsInt numFixed = 0;
+  for (HighsInt j : intcols) {
+    if (localdom.col_lower_[j] == localdom.col_upper_[j]) ++numFixed;
+    ++numTotal;
+  }
+  const double fixingrate =
+      numTotal ? static_cast<double>(numFixed) / numTotal : 1.0;
+  if (fixingrate < 0.3) return;
+
+  HighsLpRelaxation heurlp(mipsolver);
+  heurlp.setMipWorker(worker);
+  heurlp.setProfiling(mipsolver.profiling_);
+  heurlp.loadModel();
+  heurlp.setIterationLimit(
+      std::max(int64_t{10000}, 2 * mipsolver.mipdata_->firstrootlpiters));
+  heurlp.getLpSolver().changeColsBounds(
+      0, mipsolver.numCol() - 1, localdom.col_lower_.data(),
+      localdom.col_upper_.data());
+  heurlp.getLpSolver().setBasis(mipsolver.mipdata_->firstrootbasis,
+                                "HighsPrimalHeuristics::localBranching");
+  heurlp.removeObsoleteRows(false);
+  HighsInt node_reduction_factor =
+      mipsolver.mipdata_->parallelLockActive()
+          ? std::max(
+                HighsInt{1},
+                static_cast<HighsInt>(mipsolver.mipdata_->workers.size()) / 4)
+          : 1;
+  solveSubMip(worker, heurlp.getLp(), heurlp.getLpSolver().getBasis(),
+              fixingrate, localdom.col_lower_, localdom.col_upper_, 500,
+              200 + mipsolver.mipdata_->num_nodes /
+                        (node_reduction_factor * 20),
+              12);
+}
 
 void HighsPrimalHeuristics::rootReducedCost(HighsMipWorker& worker) {
   std::vector<std::pair<double, HighsDomainChange>> lurkingBounds =

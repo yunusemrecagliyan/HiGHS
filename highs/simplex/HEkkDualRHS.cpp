@@ -60,18 +60,25 @@ void HEkkDualRHS::chooseNormal(HighsInt* chIndex) {
     HighsInt randomStart = ekk_instance_.random_.integer(numRow);
     double bestMerit = 0;
     HighsInt bestIndex = -1;
+    // Iterate in L1-sized blocks so that the two scanned arrays stay in
+    // cache: the comparisons happen in exactly the same order as a plain
+    // scan, so the selection is bit-identical
+    const HighsInt kChuzrBlockSize = 4096;
     for (HighsInt section = 0; section < 2; section++) {
       const HighsInt start = (section == 0) ? randomStart : 0;
       const HighsInt end = (section == 0) ? numRow : randomStart;
-      for (HighsInt iRow = start; iRow < end; iRow++) {
-        if (work_infeasibility[iRow] > kHighsZero) {
-          const double myInfeas = work_infeasibility[iRow];
-          const double myWeight = edge_weight[iRow];
-          //	  printf("Dense: Row %4" HIGHSINT_FORMAT " weight = %g\n", iRow,
-          // myWeight);
-          if (bestMerit * myWeight < myInfeas) {
-            bestMerit = myInfeas / myWeight;
-            bestIndex = iRow;
+      for (HighsInt block = start; block < end; block += kChuzrBlockSize) {
+        const HighsInt block_end = std::min(block + kChuzrBlockSize, end);
+        for (HighsInt iRow = block; iRow < block_end; iRow++) {
+          if (work_infeasibility[iRow] > kHighsZero) {
+            const double myInfeas = work_infeasibility[iRow];
+            const double myWeight = edge_weight[iRow];
+            //	  printf("Dense: Row %4" HIGHSINT_FORMAT " weight = %g\n", iRow,
+            // myWeight);
+            if (bestMerit * myWeight < myInfeas) {
+              bestMerit = myInfeas / myWeight;
+              bestIndex = iRow;
+            }
           }
         }
       }
@@ -344,6 +351,121 @@ bool HEkkDualRHS::updatePrimal(HVector* column, double theta) {
         baseValue[iRow] >= kExcessivePrimalValue)
       num_excessive_primal++;
   }
+  analysis->simplexTimerStop(UpdatePrimalClock);
+  // Flag detection of excessive values in return
+  if (num_excessive_primal) return false;
+  return true;
+}
+
+void HEkkDualRHS::updatePrimalStart(HVector* column, double theta,
+                                    bool skip_infeas_list) {
+  analysis->simplexTimerStart(UpdatePrimalClock);
+  const HighsInt numRow = ekk_instance_.lp_.num_row_;
+  const HighsInt columnCount = column->count;
+  const HighsInt* variable_index = column->index.data();
+  const double* columnArray = column->array.data();
+  const double* baseLower = ekk_instance_.info_.baseLower_.data();
+  const double* baseUpper = ekk_instance_.info_.baseUpper_.data();
+  const double Tp = ekk_instance_.options_->primal_feasibility_tolerance;
+  double* baseValue = ekk_instance_.info_.baseValue_.data();
+  const bool store_squared =
+      ekk_instance_.info_.store_squared_primal_infeasibility;
+  const bool hyper_sparse = workCutoff > 0;
+  const std::vector<double>& edge_weight = ekk_instance_.dual_edge_weight_;
+
+  const bool updatePrimal_inDense = columnCount < 0 || columnCount > 0.4 * numRow;
+  const HighsInt to_entry = updatePrimal_inDense ? numRow : columnCount;
+  for (HighsInt iEntry = 0; iEntry < to_entry; iEntry++) {
+    const HighsInt iRow =
+        updatePrimal_inDense ? iEntry : variable_index[iEntry];
+    baseValue[iRow] -= theta * columnArray[iRow];
+    // @primal_infeasibility calculation
+    const double value = baseValue[iRow];
+    const double lower = baseLower[iRow];
+    const double upper = baseUpper[iRow];
+    double primal_infeasibility = 0;
+    if (value < lower - Tp) {
+      primal_infeasibility = lower - value;
+    } else if (value > upper + Tp) {
+      primal_infeasibility = value - upper;
+    }
+    if (store_squared)
+      work_infeasibility[iRow] = primal_infeasibility * primal_infeasibility;
+    else
+      work_infeasibility[iRow] = fabs(primal_infeasibility);
+  }
+  if (skip_infeas_list || workCount < 0) return;
+  // The infeasibility list insertion mirrors updateInfeasList: it walks
+  // the column entries (and does nothing when the column is dense)
+  for (HighsInt iEntry = 0; iEntry < columnCount; iEntry++) {
+    const HighsInt iRow = variable_index[iEntry];
+    if (!workMark[iRow]) {
+      const double infeasibility = work_infeasibility[iRow];
+      if (infeasibility &&
+          (!hyper_sparse || infeasibility > edge_weight[iRow] * workCutoff)) {
+        workIndex[workCount++] = iRow;
+        workMark[iRow] = true;
+      }
+    }
+  }
+}
+
+bool HEkkDualRHS::updatePrimalFinish(HVector* column, double theta,
+                                     bool skip_infeas_list) {
+  const HighsInt numRow = ekk_instance_.lp_.num_row_;
+  const HighsInt columnCount = column->count;
+  const HighsInt* variable_index = column->index.data();
+  const double* columnArray = column->array.data();
+  const double* baseLower = ekk_instance_.info_.baseLower_.data();
+  const double* baseUpper = ekk_instance_.info_.baseUpper_.data();
+  const double Tp = ekk_instance_.options_->primal_feasibility_tolerance;
+  double* baseValue = ekk_instance_.info_.baseValue_.data();
+  const bool store_squared =
+      ekk_instance_.info_.store_squared_primal_infeasibility;
+  const bool hyper_sparse = workCutoff > 0;
+  const std::vector<double>& edge_weight = ekk_instance_.dual_edge_weight_;
+  HighsInt num_excessive_primal = 0;
+
+  const bool updatePrimal_inDense = columnCount < 0 || columnCount > 0.4 * numRow;
+  const HighsInt to_entry = updatePrimal_inDense ? numRow : columnCount;
+  for (HighsInt iEntry = 0; iEntry < to_entry; iEntry++) {
+    const HighsInt iRow =
+        updatePrimal_inDense ? iEntry : variable_index[iEntry];
+    baseValue[iRow] -= theta * columnArray[iRow];
+    // @primal_infeasibility calculation
+    const double value = baseValue[iRow];
+    const double lower = baseLower[iRow];
+    const double upper = baseUpper[iRow];
+    double primal_infeasibility = 0;
+    if (value < lower - Tp) {
+      primal_infeasibility = lower - value;
+    } else if (value > upper + Tp) {
+      primal_infeasibility = value - upper;
+    }
+    if (store_squared)
+      work_infeasibility[iRow] = primal_infeasibility * primal_infeasibility;
+    else
+      work_infeasibility[iRow] = fabs(primal_infeasibility);
+    if (baseValue[iRow] <= -kExcessivePrimalValue ||
+        baseValue[iRow] >= kExcessivePrimalValue)
+      num_excessive_primal++;
+  }
+  if (!skip_infeas_list && workCount >= 0) {
+    // The infeasibility list insertion mirrors updateInfeasList: it walks
+    // the column entries (and does nothing when the column is dense)
+    for (HighsInt iEntry = 0; iEntry < columnCount; iEntry++) {
+      const HighsInt iRow = variable_index[iEntry];
+      if (!workMark[iRow]) {
+        const double infeasibility = work_infeasibility[iRow];
+        if (infeasibility &&
+            (!hyper_sparse || infeasibility > edge_weight[iRow] * workCutoff)) {
+          workIndex[workCount++] = iRow;
+          workMark[iRow] = true;
+        }
+      }
+    }
+  }
+
   analysis->simplexTimerStop(UpdatePrimalClock);
   // Flag detection of excessive values in return
   if (num_excessive_primal) return false;

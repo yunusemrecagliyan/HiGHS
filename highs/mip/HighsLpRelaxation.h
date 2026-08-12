@@ -111,18 +111,31 @@ class HighsLpRelaxation {
     friend class HighsLpRelaxation;
     HighsLpRelaxation* lp;
     bool iterateStored;
+    // Whether the LP is re-solved when the playground goes out of
+    // scope. Re-solving is only needed when the search will consult
+    // the LP solution of the node directly (e.g. the fallback path
+    // after a pruned strong-branching candidate). When the search
+    // continues with a regular branching decision the node LP is
+    // re-solved by the subsequent node evaluation anyway, so the
+    // re-solve here would just repeat the last strong-branching
+    // child solve and be discarded.
+    bool rerunLpOnExit;
 
-    Playground(HighsLpRelaxation* lp) : lp(lp), iterateStored(false) {}
+    Playground(HighsLpRelaxation* lp)
+        : lp(lp), iterateStored(false), rerunLpOnExit(true) {}
 
    public:
     Playground(Playground&& other)
-        : lp(other.lp), iterateStored(other.iterateStored) {
+        : lp(other.lp),
+          iterateStored(other.iterateStored),
+          rerunLpOnExit(other.rerunLpOnExit) {
       other.iterateStored = false;
     }
 
     Playground& operator=(Playground&& other) {
       std::swap(lp, other.lp);
       std::swap(iterateStored, other.iterateStored);
+      std::swap(rerunLpOnExit, other.rerunLpOnExit);
       return *this;
     }
 
@@ -140,13 +153,20 @@ class HighsLpRelaxation {
       return lp->run(false);
     }
 
+    // When the search proceeds with a regular branching decision the
+    // node LP is re-solved by the following node evaluation, so the
+    // re-solve performed on destruction would be redundant. Only the
+    // early-exit paths that consult the node LP solution directly
+    // keep the default behaviour.
+    void skipRerunOnExit() { rerunLpOnExit = false; }
+
     Playground(const Playground& other) = delete;
     Playground& operator=(const Playground& other) = delete;
 
     ~Playground() {
       if (iterateStored) {
         lp->getLpSolver().getIterate();
-        lp->run();
+        if (rerunLpOnExit) lp->run();
         // If desired, here is the place to clear the stored iterate
       }
     }

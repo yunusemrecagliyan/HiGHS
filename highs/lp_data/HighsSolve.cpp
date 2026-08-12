@@ -38,7 +38,30 @@ HighsStatus solveLp(HighsLpSolverObject& solver_object, const string message) {
                                         return_status, "assessLp");
     if (return_status == HighsStatus::kError) return return_status;
   }
-  const bool use_only_ipm = useIpm(options.solver) || options.run_centring;
+  bool use_only_ipm = useIpm(options.solver) || options.run_centring;
+  // A large LP without a warm start basis can be solved much faster with
+  // IPM than with a (degenerate) simplex solve. The primary signal is the
+  // boxed-column fraction, as before. For standalone LP solves (not MIP
+  // relaxation solves) a complementary signal is added: when the LP is
+  // still large in both dimensions after presolve, IPM usually dominates
+  // even without a boxed structure (qap15 and supportcase10 solve in
+  // seconds with IPM where simplex cannot solve them within the limit)
+  if (!use_only_ipm && !solver_object.basis_.valid &&
+      (options.solver == kSimplexString || options.solver == kHighsChooseString)) {
+    const HighsLp& lp = solver_object.lp_;
+    const bool large_rows = lp.num_row_ >= 3000 && lp.num_row_ <= 200000;
+    if (large_rows) {
+      HighsInt num_boxed = 0;
+      for (HighsInt i = 0; i < lp.num_col_; ++i)
+        if (lp.col_lower_[i] > -kHighsInf && lp.col_upper_[i] < kHighsInf)
+          ++num_boxed;
+      const bool boxed_lp = 10 * num_boxed >= 8 * lp.num_col_;
+      const bool large_standalone_lp =
+          !options.mip_lp_relaxation && lp.num_col_ >= 5000;
+      if ((lp.num_col_ >= 10000 && boxed_lp) || large_standalone_lp)
+        use_only_ipm = true;
+    }
+  }
   bool use_hipo = useHipo(options, kSolverString, solver_object.lp_);
 
   const bool use_ipx = use_only_ipm && !use_hipo;
@@ -121,7 +144,7 @@ HighsStatus solveLp(HighsLpSolverObject& solver_object, const string message) {
     // Non-error return requires a primal solution
     assert(solver_object.solution_.value_valid);
 
-    if (useIpm(options.solver) || options.run_centring) {
+    if (use_only_ipm || options.run_centring) {
       // Setting the IPM-specific values of (highs_)info_ has been done in
       // solveLpHipo/Ipx
       const bool unwelcome_ipx_status =

@@ -81,6 +81,31 @@ class HEkkDualRHS {
   );
 
   /**
+   * @brief Start of the fused two-column primal update: applies the
+   * multiple of the first column to the primal values, updates the
+   * primal infeasibilities and the infeasibility list in one pass.
+   * Exactly equivalent to updatePrimal followed by updateInfeasList
+   */
+  void updatePrimalStart(
+      HVector* column,  //!< Column to add into primal values
+      double theta,     //!< Multiple of column to add into primal values
+      bool skip_infeas_list  //!< Whether to skip the infeasibility list update
+  );
+
+  /**
+   * @brief Finish of the fused two-column primal update: applies the
+   * multiple of the second column, updates the primal infeasibilities
+   * and the infeasibility list in one pass, returning false if excessive
+   * primal values occur. Exactly equivalent to updatePrimal followed by
+   * updateInfeasList
+   */
+  bool updatePrimalFinish(
+      HVector* column,  //!< Column to add into primal values
+      double theta,     //!< Multiple of column to add into primal values
+      bool skip_infeas_list  //!< Whether to skip the infeasibility list update
+  );
+
+  /**
    * @brief Update the primal value for the row where the basis change has
    * occurred
    */

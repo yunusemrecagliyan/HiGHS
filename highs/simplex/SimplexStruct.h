@@ -164,6 +164,13 @@ struct HighsSimplexInfo {
   HighsInt num_costly_DSE_iteration;
   double costly_DSE_measure;
 
+  // Per-iteration raw DSE solve density and a sliding window of costly
+  // DSE iterations, used to detect bimodal DSE solve densities that the
+  // smoothed average-based cost test cannot see
+  double raw_row_DSE_density;
+  std::vector<HighsBool> costly_dse_ring_;
+  HighsInt costly_dse_in_window_;
+
   double average_log_low_DSE_weight_error;
   double average_log_high_DSE_weight_error;
   // Needed globally??

@@ -391,6 +391,9 @@ struct HighsOptionsStruct {
   bool log_to_console;
   bool timeless_log;
 
+  // Set only on the internal LP solver instances used by the MIP solver
+  bool mip_lp_relaxation;
+
   // Options for IPM solver
   double ipm_optimality_tolerance;
   HighsInt ipm_iteration_limit;
@@ -501,7 +504,9 @@ struct HighsOptionsStruct {
   double mip_heuristic_effort;
   bool mip_heuristic_run_feasibility_jump;
   bool mip_heuristic_run_rins;
+  bool mip_heuristic_run_local_branching;
   bool mip_heuristic_run_rens;
+  bool mip_heuristic_run_diving;
   bool mip_heuristic_run_root_reduced_cost;
   bool mip_heuristic_run_zi_round;
   bool mip_heuristic_run_shifting;
@@ -573,6 +578,7 @@ struct HighsOptionsStruct {
         output_flag(false),
         log_to_console(false),
         timeless_log(false),
+        mip_lp_relaxation(false),
         ipm_optimality_tolerance(0.0),
         ipm_iteration_limit(0),
         hipo_system(""),
@@ -668,7 +674,9 @@ struct HighsOptionsStruct {
         mip_heuristic_effort(0.0),
         mip_heuristic_run_feasibility_jump(false),
         mip_heuristic_run_rins(false),
+        mip_heuristic_run_local_branching(false),
         mip_heuristic_run_rens(false),
+        mip_heuristic_run_diving(false),
         mip_heuristic_run_root_reduced_cost(false),
         mip_heuristic_run_zi_round(false),
         mip_heuristic_run_shifting(false),
@@ -972,6 +980,13 @@ class HighsOptions : public HighsOptionsStruct {
                              advanced, &output_flag, true);
     records.push_back(record_bool);
 
+    record_bool =
+        new OptionRecordBool("mip_lp_relaxation",
+                             "Internal: set on LP solver instances used by the "
+                             "MIP solver",
+                             advanced, &mip_lp_relaxation, false);
+    records.push_back(record_bool);
+
     record_bool = new OptionRecordBool("log_to_console",
                                        "Enables or disables console logging",
                                        advanced, &log_to_console, true);
@@ -1238,10 +1253,23 @@ class HighsOptions : public HighsOptionsStruct {
                              advanced, &mip_heuristic_run_rins, true);
     records.push_back(record_bool);
 
+    record_bool = new OptionRecordBool(
+        "mip_heuristic_run_local_branching",
+        "Use the local branching heuristic", advanced,
+        &mip_heuristic_run_local_branching, false);
+    records.push_back(record_bool);
+
     record_bool =
         new OptionRecordBool("mip_heuristic_run_rens", "Use the RENS heuristic",
                              advanced, &mip_heuristic_run_rens, true);
     records.push_back(record_bool);
+
+    record_bool =
+        new OptionRecordBool("mip_heuristic_run_diving",
+                             "Use the diving heuristic", advanced,
+                             &mip_heuristic_run_diving, true);
+    records.push_back(record_bool);
+
 
     record_bool =
         new OptionRecordBool("mip_heuristic_run_root_reduced_cost",

@@ -11,6 +11,14 @@
 
 #include "simplex/HEkk.h"
 
+// Sliding window used to detect bimodal DSE solve densities that the
+// smoothed-average based cost test cannot see: if a large fraction of
+// the recent DSE solves were costly, Devex (whose per-iteration cost is
+// O(pack)) is clearly preferable
+constexpr HighsInt kCostlyDseWindowSize = 1000;
+constexpr double kCostlyDseWindowCostlyFraction = 0.2;
+constexpr HighsInt kCostlyDseWindowMinIterations = 2000;
+
 void HEkk::initialiseControl() {
   // Copy tolerances from options
   info_.allow_dual_steepest_edge_to_devex_switch =
@@ -24,6 +32,9 @@ void HEkk::initialiseControl() {
   info_.row_ep_density = 0;
   info_.row_ap_density = 0;
   info_.row_DSE_density = 0;
+  info_.raw_row_DSE_density = 0;
+  info_.costly_dse_in_window_ = 0;
+  info_.costly_dse_ring_.assign(kCostlyDseWindowSize, false);
   info_.col_steepest_edge_density = 0;
   info_.col_basic_feasibility_change_density = 0;
   info_.row_basic_feasibility_change_density = 0;
@@ -85,48 +96,47 @@ bool HEkk::switchToDevex() {
   double costly_DSE_measure_denominator;
   costly_DSE_measure_denominator = max(
       max(info_.row_ep_density, info_.col_aq_density), info_.row_ap_density);
-  if (costly_DSE_measure_denominator > 0) {
-    info_.costly_DSE_measure =
-        info_.row_DSE_density / costly_DSE_measure_denominator;
-    info_.costly_DSE_measure =
-        info_.costly_DSE_measure * info_.costly_DSE_measure;
-  } else {
-    info_.costly_DSE_measure = 0;
+
+  // Track a sliding window of the raw per-iteration DSE solve density
+  // relative to the other NLA solve densities: the smoothed average used
+  // below cannot detect bimodal densities (many very cheap and many very
+  // costly solves alternating), in which case the costly fraction is
+  // invisible to the smoothed cost test
+  if (info_.costly_dse_ring_.size() !=
+      static_cast<size_t>(kCostlyDseWindowSize))
+    info_.costly_dse_ring_.assign(kCostlyDseWindowSize, false);
+  const HighsInt ring_index = iteration_count_ % kCostlyDseWindowSize;
+  double raw_costly_DSE_measure = 0;
+  if (costly_DSE_measure_denominator > 0 && info_.raw_row_DSE_density > 0) {
+    raw_costly_DSE_measure =
+        info_.raw_row_DSE_density / costly_DSE_measure_denominator;
+    raw_costly_DSE_measure *= raw_costly_DSE_measure;
   }
-  bool costly_DSE_iteration =
-      info_.costly_DSE_measure > kCostlyDseMeasureLimit &&
-      info_.row_DSE_density > kCostlyDseMinimumDensity;
-  info_.costly_DSE_frequency =
-      (1 - kRunningAverageMultiplier) * info_.costly_DSE_frequency;
-  if (costly_DSE_iteration) {
-    info_.num_costly_DSE_iteration++;
-    info_.costly_DSE_frequency += kRunningAverageMultiplier * 1.0;
-    // What if non-dual iterations have been performed: need to think about this
-    HighsInt local_iteration_count =
-        iteration_count_ - info_.control_iteration_count0;
-    HighsInt local_num_tot = lp_.num_col_ + lp_.num_row_;
-    // Switch to Devex if at least 5% of the (at least) 0.1NumTot iterations
-    // have been costly
+  const bool costly_dse_iteration_raw =
+      raw_costly_DSE_measure > kCostlyDseMeasureLimit &&
+      info_.raw_row_DSE_density > kCostlyDseMinimumDensity;
+  info_.costly_dse_in_window_ -= info_.costly_dse_ring_[ring_index];
+  info_.costly_dse_ring_[ring_index] = costly_dse_iteration_raw;
+  info_.costly_dse_in_window_ += costly_dse_iteration_raw;
+  const HighsInt local_iteration_count_window =
+      iteration_count_ - info_.control_iteration_count0;
+  if (local_iteration_count_window >= kCostlyDseWindowMinIterations) {
+    const HighsInt window_count =
+        std::min(local_iteration_count_window, kCostlyDseWindowSize);
     switch_to_devex =
         info_.allow_dual_steepest_edge_to_devex_switch &&
-        (info_.num_costly_DSE_iteration >
-         local_iteration_count *
-             kCostlyDseFractionNumCostlyDseIterationBeforeSwitch) &&
-        (local_iteration_count >
-         kCostlyDseFractionNumTotalIterationBeforeSwitch * local_num_tot);
-
+        info_.costly_dse_in_window_ >
+            kCostlyDseWindowCostlyFraction * window_count;
     if (switch_to_devex) {
       highsLogDev(options_->log_options, HighsLogType::kInfo,
                   "Switch from DSE to Devex after %" HIGHSINT_FORMAT
-                  " costly DSE iterations of %" HIGHSINT_FORMAT
-                  " with "
-                  "densities C_Aq = %11.4g; R_Ep = %11.4g; R_Ap = "
-                  "%11.4g; DSE = %11.4g\n",
-                  info_.num_costly_DSE_iteration, local_iteration_count,
-                  info_.col_aq_density, info_.row_ep_density,
-                  info_.row_ap_density, info_.row_DSE_density);
+                  " costly DSE iterations of the last %" HIGHSINT_FORMAT
+                  " with raw density %11.4g\n",
+                  info_.costly_dse_in_window_, window_count,
+                  info_.raw_row_DSE_density);
     }
   }
+
   if (!switch_to_devex) {
     // Secondly consider switching on the basis of weight accuracy
     double local_measure = info_.average_log_low_DSE_weight_error +
