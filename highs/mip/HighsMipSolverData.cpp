@@ -219,15 +219,12 @@ bool HighsMipSolverData::trySolution(const std::vector<double>& solution,
                                      const int solution_source) {
   if (int(solution.size()) != mipsolver.numCol()) return false;
 
-  HighsCDouble obj = 0;
-
   for (HighsInt i = 0; i != mipsolver.numCol(); ++i) {
     if (solution[i] < mipsolver.model_->col_lower_[i] - feastol) return false;
     if (solution[i] > mipsolver.model_->col_upper_[i] + feastol) return false;
     if (mipsolver.isColInteger(i) && fractionality(solution[i]) > feastol)
       return false;
 
-    obj += static_cast<HighsCDouble>(mipsolver.colCost(i)) * solution[i];
   }
 
   for (HighsInt i = 0; i != mipsolver.numRow(); ++i) {
@@ -242,6 +239,10 @@ bool HighsMipSolverData::trySolution(const std::vector<double>& solution,
     if (rowactivity > mipsolver.rowUpper(i) + feastol) return false;
     if (rowactivity < mipsolver.rowLower(i) - feastol) return false;
   }
+
+  HighsCDouble obj = 0;
+  for (HighsInt i = 0; i != mipsolver.numCol(); ++i)
+    obj += static_cast<HighsCDouble>(mipsolver.colCost(i)) * solution[i];
 
   return addIncumbent(solution, double(obj), solution_source);
 }
@@ -1866,6 +1867,7 @@ bool HighsMipSolverData::rootSeparationRound(
       getLp().getLpSolver().getSolution().col_value;
 
   if (mipsolver.submip || incumbent.empty()) {
+    if (incumbent.empty()) heuristics.pseudocostRounding(worker, solvals);
     heuristics.randomizedRounding(worker, solvals);
     if (mipsolver.options_mip_->mip_heuristic_run_shifting)
       heuristics.shifting(worker, solvals);
@@ -2118,6 +2120,7 @@ restart:
 
   if (mipsolver.options_mip_->mip_heuristic_run_zi_round)
     heuristics.ziRound(worker, firstlpsol);
+  if (incumbent.empty()) heuristics.pseudocostRounding(worker, firstlpsol);
   profiling->start(kMipClockRandomizedRounding);
   heuristics.randomizedRounding(worker, firstlpsol);
   profiling->stop(kMipClockRandomizedRounding);

@@ -74,6 +74,54 @@ void HighsPrimalHeuristics::setupIntCols() {
   });
 }
 
+bool HighsPrimalHeuristics::pseudocostRounding(
+    HighsMipWorker& worker, const std::vector<double>& relaxationsol) {
+  if (relaxationsol.size() != static_cast<size_t>(mipsolver.numCol()))
+    return false;
+
+  const HighsDomain& domain = worker.getGlobalDomain();
+  const HighsPseudocost& pseudocost = worker.getPseudocost();
+  const double feastol = mipsolver.mipdata_->feastol;
+  std::vector<double> roundedsol = relaxationsol;
+  bool roundedFractional = false;
+
+  for (HighsInt col : intcols) {
+    const double value = relaxationsol[col];
+    const double down = std::floor(value);
+    const double up = std::ceil(value);
+    double rounded;
+
+    if (value - down <= feastol)
+      rounded = down;
+    else if (up - value <= feastol)
+      rounded = up;
+    else {
+      roundedFractional = true;
+      const bool lockFreeUp = mipsolver.mipdata_->uplocks[col] == 0;
+      const bool lockFreeDown = mipsolver.mipdata_->downlocks[col] == 0;
+      if (lockFreeUp != lockFreeDown) {
+        rounded = lockFreeUp ? up : down;
+      } else {
+        const double upcost = pseudocost.getPseudocostUp(col, value);
+        const double downcost = pseudocost.getPseudocostDown(col, value);
+        rounded = upcost < downcost
+                      ? up
+                      : downcost < upcost ? down
+                                          : std::floor(value + 0.5);
+      }
+    }
+
+    roundedsol[col] =
+        std::max(domain.col_lower_[col],
+                 std::min(domain.col_upper_[col], rounded));
+  }
+
+  // No repair LP is started here: unsuccessful attempts only pay for one
+  // deterministic solution check.
+  return roundedFractional &&
+         trySolution(roundedsol, kSolutionSourceHeuristic, worker);
+}
+
 bool HighsPrimalHeuristics::solveSubMip(
     HighsMipWorker& worker, const HighsLp& lp, const HighsBasis& basis,
     double fixingRate, std::vector<double> colLower,
@@ -326,11 +374,9 @@ class HeuristicNeighbourhood {
 };
 
 void HighsPrimalHeuristics::diving(HighsMipWorker& worker) {
-  // Guided fractional diving: repeatedly solve the LP relaxation, fix the
-  // most fractional integer variable to its nearest integer and re-solve,
-  // until an integer feasible solution is found or the LP is infeasible.
-  // This classical primal heuristic (used by commercial solvers) finds
-  // feasible solutions quickly by constructing a shallow search path.
+  // Lock/pseudocost-guided diving. Structurally safe zero-lock roundings are
+  // fixed as a batch. If none exist, one branching-relevant variable is fixed
+  // in its cheaper pseudocost direction.
   HighsDomain localdom = worker.getGlobalDomain();
 
   HighsLpRelaxation lprelax(mipsolver);
@@ -342,6 +388,7 @@ void HighsPrimalHeuristics::diving(HighsMipWorker& worker) {
   lprelax.getLpSolver().changeColsBounds(0, mipsolver.numCol() - 1,
                                          localdom.col_lower_.data(),
                                          localdom.col_upper_.data());
+  localdom.clearChangedCols();
   if (mipsolver.options_mip_->mip_root_presolve_only)
     lprelax.getLpSolver().setOptionValue("presolve", kHighsOffString);
   else if ((5 * intcols.size()) / mipsolver.numCol() >= 1)
@@ -349,37 +396,78 @@ void HighsPrimalHeuristics::diving(HighsMipWorker& worker) {
   else
     lprelax.getLpSolver().setOptionValue("presolve", kHighsOffString);
 
-  // Dive: solve the LP, fix the most fractional integer variable to its
-  // nearest integer, re-solve, until the LP solution is integral or the
-  // LP becomes infeasible. The dive is bounded by the relaxation's
-  // iteration limit
   const double feastol = mipsolver.mipdata_->feastol;
+  const HighsPseudocost& pseudocost = worker.getPseudocost();
+  std::vector<HighsInt> fixingCols;
+  std::vector<double> fixingVals;
+  fixingCols.reserve(intcols.size());
+  fixingVals.reserve(intcols.size());
   while (true) {
     const HighsLpRelaxation::Status status = lprelax.run();
     if (status != HighsLpRelaxation::Status::kOptimal) return;
     const std::vector<double>& sol =
         lprelax.getLpSolver().getSolution().col_value;
-    double best_frac = feastol;
+    fixingCols.clear();
+    fixingVals.clear();
     HighsInt best_col = -1;
+    double best_val = 0.0;
+    double best_priority = -1.0;
     for (HighsInt i : intcols) {
       if (localdom.col_lower_[i] == localdom.col_upper_[i]) continue;
       const double val = sol[i];
       const double frac = std::abs(val - std::floor(val + 0.5));
-      if (frac > best_frac) {
-        best_frac = frac;
+      if (frac <= feastol) continue;
+
+      const bool lockFreeUp = mipsolver.mipdata_->uplocks[i] == 0;
+      const bool lockFreeDown = mipsolver.mipdata_->downlocks[i] == 0;
+      if (lockFreeUp || lockFreeDown) {
+        double fixval = lockFreeUp != lockFreeDown
+                            ? lockFreeUp ? std::ceil(val) : std::floor(val)
+                            : std::floor(val + 0.5);
+        fixingCols.push_back(i);
+        fixingVals.push_back(std::max(
+            localdom.col_lower_[i],
+            std::min(localdom.col_upper_[i], fixval)));
+        continue;
+      }
+
+      const double priority = pseudocost.getScore(i, val);
+      if (priority > best_priority ||
+          (priority == best_priority && (best_col == -1 || i < best_col))) {
+        const double upcost = pseudocost.getPseudocostUp(i, val);
+        const double downcost = pseudocost.getPseudocostDown(i, val);
+        double fixval = upcost < downcost ? std::ceil(val) : std::floor(val);
+        if (upcost == downcost) fixval = std::floor(val + 0.5);
+        best_priority = priority;
         best_col = i;
+        best_val = std::max(localdom.col_lower_[i],
+                            std::min(localdom.col_upper_[i], fixval));
       }
     }
-    if (best_col == -1) {
+    if (fixingCols.empty() && best_col == -1) {
       // All integer variables are integral: try the resulting solution
       trySolution(sol, kSolutionSourceHeuristic, worker);
       return;
     }
-    const double fixval = std::floor(sol[best_col] + 0.5);
-    localdom.fixCol(best_col, fixval, HighsDomain::Reason::branching());
-    if (localdom.infeasible()) return;
-    lprelax.getLpSolver().changeColsBounds(best_col, best_col, &fixval,
-                                           &fixval);
+
+    if (fixingCols.empty()) {
+      fixingCols.push_back(best_col);
+      fixingVals.push_back(best_val);
+    }
+
+    for (size_t k = 0; k != fixingCols.size(); ++k) {
+      localdom.fixColWithoutPropagation(fixingCols[k], fixingVals[k],
+                                        HighsDomain::Reason::branching());
+      if (localdom.infeasible()) break;
+    }
+    if (!localdom.infeasible()) localdom.propagate();
+    if (localdom.infeasible()) {
+      localdom.conflictAnalysis(worker.getConflictPool(),
+                                worker.getGlobalDomain(),
+                                worker.getPseudocost());
+      return;
+    }
+    lprelax.flushDomain(localdom, true);
   }
 }
 
@@ -416,7 +504,8 @@ void HighsPrimalHeuristics::localBranching(
 
   for (size_t i = k; i != differs.size(); ++i) {
     const HighsInt col = differs[i];
-    localdom.fixCol(col, incumbent[col], HighsDomain::Reason::branching());
+    localdom.fixColWithoutPropagation(col, incumbent[col],
+                                      HighsDomain::Reason::branching());
     if (localdom.infeasible()) return;
   }
   localdom.propagate();
@@ -1136,20 +1225,21 @@ bool HighsPrimalHeuristics::tryRoundedPoint(HighsMipWorker& worker,
     intval = std::min(localdom.col_upper_[col], intval);
     intval = std::max(localdom.col_lower_[col], intval);
 
-    localdom.fixCol(col, intval, HighsDomain::Reason::branching());
+    localdom.fixColWithoutPropagation(col, intval,
+                                      HighsDomain::Reason::branching());
     if (localdom.infeasible()) {
       localdom.conflictAnalysis(worker.getConflictPool(),
                                 worker.getGlobalDomain(),
                                 worker.getPseudocost());
       return false;
     }
-    localdom.propagate();
-    if (localdom.infeasible()) {
-      localdom.conflictAnalysis(worker.getConflictPool(),
-                                worker.getGlobalDomain(),
-                                worker.getPseudocost());
-      return false;
-    }
+  }
+  localdom.propagate();
+  if (localdom.infeasible()) {
+    localdom.conflictAnalysis(worker.getConflictPool(),
+                              worker.getGlobalDomain(),
+                              worker.getPseudocost());
+    return false;
   }
 
   if (numintcols != mipsolver.numCol()) {
@@ -1280,20 +1370,21 @@ void HighsPrimalHeuristics::randomizedRounding(
     intval = std::min(localdom.col_upper_[i], intval);
     intval = std::max(localdom.col_lower_[i], intval);
 
-    localdom.fixCol(i, intval, HighsDomain::Reason::branching());
+    localdom.fixColWithoutPropagation(i, intval,
+                                      HighsDomain::Reason::branching());
     if (localdom.infeasible()) {
       localdom.conflictAnalysis(worker.getConflictPool(),
                                 worker.getGlobalDomain(),
                                 worker.getPseudocost());
       return;
     }
-    localdom.propagate();
-    if (localdom.infeasible()) {
-      localdom.conflictAnalysis(worker.getConflictPool(),
-                                worker.getGlobalDomain(),
-                                worker.getPseudocost());
-      return;
-    }
+  }
+  localdom.propagate();
+  if (localdom.infeasible()) {
+    localdom.conflictAnalysis(worker.getConflictPool(),
+                              worker.getGlobalDomain(),
+                              worker.getPseudocost());
+    return;
   }
 
   if (mipsolver.mipdata_->integer_cols.size() !=
@@ -1764,22 +1855,15 @@ void HighsPrimalHeuristics::feasibilityPump(HighsMipWorker& worker) {
       intval = std::min(intval, localdom.col_upper_[i]);
       roundedsol[i] = intval;
       referencepoint.push_back((HighsInt)intval);
-      if (!localdom.infeasible()) {
-        localdom.fixCol(i, intval, HighsDomain::Reason::branching());
-        if (localdom.infeasible()) {
-          localdom.conflictAnalysis(worker.getConflictPool(),
-                                    worker.getGlobalDomain(),
-                                    worker.getPseudocost());
-          continue;
-        }
-        localdom.propagate();
-        if (localdom.infeasible()) {
-          localdom.conflictAnalysis(worker.getConflictPool(),
-                                    worker.getGlobalDomain(),
-                                    worker.getPseudocost());
-          continue;
-        }
-      }
+      if (!localdom.infeasible())
+        localdom.fixColWithoutPropagation(i, intval,
+                                          HighsDomain::Reason::branching());
+    }
+    if (!localdom.infeasible()) localdom.propagate();
+    if (localdom.infeasible()) {
+      localdom.conflictAnalysis(worker.getConflictPool(),
+                                worker.getGlobalDomain(),
+                                worker.getPseudocost());
     }
 
     bool havecycle = !referencepoints.emplace(referencepoint).second;

@@ -14,6 +14,7 @@
 #include "Highs.h"
 #include "mip/HighsConflictPool.h"
 #include "mip/HighsMipSolver.h"
+#include "util/HighsHash.h"
 
 class HighsDomain;
 struct HighsCutSet;
@@ -66,9 +67,12 @@ class HighsLpRelaxation {
   std::vector<LpRow> lprows;
 
   std::vector<std::pair<HighsInt, double>> fractionalints;
+  HighsHashTable<HighsInt, std::pair<double, int>> fractionalAggregation;
+  std::vector<HighsInt> objectiveNonzeroCols;
   std::vector<double> dualproofvals;
   std::vector<HighsInt> dualproofinds;
   std::vector<double> dualproofbuffer;
+  std::vector<HighsInt> colIndexBuffer;
   std::vector<double> colLbBuffer;
   std::vector<double> colUbBuffer;
   HVector row_ep;
@@ -83,7 +87,6 @@ class HighsLpRelaxation {
   double avgSolveIters;
   int64_t numSolved;
   size_t epochs;
-  HighsInt maxNumFractional;
   Status status;
   bool adjustSymBranchingCol;
   bool solved_first_lp;
@@ -94,6 +97,9 @@ class HighsLpRelaxation {
   void storeDualUBProof();
 
   bool checkDualProof() const;
+
+  HighsCDouble computeOriginalObjective(
+      const std::vector<double>& solution) const;
 
  public:
   HighsLpRelaxation(const HighsMipSolver& mip);

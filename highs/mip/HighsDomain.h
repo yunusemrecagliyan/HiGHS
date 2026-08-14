@@ -515,6 +515,19 @@ class HighsDomain {
       changeBound({val, col, HighsBoundType::kUpper}, reason);
   }
 
+  // Apply both sides of a fixing without running the row propagator between
+  // them. This is intended for callers that construct a batch of independent
+  // heuristic fixings and call propagate() once after the complete batch.
+  // Binary implications are still processed immediately by changeBound().
+  void fixColWithoutPropagation(
+      HighsInt col, double val, Reason reason = Reason::unspecified()) {
+    if (kAllowDeveloperAssert) assert(infeasible_ == 0);
+    if (col_lower_[col] < val)
+      changeBound({val, col, HighsBoundType::kLower}, reason);
+    if (infeasible_ == 0 && col_upper_[col] > val)
+      changeBound({val, col, HighsBoundType::kUpper}, reason);
+  }
+
   void backtrackToGlobal();
 
   HighsDomainChange backtrack();

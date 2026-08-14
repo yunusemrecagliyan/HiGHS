@@ -116,8 +116,6 @@ bool HighsMipWorker::trySolution(const std::vector<double>& solution,
   if (static_cast<int>(solution.size()) != mipsolver_.model_->num_col_)
     return false;
 
-  HighsCDouble obj = 0;
-
   for (HighsInt i = 0; i != mipsolver_.model_->num_col_; ++i) {
     if (solution[i] < mipsolver_.model_->col_lower_[i] - mipdata_.feastol)
       return false;
@@ -127,7 +125,6 @@ bool HighsMipWorker::trySolution(const std::vector<double>& solution,
         fractionality(solution[i]) > mipdata_.feastol)
       return false;
 
-    obj += static_cast<HighsCDouble>(mipsolver_.colCost(i)) * solution[i];
   }
 
   for (HighsInt i = 0; i != mipsolver_.model_->num_row_; ++i) {
@@ -142,6 +139,10 @@ bool HighsMipWorker::trySolution(const std::vector<double>& solution,
     if (rowactivity > mipsolver_.rowUpper(i) + mipdata_.feastol) return false;
     if (rowactivity < mipsolver_.rowLower(i) - mipdata_.feastol) return false;
   }
+
+  HighsCDouble obj = 0;
+  for (HighsInt i = 0; i != mipsolver_.model_->num_col_; ++i)
+    obj += static_cast<HighsCDouble>(mipsolver_.colCost(i)) * solution[i];
 
   return addIncumbent(solution, static_cast<double>(obj), solution_source);
 }

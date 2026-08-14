@@ -11,6 +11,7 @@
 #include <numeric>
 #include <tuple>
 
+#include "../extern/pdqsort/pdqsort.h"
 #include "lp_data/HConst.h"
 #include "mip/HighsCutGeneration.h"
 #include "mip/HighsDomainChange.h"
@@ -251,29 +252,39 @@ HighsInt HighsSearch::selectBranchingCandidate(int64_t maxSbIters,
                                                double& upNodeLb) {
   assert(!lp->getFractionalIntegers().empty());
 
-  std::vector<double> upscore;
-  std::vector<double> downscore;
-  std::vector<uint8_t> upscorereliable;
-  std::vector<uint8_t> downscorereliable;
-  std::vector<double> upbound;
-  std::vector<double> downbound;
+  auto& upscore = branchUpscore;
+  auto& downscore = branchDownscore;
+  auto& upscorereliable = branchUpscoreReliable;
+  auto& downscorereliable = branchDownscoreReliable;
+  auto& upbound = branchUpbound;
+  auto& downbound = branchDownbound;
+  auto& priority = branchPriority;
+  auto& evalqueue = branchEvalqueue;
+  auto& upnodes = branchUpnodes;
+  auto& downnodes = branchDownnodes;
 
   HighsInt numfrac = lp->getFractionalIntegers().size();
   const auto& fracints = lp->getFractionalIntegers();
 
-  upscore.resize(numfrac, kHighsInf);
-  downscore.resize(numfrac, kHighsInf);
-  upbound.resize(numfrac, getCurrentLowerBound());
-  downbound.resize(numfrac, getCurrentLowerBound());
+  upscore.assign(numfrac, kHighsInf);
+  downscore.assign(numfrac, kHighsInf);
+  upbound.assign(numfrac, getCurrentLowerBound());
+  downbound.assign(numfrac, getCurrentLowerBound());
+  priority.resize(numfrac);
+  upnodes.resize(numfrac);
+  downnodes.resize(numfrac);
 
-  upscorereliable.resize(numfrac, 0);
-  downscorereliable.resize(numfrac, 0);
+  upscorereliable.assign(numfrac, 0);
+  downscorereliable.assign(numfrac, 0);
 
   // initialize up and down scores of variables that have a
   // reliable pseudocost so that they do not get evaluated
   for (HighsInt k = 0; k != numfrac; ++k) {
     HighsInt col = fracints[k].first;
     double fracval = fracints[k].second;
+    priority[k] = pseudocost.getScore(col, fracval);
+    upnodes[k] = getNodeQueue().numNodesUp(col);
+    downnodes[k] = getNodeQueue().numNodesDown(col);
 
     const double lower_residual =
         (fracval - localdom.col_lower_[col]) - getFeasTol();
@@ -324,26 +335,16 @@ HighsInt HighsSearch::selectBranchingCandidate(int64_t maxSbIters,
     }
   }
 
-  std::vector<HighsInt> evalqueue;
   evalqueue.resize(numfrac);
   std::iota(evalqueue.begin(), evalqueue.end(), 0);
   // Evaluate the most promising candidates first: strong branching is
   // usually stopped by the first candidate whose child LP decides the
   // node, so the evaluation order determines how much strong branching
   // work is done at the node. Order by descending pseudocost score.
-  std::stable_sort(evalqueue.begin(), evalqueue.end(), [&](HighsInt a,
-                                                          HighsInt b) {
-    return pseudocost.getScore(fracints[a].first, fracints[a].second) >
-           pseudocost.getScore(fracints[b].first, fracints[b].second);
+  pdqsort(evalqueue.begin(), evalqueue.end(), [&](HighsInt a, HighsInt b) {
+    if (priority[a] != priority[b]) return priority[a] > priority[b];
+    return a < b;
   });
-
-  auto numNodesUp = [&](HighsInt k) {
-    return getNodeQueue().numNodesUp(fracints[k].first);
-  };
-
-  auto numNodesDown = [&](HighsInt k) {
-    return getNodeQueue().numNodesDown(fracints[k].first);
-  };
 
   double minScore = getFeasTol();
 
@@ -370,21 +371,19 @@ HighsInt HighsSearch::selectBranchingCandidate(int64_t maxSbIters,
                                     std::min(downscore[k], oldminscore));
       else {
         score = upscore[k] == kHighsInf || downscore[k] == kHighsInf
-                    ? finalSelection ? pseudocost.getScore(fracints[k].first,
-                                                           fracints[k].second)
-                                     : kHighsInf
+                    ? finalSelection ? priority[k] : kHighsInf
                     : pseudocost.getScore(fracints[k].first, upscore[k],
                                           downscore[k]);
       }
 
       assert(score >= 0.0);
-      int64_t upnodes = numNodesUp(k);
-      int64_t downnodes = numNodesDown(k);
+      int64_t candidateUpnodes = upnodes[k];
+      int64_t candidateDownnodes = downnodes[k];
       double nodes = 0;
-      int64_t numnodes = upnodes + downnodes;
-      if (upnodes != 0 || downnodes != 0)
-        nodes =
-            (downnodes / (double)(numnodes)) * (upnodes / (double)(numnodes));
+      int64_t numnodes = candidateUpnodes + candidateDownnodes;
+      if (candidateUpnodes != 0 || candidateDownnodes != 0)
+        nodes = (candidateDownnodes / (double)(numnodes)) *
+                (candidateUpnodes / (double)(numnodes));
       if (score > bestscore || (score > bestscore - getFeasTol() &&
                                 std::make_pair(nodes, numnodes) >
                                     std::make_pair(bestnodes, bestnumnodes))) {

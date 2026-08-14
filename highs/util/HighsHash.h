@@ -1136,6 +1136,19 @@ class HighsHashTable {
     }
   }
 
+  // Clear all entries while retaining the allocated table. This is useful for
+  // hot-path scratch tables whose peak size is likely to be needed again.
+  void clearRetainCapacity() {
+    if (!numElements) return;
+    const u64 capacity = tableSizeMask + 1;
+    if (!std::is_trivially_destructible<Entry>::value) {
+      for (u64 i = 0; i < capacity; ++i)
+        if (occupied(metadata[i])) entries.get()[i].~Entry();
+    }
+    std::memset(metadata.get(), 0, capacity);
+    numElements = 0;
+  }
+
   const ValueType* find(const KeyType& key) const {
     u64 pos, startPos, maxPos;
     u8 meta;

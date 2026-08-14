@@ -766,6 +766,11 @@ restart:
     if (!mipdata_->parallelLockActive())
       profiling_->start(kMipClockDivePrimalHeuristics);
     if (mipdata_->incumbent.empty()) {
+      mipdata_->heuristics.pseudocostRounding(
+          worker,
+          worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+    }
+    if (mipdata_->incumbent.empty()) {
       if (!mipdata_->parallelLockActive())
         profiling_->start(kMipClockDiveRandomizedRounding);
       mipdata_->heuristics.randomizedRounding(

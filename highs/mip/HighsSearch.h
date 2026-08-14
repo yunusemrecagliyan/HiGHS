@@ -122,6 +122,20 @@ class HighsSearch {
   StabilizerOrbitWorkspace stabilizerOrbitWorkspace;
   HighsHashTable<HighsInt, int> reliableatnode;
 
+  // Reused branching workspaces. Candidate selection is called for nearly
+  // every processed node, so retaining capacity avoids several allocations
+  // and frees per node.
+  std::vector<double> branchUpscore;
+  std::vector<double> branchDownscore;
+  std::vector<double> branchUpbound;
+  std::vector<double> branchDownbound;
+  std::vector<double> branchPriority;
+  std::vector<uint8_t> branchUpscoreReliable;
+  std::vector<uint8_t> branchDownscoreReliable;
+  std::vector<HighsInt> branchEvalqueue;
+  std::vector<int64_t> branchUpnodes;
+  std::vector<int64_t> branchDownnodes;
+
   int branchingVarReliableAtNodeFlags(HighsInt col) const {
     auto it = reliableatnode.find(col);
     if (it == nullptr) return 0;

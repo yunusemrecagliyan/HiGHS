@@ -197,7 +197,6 @@ HighsLpRelaxation::HighsLpRelaxation(const HighsMipSolver& mipsolver)
   avgSolveIters = 0;
   numSolved = 0;
   epochs = 0;
-  maxNumFractional = 0;
   lastAgeCall = 0;
   objective = -kHighsInf;
   currentbasisstored = false;
@@ -213,6 +212,7 @@ HighsLpRelaxation::HighsLpRelaxation(const HighsLpRelaxation& other)
     : mipsolver(other.mipsolver),
       lprows(other.lprows),
       fractionalints(other.fractionalints),
+      objectiveNonzeroCols(other.objectiveNonzeroCols),
       objective(other.objective),
       basischeckpoint(other.basischeckpoint),
       currentbasisstored(other.currentbasisstored),
@@ -223,6 +223,7 @@ HighsLpRelaxation::HighsLpRelaxation(const HighsLpRelaxation& other)
   lpsolver.passOptions(other.lpsolver.getOptions());
   lpsolver.passModel(other.lpsolver.getLp());
   lpsolver.setBasis(other.lpsolver.getBasis());
+  colIndexBuffer.resize(mipsolver.numCol());
   colLbBuffer.resize(mipsolver.numCol());
   colUbBuffer.resize(mipsolver.numCol());
   status = Status::kNotSet;
@@ -230,7 +231,6 @@ HighsLpRelaxation::HighsLpRelaxation(const HighsLpRelaxation& other)
   avgSolveIters = 0;
   numSolved = 0;
   epochs = 0;
-  maxNumFractional = 0;
   lastAgeCall = 0;
   objective = -kHighsInf;
   solved_first_lp = true;
@@ -253,6 +253,11 @@ void HighsLpRelaxation::loadModel() {
   lpsolver.clearSolver();
   lpsolver.clearModel();
   lpsolver.passModel(std::move(lpmodel));
+  objectiveNonzeroCols.clear();
+  objectiveNonzeroCols.reserve(num_col);
+  for (HighsInt col = 0; col != num_col; ++col)
+    if (mipsolver.colCost(col) != 0.0) objectiveNonzeroCols.push_back(col);
+  colIndexBuffer.resize(num_col);
   colLbBuffer.resize(num_col);
   colUbBuffer.resize(num_col);
 }
@@ -261,6 +266,22 @@ void HighsLpRelaxation::resetToGlobalDomain(const HighsDomain& globaldom) {
   lpsolver.changeColsBounds(0, mipsolver.numCol() - 1,
                             globaldom.col_lower_.data(),
                             globaldom.col_upper_.data());
+}
+
+HighsCDouble HighsLpRelaxation::computeOriginalObjective(
+    const std::vector<double>& solution) const {
+  HighsCDouble objectiveValue = 0.0;
+  if (objectiveNonzeroCols.size() ==
+      static_cast<size_t>(mipsolver.numCol())) {
+    for (HighsInt col = 0; col != mipsolver.numCol(); ++col)
+      objectiveValue += static_cast<HighsCDouble>(solution[col]) *
+                        mipsolver.colCost(col);
+  } else {
+    for (HighsInt col : objectiveNonzeroCols)
+      objectiveValue += static_cast<HighsCDouble>(solution[col]) *
+                        mipsolver.colCost(col);
+  }
+  return objectiveValue;
 }
 
 void HighsLpRelaxation::computeBasicDegenerateDuals(
@@ -713,19 +734,30 @@ void HighsLpRelaxation::notifyCutPoolsLpCopied(HighsInt n) {
 void HighsLpRelaxation::flushDomain(HighsDomain& domain, bool continuous) {
   if (!domain.getChangedCols().empty()) {
     if (&domain == &mipsolver.mipdata_->getDomain()) continuous = true;
-    currentbasisstored = false;
     if (!continuous) domain.removeContinuousChangedCols();
     HighsInt numChgCols = domain.getChangedCols().size();
     if (numChgCols == 0) return;
     const HighsInt* chgCols = domain.getChangedCols().data();
+    const HighsLp& currentLp = lpsolver.getLp();
+    HighsInt numActualChanges = 0;
     for (HighsInt i = 0; i < numChgCols; ++i) {
       HighsInt col = chgCols[i];
-      colLbBuffer[i] = domain.col_lower_[col];
-      colUbBuffer[i] = domain.col_upper_[col];
+      const double lower = domain.col_lower_[col];
+      const double upper = domain.col_upper_[col];
+      if (lower == currentLp.col_lower_[col] &&
+          upper == currentLp.col_upper_[col])
+        continue;
+      colIndexBuffer[numActualChanges] = col;
+      colLbBuffer[numActualChanges] = lower;
+      colUbBuffer[numActualChanges] = upper;
+      ++numActualChanges;
     }
 
-    lpsolver.changeColsBounds(numChgCols, domain.getChangedCols().data(),
-                              colLbBuffer.data(), colUbBuffer.data());
+    if (numActualChanges != 0) {
+      currentbasisstored = false;
+      lpsolver.changeColsBounds(numActualChanges, colIndexBuffer.data(),
+                                colLbBuffer.data(), colUbBuffer.data());
+    }
 
     domain.clearChangedCols();
   }
@@ -1446,6 +1478,7 @@ HighsLpRelaxation::Status HighsLpRelaxation::resolveLp(HighsDomain* domain) {
   bool solveagain;
   do {
     solveagain = false;
+    fractionalAggregation.clearRetainCapacity();
     if (domain) flushDomain(*domain);
     status = run();
 
@@ -1454,8 +1487,7 @@ HighsLpRelaxation::Status HighsLpRelaxation::resolveLp(HighsDomain* domain) {
       case Status::kUnscaledDualFeasible:
       case Status::kUnscaledPrimalFeasible:
       case Status::kOptimal: {
-        HighsHashTable<HighsInt, std::pair<double, int>> fracints(
-            maxNumFractional);
+        auto& fracints = fractionalAggregation;
         const HighsSolution& sol = lpsolver.getSolution();
 
         HighsCDouble objsum = 0;
@@ -1560,9 +1592,6 @@ HighsLpRelaxation::Status HighsLpRelaxation::resolveLp(HighsDomain* domain) {
           }
         }
 
-        maxNumFractional =
-            std::max((HighsInt)fracints.size(), maxNumFractional);
-
         if (domain && !domain->getChangedCols().empty()) {
           // printf("resolving due to fixings of substituted columns\n");
           solveagain = true;
@@ -1613,9 +1642,7 @@ HighsLpRelaxation::Status HighsLpRelaxation::resolveLp(HighsDomain* domain) {
                   roundsol[cliquesubst[k].replace.col];
           }
 
-          for (HighsInt i = 0; i != mipsolver.numCol(); ++i)
-            objsum +=
-                static_cast<HighsCDouble>(roundsol[i]) * mipsolver.colCost(i);
+          objsum = computeOriginalObjective(roundsol);
 
           if (!mipsolver.mipdata_->parallelLockActive() || !worker_) {
             mipsolver.mipdata_->addIncumbent(
@@ -1627,9 +1654,7 @@ HighsLpRelaxation::Status HighsLpRelaxation::resolveLp(HighsDomain* domain) {
           objsum = 0;
         }
 
-        for (HighsInt i = 0; i != mipsolver.numCol(); ++i)
-          objsum += static_cast<HighsCDouble>(sol.col_value[i]) *
-                    mipsolver.colCost(i);
+        objsum = computeOriginalObjective(sol.col_value);
 
         if (fractionalints.empty() && !unscaledPrimalFeasible(status)) {
           std::vector<double> fixSol = sol.col_value;
