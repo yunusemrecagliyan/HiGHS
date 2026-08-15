@@ -301,6 +301,12 @@ class HighsDomain {
   std::vector<HighsInt> changedcols_;
 
   std::vector<std::pair<HighsInt, HighsInt>> propRowNumChangedBounds_;
+  // Propagation scratch is retained by each domain but deliberately omitted
+  // from copy/assignment. Only the rows scheduled in the current wave need
+  // slots, rather than two slots for every nonzero in every propagation call.
+  std::vector<HighsInt> propagationIndicesBuffer_;
+  std::vector<size_t> propagationChangeStart_;
+  std::vector<HighsDomainChange> propagationChangeBuffer_;
 
   std::vector<HighsDomainChange> domchgstack_;
   std::vector<Reason> domchgreason_;

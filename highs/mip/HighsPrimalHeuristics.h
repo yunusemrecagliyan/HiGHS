@@ -45,8 +45,8 @@ class HighsPrimalHeuristics {
 
   void diving(HighsMipWorker& worker);
 
-  bool pseudocostRounding(HighsMipWorker& worker,
-                          const std::vector<double>& relaxationsol);
+  bool constraintAwareRounding(HighsMipWorker& worker,
+                               const std::vector<double>& relaxationsol);
 
   void localBranching(HighsMipWorker& worker,
                       const std::vector<double>& relaxationsol);

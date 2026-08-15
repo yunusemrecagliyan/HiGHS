@@ -43,38 +43,39 @@ HighsPrimalHeuristics::HighsPrimalHeuristics(HighsMipSolver& mipsolver)
 void HighsPrimalHeuristics::setupIntCols() {
   intcols = mipsolver.mipdata_->integer_cols;
 
-  pdqsort(intcols.begin(), intcols.end(), [&](HighsInt c1, HighsInt c2) {
-    const FP_32BIT_VOLATILE double lockScore1 =
-        (mipsolver.mipdata_->feastol + mipsolver.mipdata_->uplocks[c1]) *
-        (mipsolver.mipdata_->feastol + mipsolver.mipdata_->downlocks[c1]);
-
-    const FP_32BIT_VOLATILE double lockScore2 =
-        (mipsolver.mipdata_->feastol + mipsolver.mipdata_->uplocks[c2]) *
-        (mipsolver.mipdata_->feastol + mipsolver.mipdata_->downlocks[c2]);
-
-    if (lockScore1 > lockScore2) return true;
-    if (lockScore2 > lockScore1) return false;
-
-    const FP_32BIT_VOLATILE double cliqueScore1 =
+  struct IntegerColumnOrder {
+    double lockScore;
+    double cliqueScore;
+    uint64_t hash;
+    HighsInt col;
+  };
+  std::vector<IntegerColumnOrder> order;
+  order.reserve(intcols.size());
+  for (HighsInt col : intcols) {
+    const FP_32BIT_VOLATILE double lockScore =
+        (mipsolver.mipdata_->feastol + mipsolver.mipdata_->uplocks[col]) *
+        (mipsolver.mipdata_->feastol + mipsolver.mipdata_->downlocks[col]);
+    const FP_32BIT_VOLATILE double cliqueScore =
         (mipsolver.mipdata_->feastol +
-         mipsolver.mipdata_->cliquetable.getNumImplications(c1, 1)) *
+         mipsolver.mipdata_->cliquetable.getNumImplications(col, 1)) *
         (mipsolver.mipdata_->feastol +
-         mipsolver.mipdata_->cliquetable.getNumImplications(c1, 0));
+         mipsolver.mipdata_->cliquetable.getNumImplications(col, 0));
+    order.push_back({lockScore, cliqueScore,
+                     HighsHashHelpers::hash(uint64_t(col)), col});
+  }
 
-    const FP_32BIT_VOLATILE double cliqueScore2 =
-        (mipsolver.mipdata_->feastol +
-         mipsolver.mipdata_->cliquetable.getNumImplications(c2, 1)) *
-        (mipsolver.mipdata_->feastol +
-         mipsolver.mipdata_->cliquetable.getNumImplications(c2, 0));
-
-    return std::make_tuple(cliqueScore1, HighsHashHelpers::hash(uint64_t(c1)),
-                           c1) >
-           std::make_tuple(cliqueScore2, HighsHashHelpers::hash(uint64_t(c2)),
-                           c2);
-  });
+  pdqsort(order.begin(), order.end(),
+          [](const IntegerColumnOrder& lhs,
+             const IntegerColumnOrder& rhs) {
+            return std::make_tuple(lhs.lockScore, lhs.cliqueScore, lhs.hash,
+                                   lhs.col) >
+                   std::make_tuple(rhs.lockScore, rhs.cliqueScore, rhs.hash,
+                                   rhs.col);
+          });
+  for (size_t i = 0; i != order.size(); ++i) intcols[i] = order[i].col;
 }
 
-bool HighsPrimalHeuristics::pseudocostRounding(
+bool HighsPrimalHeuristics::constraintAwareRounding(
     HighsMipWorker& worker, const std::vector<double>& relaxationsol) {
   if (relaxationsol.size() != static_cast<size_t>(mipsolver.numCol()))
     return false;
@@ -82,44 +83,170 @@ bool HighsPrimalHeuristics::pseudocostRounding(
   const HighsDomain& domain = worker.getGlobalDomain();
   const HighsPseudocost& pseudocost = worker.getPseudocost();
   const double feastol = mipsolver.mipdata_->feastol;
+  const HighsLp& model = *mipsolver.model_;
   std::vector<double> roundedsol = relaxationsol;
+  std::vector<std::pair<HighsInt, double>> alternatives;
+  alternatives.reserve(intcols.size());
+  std::vector<HighsCDouble> rowActivity(model.num_row_, HighsCDouble{0.0});
   bool roundedFractional = false;
 
+  for (HighsInt col = 0; col != model.num_col_; ++col)
+    roundedsol[col] =
+        std::max(domain.col_lower_[col],
+                 std::min(domain.col_upper_[col], roundedsol[col]));
+
+  for (HighsInt col = 0; col != model.num_col_; ++col) {
+    for (HighsInt el = model.a_matrix_.start_[col];
+         el != model.a_matrix_.start_[col + 1]; ++el) {
+      rowActivity[model.a_matrix_.index_[el]] +=
+          static_cast<HighsCDouble>(roundedsol[col]) *
+          model.a_matrix_.value_[el];
+    }
+  }
+
+  auto scaledRowViolation = [&](HighsInt row,
+                                const HighsCDouble& activity) {
+    double violation = 0.0;
+    if (activity < model.row_lower_[row] - feastol)
+      violation = model.row_lower_[row] - static_cast<double>(activity);
+    else if (activity > model.row_upper_[row] + feastol)
+      violation = static_cast<double>(activity) - model.row_upper_[row];
+    return violation /
+           std::max(feastol, mipsolver.mipdata_->maxAbsRowCoef[row]);
+  };
+
+  auto directionViolation = [&](HighsInt col, double newValue) {
+    HighsCDouble violation = 0.0;
+    const double delta = newValue - roundedsol[col];
+    for (HighsInt el = model.a_matrix_.start_[col];
+         el != model.a_matrix_.start_[col + 1]; ++el) {
+      const HighsInt row = model.a_matrix_.index_[el];
+      violation += scaledRowViolation(
+          row, rowActivity[row] +
+                   static_cast<HighsCDouble>(delta) *
+                       model.a_matrix_.value_[el]);
+    }
+    return violation;
+  };
+
+  auto applyMove = [&](HighsInt col, double newValue) {
+    const double delta = newValue - roundedsol[col];
+    if (delta == 0.0) return;
+    roundedsol[col] = newValue;
+    for (HighsInt el = model.a_matrix_.start_[col];
+         el != model.a_matrix_.start_[col + 1]; ++el)
+      rowActivity[model.a_matrix_.index_[el]] +=
+          static_cast<HighsCDouble>(delta) * model.a_matrix_.value_[el];
+  };
+
   for (HighsInt col : intcols) {
-    const double value = relaxationsol[col];
+    const double value = roundedsol[col];
     const double down = std::floor(value);
     const double up = std::ceil(value);
     double rounded;
+    bool fractional = false;
 
     if (value - down <= feastol)
       rounded = down;
     else if (up - value <= feastol)
       rounded = up;
     else {
+      fractional = true;
       roundedFractional = true;
       const bool lockFreeUp = mipsolver.mipdata_->uplocks[col] == 0;
       const bool lockFreeDown = mipsolver.mipdata_->downlocks[col] == 0;
       if (lockFreeUp != lockFreeDown) {
         rounded = lockFreeUp ? up : down;
       } else {
+        const double boundedDown = std::max(domain.col_lower_[col], down);
+        const double boundedUp = std::min(domain.col_upper_[col], up);
+        const HighsCDouble downViolation =
+            directionViolation(col, boundedDown);
+        const HighsCDouble upViolation = directionViolation(col, boundedUp);
         const double upcost = pseudocost.getPseudocostUp(col, value);
         const double downcost = pseudocost.getPseudocostDown(col, value);
-        rounded = upcost < downcost
-                      ? up
-                      : downcost < upcost ? down
-                                          : std::floor(value + 0.5);
+        if (upViolation < downViolation)
+          rounded = up;
+        else if (downViolation < upViolation)
+          rounded = down;
+        else
+          rounded = upcost < downcost
+                        ? up
+                        : downcost < upcost ? down
+                                            : std::floor(value + 0.5);
       }
     }
 
-    roundedsol[col] =
+    rounded =
         std::max(domain.col_lower_[col],
                  std::min(domain.col_upper_[col], rounded));
+    if (fractional) {
+      const double other = rounded == down ? up : down;
+      const double alternative =
+          std::max(domain.col_lower_[col],
+                   std::min(domain.col_upper_[col], other));
+      if (alternative != rounded) alternatives.emplace_back(col, alternative);
+    }
+    applyMove(col, rounded);
   }
 
-  // No repair LP is started here: unsuccessful attempts only pay for one
-  // deterministic solution check.
-  return roundedFractional &&
-         trySolution(roundedsol, kSolutionSourceHeuristic, worker);
+  if (!roundedFractional) return false;
+
+  // One deterministic best-improvement repair pass. Initial improvements
+  // define the order; each move is re-evaluated against the updated activities
+  // before it is accepted.
+  auto currentColumnViolation = [&](HighsInt col) {
+    HighsCDouble violation = 0.0;
+    for (HighsInt el = model.a_matrix_.start_[col];
+         el != model.a_matrix_.start_[col + 1]; ++el) {
+      const HighsInt row = model.a_matrix_.index_[el];
+      violation += scaledRowViolation(row, rowActivity[row]);
+    }
+    return violation;
+  };
+
+  std::vector<std::tuple<double, HighsInt, double>> repairOrder;
+  repairOrder.reserve(alternatives.size());
+  for (const auto& alternative : alternatives) {
+    const HighsInt col = alternative.first;
+    const HighsCDouble currentViolation = currentColumnViolation(col);
+    const HighsCDouble alternateViolation =
+        directionViolation(col, alternative.second);
+    if (alternateViolation < currentViolation) {
+      repairOrder.emplace_back(
+          static_cast<double>(currentViolation - alternateViolation), col,
+          alternative.second);
+    }
+  }
+  pdqsort(repairOrder.begin(), repairOrder.end(),
+          [](const std::tuple<double, HighsInt, double>& lhs,
+             const std::tuple<double, HighsInt, double>& rhs) {
+            if (std::get<0>(lhs) != std::get<0>(rhs))
+              return std::get<0>(lhs) > std::get<0>(rhs);
+            return std::get<1>(lhs) < std::get<1>(rhs);
+          });
+
+  for (const auto& repair : repairOrder) {
+    const HighsInt col = std::get<1>(repair);
+    const double alternative = std::get<2>(repair);
+    if (directionViolation(col, alternative) < currentColumnViolation(col))
+      applyMove(col, alternative);
+  }
+
+  // The incrementally maintained quad activities provide a complete model-row
+  // validation, so an unsuccessful candidate avoids a second full matrix scan.
+  for (HighsInt row = 0; row != model.num_row_; ++row) {
+    if (rowActivity[row] > model.row_upper_[row] + feastol ||
+        rowActivity[row] < model.row_lower_[row] - feastol)
+      return false;
+  }
+
+  HighsCDouble objective = 0.0;
+  for (HighsInt col = 0; col != model.num_col_; ++col)
+    objective += static_cast<HighsCDouble>(mipsolver.colCost(col)) *
+                 roundedsol[col];
+  return addIncumbent(roundedsol, static_cast<double>(objective),
+                      kSolutionSourceHeuristic, worker);
 }
 
 bool HighsPrimalHeuristics::solveSubMip(
@@ -1453,33 +1580,66 @@ void HighsPrimalHeuristics::shifting(HighsMipWorker& worker,
       mipsolver.mipdata_->parallelLockActive() ? worker.randgen : this->randgen;
   std::vector<std::pair<HighsInt, double>> current_fractional_integers =
       lprelax.getFractionalIntegers();
-  std::vector<std::tuple<HighsInt, HighsInt, double>> current_infeasible_rows =
-      mipsolver.mipdata_->getInfeasibleRows(current_relax_solution);
+  std::vector<uint8_t> isFractional(mipsolver.numCol(), 0);
+  for (const auto& fractional : current_fractional_integers)
+    isFractional[fractional.first] = 1;
+  HighsInt numFractional =
+      static_cast<HighsInt>(current_fractional_integers.size());
+
+  std::vector<HighsCDouble> rowActivity(currentLp.num_row_,
+                                        HighsCDouble{0.0});
+  for (HighsInt col = 0; col != currentLp.num_col_; ++col) {
+    for (HighsInt el = currentLp.a_matrix_.start_[col];
+         el != currentLp.a_matrix_.start_[col + 1]; ++el)
+      rowActivity[currentLp.a_matrix_.index_[el]] +=
+          static_cast<HighsCDouble>(current_relax_solution[col]) *
+          currentLp.a_matrix_.value_[el];
+  }
+
+  std::vector<std::tuple<HighsInt, HighsInt, double>>
+      current_infeasible_rows;
+  auto refreshInfeasibleRows = [&]() {
+    current_infeasible_rows.clear();
+    for (HighsInt row = 0; row != currentLp.num_row_; ++row) {
+      const double activity = static_cast<double>(rowActivity[row]);
+      if (activity > currentLp.row_upper_[row] +
+                         mipsolver.mipdata_->feastol) {
+        current_infeasible_rows.emplace_back(
+            row, HighsInt{1}, std::abs(activity - currentLp.row_upper_[row]));
+      } else if (activity < currentLp.row_lower_[row] -
+                                mipsolver.mipdata_->feastol) {
+        current_infeasible_rows.emplace_back(
+            row, HighsInt{-1}, std::abs(currentLp.row_lower_[row] - activity));
+      }
+    }
+  };
+  auto updateRowActivities = [&](HighsInt col, double delta) {
+    if (delta == 0.0) return;
+    for (HighsInt el = currentLp.a_matrix_.start_[col];
+         el != currentLp.a_matrix_.start_[col + 1]; ++el)
+      rowActivity[currentLp.a_matrix_.index_[el]] +=
+          static_cast<HighsCDouble>(delta) * currentLp.a_matrix_.value_[el];
+  };
+  refreshInfeasibleRows();
   size_t previous_infeasible_rows_size = current_infeasible_rows.size();
   bool hasInfeasibleConstraints = current_infeasible_rows.size() != 0;
   HighsInt iterationsWithoutReductions = 0;
   HighsInt maxIterationsWithoutReductions = 5;
-  std::unordered_map<HighsInt, std::vector<HighsInt>> shift_iterations_set;
-  std::vector<HighsInt> shifts;
+  // Dense indirection keeps the hot repair scan out of unordered_map while
+  // allocating histories only for columns that are actually shifted.
+  std::vector<HighsInt> shiftHistoryIndex(mipsolver.numCol(), HighsInt{-1});
+  std::vector<std::vector<HighsInt>> shiftHistories;
 
-  auto findPairByIndex = [](std::vector<std::pair<HighsInt, double>>& vec,
-                            HighsInt k) {
-    return std::find_if(
-        vec.begin(), vec.end(),
-        [k](const std::pair<HighsInt, double>& p) { return p.first == k; });
-  };
-
-  auto findShiftsByIndex =
-      [](const std::unordered_map<HighsInt, std::vector<HighsInt>>& shifts,
-         HighsInt k) -> std::vector<HighsInt> {
-    auto it = shifts.find(k);
-    if (it != shifts.end()) {
-      return it->second;
+  auto recordShift = [&](HighsInt col, HighsInt iteration) {
+    HighsInt& history = shiftHistoryIndex[col];
+    if (history == -1) {
+      history = static_cast<HighsInt>(shiftHistories.size());
+      shiftHistories.emplace_back();
     }
-    return {};
+    shiftHistories[history].push_back(iteration);
   };
 
-  while ((current_fractional_integers.size() > 0 || hasInfeasibleConstraints) &&
+  while ((numFractional > 0 || hasInfeasibleConstraints) &&
          iterationsWithoutReductions <= maxIterationsWithoutReductions &&
          t <= static_cast<HighsInt>(mipsolver.mipdata_->integer_cols.size())) {
     t++;
@@ -1496,9 +1656,8 @@ void HighsPrimalHeuristics::shifting(HighsMipWorker& worker,
         HighsInt start = mipsolver.mipdata_->ARstart_[r];
         HighsInt end = mipsolver.mipdata_->ARstart_[r + 1];
         for (HighsInt jInd = start; jInd != end; ++jInd) {
-          auto it = findPairByIndex(current_fractional_integers,
-                                    mipsolver.mipdata_->ARindex_[jInd]);
-          fractionalIntegerFound = it != current_fractional_integers.end();
+          fractionalIntegerFound =
+              isFractional[mipsolver.mipdata_->ARindex_[jInd]] != 0;
           if (fractionalIntegerFound) break;
         }
         rIndex++;
@@ -1526,8 +1685,7 @@ void HighsPrimalHeuristics::shifting(HighsMipWorker& worker,
         if (currentLp.col_lower_[j] == currentLp.col_upper_[j]) continue;
 
         // lambda for finding best shift
-        auto repair = [&findPairByIndex, &current_fractional_integers,
-                       &findShiftsByIndex, &shift_iterations_set, &t,
+        auto repair = [&isFractional, &shiftHistoryIndex, &shiftHistories, &t,
                        &score_min, &j_min, &aij_min, &x_j_min,
                        &current_relax_solution, &moveValueUp](
                           HighsInt col, HighsInt direction, HighsInt row_sense,
@@ -1540,22 +1698,18 @@ void HighsPrimalHeuristics::shifting(HighsMipWorker& worker,
           // skip variables at bounds
           if (isAtBound) return;
 
-          // search for column
-          auto it = findPairByIndex(current_fractional_integers, col);
-
-          // add data
-          bool found = it != current_fractional_integers.end();
+          bool found = isFractional[col] != 0;
 
           double score = kHighsInf;
           if (found) {
             score = -1.0 + 1.0 / static_cast<double>(numLocks + 1);
           } else {
-            const auto& shifts = findShiftsByIndex(shift_iterations_set, col);
-            if (shifts.empty())
+            const HighsInt history = shiftHistoryIndex[col];
+            if (history == -1)
               score = direction * (isMaximization ? -cost : cost);
             else {
               score = 0.0;
-              for (double shift : shifts) {
+              for (HighsInt shift : shiftHistories[history]) {
                 if (direction * shift > 0)
                   score += pow(1.1, direction * shift - t);
               }
@@ -1590,10 +1744,11 @@ void HighsPrimalHeuristics::shifting(HighsMipWorker& worker,
       }
 
       if (j_min != std::numeric_limits<HighsInt>::max()) {
-        // Update current_fractional_integers
-        auto it = findPairByIndex(current_fractional_integers, j_min);
-        if (it != current_fractional_integers.end()) {
-          current_fractional_integers.erase(it);
+        // Marking retains the original candidate order while avoiding a
+        // linear search and vector compaction after every rounding move.
+        if (isFractional[j_min]) {
+          isFractional[j_min] = 0;
+          --numFractional;
           fractionalIntegersReduced = true;
         }
         // Update current_relax_solution and shift_iterations_set (for not
@@ -1612,7 +1767,7 @@ void HighsPrimalHeuristics::shifting(HighsMipWorker& worker,
                   x_j_min + infeasibility / std::abs(aij_min),
                   currentLp.col_upper_[j_min] + mipsolver.mipdata_->feastol);
             }
-            shift_iterations_set[j_min].push_back(t);
+            recordShift(j_min, t);
           }
         } else {
           if (fractionalIntegersReduced) {
@@ -1629,14 +1784,14 @@ void HighsPrimalHeuristics::shifting(HighsMipWorker& worker,
                   currentLp.col_lower_[j_min] - mipsolver.mipdata_->feastol);
             }
 
-            shift_iterations_set[j_min].push_back(-t);
+            recordShift(j_min, -t);
           }
         }
+        updateRowActivities(j_min, current_relax_solution[j_min] - x_j_min);
       }
     } else {
       double xi_max = -1;
       double delta_c_min = kHighsInf;
-      HighsInt pind_j_min = std::numeric_limits<HighsInt>::max();
       HighsInt j_min = std::numeric_limits<HighsInt>::max();
       double x_j_min = kHighsInf;
       HighsInt sigma = 0;
@@ -1645,18 +1800,18 @@ void HighsPrimalHeuristics::shifting(HighsMipWorker& worker,
            ++i) {
         std::pair<HighsInt, double> it = current_fractional_integers[i];
         HighsInt col = it.first;
+        if (!isFractional[col]) continue;
         assert(col >= 0);
         assert(col < mipsolver.numCol());
 
-        auto isBetter = [&currentLp, &it, &xi_max, &delta_c_min, &pind_j_min,
-                         &j_min, &x_j_min, &sigma,
-                         &i](double col, double xi, double roundedval,
-                             HighsInt direction) {
+        auto isBetter = [&currentLp, &it, &xi_max, &delta_c_min, &j_min,
+                         &x_j_min, &sigma](double col, double xi,
+                                           double roundedval,
+                                           HighsInt direction) {
           double c_min = currentLp.col_cost_[col] * (roundedval - it.second);
           if (xi > xi_max || (xi == xi_max && c_min < delta_c_min)) {
             xi_max = xi;
             delta_c_min = c_min;
-            pind_j_min = i;
             j_min = col;
             x_j_min = roundedval;
             sigma = direction;
@@ -1670,17 +1825,20 @@ void HighsPrimalHeuristics::shifting(HighsMipWorker& worker,
                  std::ceil(it.second - mipsolver.mipdata_->feastol),
                  HighsInt{1});
       }
+      double previous_j_value = 0.0;
       if (sigma != 0) {
+        previous_j_value = current_relax_solution[j_min];
         current_relax_solution[j_min] = x_j_min;
       }
-      if (pind_j_min != std::numeric_limits<HighsInt>::max()) {
-        current_fractional_integers.erase(current_fractional_integers.begin() +
-                                          pind_j_min);
+      if (j_min != std::numeric_limits<HighsInt>::max()) {
+        isFractional[j_min] = 0;
+        --numFractional;
         fractionalIntegersReduced = true;
+        updateRowActivities(j_min,
+                            current_relax_solution[j_min] - previous_j_value);
       }
     }
-    current_infeasible_rows =
-        mipsolver.mipdata_->getInfeasibleRows(current_relax_solution);
+    refreshInfeasibleRows();
     hasInfeasibleConstraints = current_infeasible_rows.size() != 0;
     if (current_infeasible_rows.size() < previous_infeasible_rows_size ||
         fractionalIntegersReduced)
@@ -1722,12 +1880,28 @@ void HighsPrimalHeuristics::ziRound(HighsMipWorker& worker,
 
   const HighsLp& currentLp = *mipsolver.model_;
 
-  std::vector<double> rowActivities;
+  std::vector<HighsCDouble> rowActivities;
   std::vector<double> XrowLower;
   std::vector<double> XrowUpper;
-  rowActivities.resize(currentLp.num_row_);
+  rowActivities.assign(currentLp.num_row_, HighsCDouble{0.0});
   XrowLower.resize(currentLp.num_row_);
   XrowUpper.resize(currentLp.num_row_);
+
+  if (currentLp.num_row_ > 0)
+    getLpRowBounds(currentLp, 0, currentLp.num_row_ - 1, XrowLower.data(),
+                   XrowUpper.data());
+
+  // Compute activities once. Subsequent rounding moves update only the rows
+  // touched by the changed column, avoiding a full matrix traversal for every
+  // fractional integer.
+  for (HighsInt col = 0; col != currentLp.num_col_; ++col) {
+    for (HighsInt el = currentLp.a_matrix_.start_[col];
+         el != currentLp.a_matrix_.start_[col + 1]; ++el) {
+      rowActivities[currentLp.a_matrix_.index_[el]] +=
+          static_cast<HighsCDouble>(current_relax_solution[col]) *
+          currentLp.a_matrix_.value_[el];
+    }
+  }
 
   HighsInt loop_count = 0;
   HighsInt max_loop_count = 5;
@@ -1740,17 +1914,10 @@ void HighsPrimalHeuristics::ziRound(HighsMipWorker& worker,
     previous_zi_total = zi_total;
     loop_count++;
 
-    if (currentLp.num_row_ > 0)
-      getLpRowBounds(currentLp, 0, currentLp.num_row_ - 1, XrowLower.data(),
-                     XrowUpper.data());
-
     for (HighsInt j : intcols) {
       double relax_solution = current_relax_solution[j];
       if (fractionality(relax_solution) <= mipsolver.mipdata_->feastol)
         continue;
-
-      rowActivities.assign(currentLp.num_row_, 0.0);
-      calculateRowValuesQuad(currentLp, current_relax_solution, rowActivities);
 
       double min_row_ratio_for_upper = kHighsInf;
       double min_row_ratio_for_lower = kHighsInf;
@@ -1760,8 +1927,9 @@ void HighsPrimalHeuristics::ziRound(HighsMipWorker& worker,
         HighsInt i = currentLp.a_matrix_.index_[el];
         double aij = currentLp.a_matrix_.value_[el];
 
-        double slack_upper = XrowUpper[i] - rowActivities[i];
-        double slack_lower = rowActivities[i] - XrowLower[i];
+        double activity = static_cast<double>(rowActivities[i]);
+        double slack_upper = XrowUpper[i] - activity;
+        double slack_lower = activity - XrowLower[i];
         min_row_ratio_for_upper =
             std::min(min_row_ratio_for_upper,
                      (aij > 0 ? slack_upper : -slack_lower) / aij);
@@ -1778,6 +1946,12 @@ void HighsPrimalHeuristics::ziRound(HighsMipWorker& worker,
       auto performUpdates = [&](HighsInt col, double change) {
         double old_relax_solution = current_relax_solution[col];
         current_relax_solution[col] += change;
+        for (HighsInt el = currentLp.a_matrix_.start_[col];
+             el != currentLp.a_matrix_.start_[col + 1]; ++el) {
+          rowActivities[currentLp.a_matrix_.index_[el]] +=
+              static_cast<HighsCDouble>(change) *
+              currentLp.a_matrix_.value_[el];
+        }
         zi_total =
             zi_total - zi(old_relax_solution) + zi(current_relax_solution[col]);
       };

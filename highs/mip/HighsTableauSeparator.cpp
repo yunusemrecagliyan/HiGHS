@@ -24,7 +24,8 @@ struct FractionalInteger {
   double row_ep_norm2;
   double score;
   HighsInt basisIndex;
-  std::vector<std::pair<HighsInt, double>> row_ep;
+  size_t row_ep_start;
+  HighsInt row_ep_count;
 
   bool operator<(const FractionalInteger& other) const {
     return score > other.score;
@@ -33,7 +34,11 @@ struct FractionalInteger {
   FractionalInteger() = default;
 
   FractionalInteger(HighsInt basisIndex, double fractionality)
-      : fractionality(fractionality), score(-1.0), basisIndex(basisIndex) {}
+      : fractionality(fractionality),
+        score(-1.0),
+        basisIndex(basisIndex),
+        row_ep_start(0),
+        row_ep_count(0) {}
 };
 
 void HighsTableauSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
@@ -137,6 +142,7 @@ void HighsTableauSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
 
   HVector rowEpBuffer;
   rowEpBuffer.setup(numRow);
+  std::vector<std::pair<HighsInt, double>> rowEpArena;
 
   numTries += fractionalBasisvars.size();
 
@@ -151,7 +157,7 @@ void HighsTableauSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
     fracvar.row_ep_norm2 = 0.0;
     double minWeight = kHighsInf;
     double maxWeight = 0.0;
-    fracvar.row_ep.reserve(rowEpBuffer.count);
+    fracvar.row_ep_start = rowEpArena.size();
     for (HighsInt j = 0; j < rowEpBuffer.count; ++j) {
       HighsInt row = rowEpBuffer.index[j];
       double weight = rowEpBuffer.array[row];
@@ -163,10 +169,16 @@ void HighsTableauSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
       minWeight = std::min(minWeight, scaledWeight);
       maxWeight = std::max(maxWeight, scaledWeight);
       fracvar.row_ep_norm2 += scaledWeight * scaledWeight;
-      fracvar.row_ep.emplace_back(row, weight);
+      rowEpArena.emplace_back(row, weight);
     }
+    fracvar.row_ep_count =
+        static_cast<HighsInt>(rowEpArena.size() - fracvar.row_ep_start);
 
-    if (fracvar.row_ep.size() <= 1) continue;
+    if (fracvar.row_ep_count <= 1) {
+      rowEpArena.resize(fracvar.row_ep_start);
+      fracvar.row_ep_count = 0;
+      continue;
+    }
 
     if (maxWeight / minWeight <= 1e4) {
       fracvar.score = fracvar.fractionality * (1.0 - fracvar.fractionality) /
@@ -197,19 +209,21 @@ void HighsTableauSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
       break;
 
     assert(lpAggregator.isEmpty());
-    for (const auto& rowWeight : fracvar.row_ep)
-      lpAggregator.addRow(rowWeight.first, rowWeight.second);
+    const auto rowEpBegin = rowEpArena.begin() + fracvar.row_ep_start;
+    const auto rowEpEnd = rowEpBegin + fracvar.row_ep_count;
+    for (auto rowWeight = rowEpBegin; rowWeight != rowEpEnd; ++rowWeight)
+      lpAggregator.addRow(rowWeight->first, rowWeight->second);
 
     lpAggregator.getCurrentAggregation(baseRowInds, baseRowVals, false);
 
-    if (10 * (baseRowInds.size() - fracvar.row_ep.size()) >
+    if (10 * (baseRowInds.size() - fracvar.row_ep_count) >
         10000 + static_cast<size_t>(mip.numCol())) {
       lpAggregator.clear();
       continue;
     }
 
     HighsInt len = baseRowInds.size();
-    if (len > (HighsInt)fracvar.row_ep.size()) {
+    if (len > fracvar.row_ep_count) {
       double maxAbsVal = 0.0;
       double minAbsVal = kHighsInf;
       for (HighsInt i = 0; i < len; ++i) {

@@ -766,7 +766,7 @@ restart:
     if (!mipdata_->parallelLockActive())
       profiling_->start(kMipClockDivePrimalHeuristics);
     if (mipdata_->incumbent.empty()) {
-      mipdata_->heuristics.pseudocostRounding(
+      mipdata_->heuristics.constraintAwareRounding(
           worker,
           worker.getLpRelaxation().getLpSolver().getSolution().col_value);
     }

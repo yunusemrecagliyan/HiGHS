@@ -1867,7 +1867,7 @@ bool HighsMipSolverData::rootSeparationRound(
       getLp().getLpSolver().getSolution().col_value;
 
   if (mipsolver.submip || incumbent.empty()) {
-    if (incumbent.empty()) heuristics.pseudocostRounding(worker, solvals);
+    if (incumbent.empty()) heuristics.constraintAwareRounding(worker, solvals);
     heuristics.randomizedRounding(worker, solvals);
     if (mipsolver.options_mip_->mip_heuristic_run_shifting)
       heuristics.shifting(worker, solvals);
@@ -2120,7 +2120,8 @@ restart:
 
   if (mipsolver.options_mip_->mip_heuristic_run_zi_round)
     heuristics.ziRound(worker, firstlpsol);
-  if (incumbent.empty()) heuristics.pseudocostRounding(worker, firstlpsol);
+  if (incumbent.empty())
+    heuristics.constraintAwareRounding(worker, firstlpsol);
   profiling->start(kMipClockRandomizedRounding);
   heuristics.randomizedRounding(worker, firstlpsol);
   profiling->stop(kMipClockRandomizedRounding);
@@ -2262,8 +2263,12 @@ restart:
     sqrnorm = 0.0;
     HighsCDouble dotproduct = 0.0;
     for (HighsInt i = 0; i != mipsolver.numCol(); ++i) {
-      avgdirection[i] =
+      const double directionDelta =
           (scale * curdirection[i] - avgdirection[i]) / nseparounds;
+      if (ncuts <= 1)
+        avgdirection[i] += directionDelta;
+      else
+        avgdirection[i] = directionDelta;
       sqrnorm += avgdirection[i] * avgdirection[i];
       dotproduct += avgdirection[i] * curdirection[i];
     }

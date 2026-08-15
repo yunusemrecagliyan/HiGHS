@@ -12,6 +12,7 @@
 #define SIMPLEX_HEKKDUALRHS_H_
 
 #include <vector>
+#include <utility>
 
 #include "simplex/HEkk.h"
 #include "util/HVector.h"
@@ -146,6 +147,12 @@ class HEkkDualRHS {
   std::vector<HighsInt>
       workIndex;  //!< List of rows with greatest primal infeasibilities
   std::vector<double> work_infeasibility;
+
+  // Reused CHUZR selection storage. Multiple pricing used to allocate these
+  // short-lived buffers at every simplex iteration.
+  std::vector<std::pair<double, HighsInt>> multi_candidate_buffer_;
+  std::vector<double> partition_best_merit_;
+  std::vector<HighsInt> partition_best_index_;
 
   HighsInt partNum;
   HighsInt partNumRow;

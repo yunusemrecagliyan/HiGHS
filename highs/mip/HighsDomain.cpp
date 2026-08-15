@@ -1418,20 +1418,10 @@ HighsInt HighsDomain::propagateRowUpper(const HighsInt* Rindex,
   assert(std::isfinite(static_cast<double>(minactivity)));
   if (ninfmin > 1) return 0;
   HighsInt numchgs = 0;
-  for (HighsInt i = 0; i != Rlen; ++i) {
-    HighsCDouble minresact;
-    double actcontribution = activityContributionMin(
-        Rvalue[i], col_lower_[Rindex[i]], col_upper_[Rindex[i]]);
-    if (ninfmin == 1) {
-      if (actcontribution != -kHighsInf) continue;
-
-      minresact = minactivity;
-    } else {
-      minresact = minactivity - actcontribution;
-    }
-
+  auto tryUpperPropagation = [&](HighsInt i,
+                                 const HighsCDouble& minresact) {
     HighsCDouble boundVal = (Rupper - minresact) / Rvalue[i];
-    if (abs(boundVal) * kHighsTiny > feastol()) continue;
+    if (abs(boundVal) * kHighsTiny > feastol()) return;
 
     if (Rvalue[i] > 0) {
       bool accept;
@@ -1447,6 +1437,26 @@ HighsInt HighsDomain::propagateRowUpper(const HighsInt* Rindex,
       if (accept)
         boundchgs[numchgs++] = {bound, Rindex[i], HighsBoundType::kLower};
     }
+  };
+
+  if (ninfmin == 1) {
+    // Exactly one coefficient uses an infinite bound. It is the only variable
+    // that can be propagated, so stop as soon as it has been processed.
+    for (HighsInt i = 0; i != Rlen; ++i) {
+      if (activityContributionMin(Rvalue[i], col_lower_[Rindex[i]],
+                                  col_upper_[Rindex[i]]) != -kHighsInf)
+        continue;
+      tryUpperPropagation(i, minactivity);
+      break;
+    }
+    return numchgs;
+  }
+
+  // Keep the finite-activity hot path free of the invariant ninfmin branch.
+  for (HighsInt i = 0; i != Rlen; ++i) {
+    const double actcontribution = activityContributionMin(
+        Rvalue[i], col_lower_[Rindex[i]], col_upper_[Rindex[i]]);
+    tryUpperPropagation(i, minactivity - actcontribution);
   }
 
   return numchgs;
@@ -1461,20 +1471,10 @@ HighsInt HighsDomain::propagateRowLower(const HighsInt* Rindex,
   assert(std::isfinite(static_cast<double>(maxactivity)));
   if (ninfmax > 1) return 0;
   HighsInt numchgs = 0;
-  for (HighsInt i = 0; i != Rlen; ++i) {
-    HighsCDouble maxresact;
-    double actcontribution = activityContributionMax(
-        Rvalue[i], col_lower_[Rindex[i]], col_upper_[Rindex[i]]);
-    if (ninfmax == 1) {
-      if (actcontribution != kHighsInf) continue;
-
-      maxresact = maxactivity;
-    } else {
-      maxresact = maxactivity - actcontribution;
-    }
-
+  auto tryLowerPropagation = [&](HighsInt i,
+                                 const HighsCDouble& maxresact) {
     HighsCDouble boundVal = (Rlower - maxresact) / Rvalue[i];
-    if (abs(boundVal) * kHighsTiny > feastol()) continue;
+    if (abs(boundVal) * kHighsTiny > feastol()) return;
 
     if (Rvalue[i] < 0) {
       bool accept;
@@ -1489,6 +1489,23 @@ HighsInt HighsDomain::propagateRowLower(const HighsInt* Rindex,
       if (accept)
         boundchgs[numchgs++] = {bound, Rindex[i], HighsBoundType::kLower};
     }
+  };
+
+  if (ninfmax == 1) {
+    for (HighsInt i = 0; i != Rlen; ++i) {
+      if (activityContributionMax(Rvalue[i], col_lower_[Rindex[i]],
+                                  col_upper_[Rindex[i]]) != kHighsInf)
+        continue;
+      tryLowerPropagation(i, maxactivity);
+      break;
+    }
+    return numchgs;
+  }
+
+  for (HighsInt i = 0; i != Rlen; ++i) {
+    const double actcontribution = activityContributionMax(
+        Rvalue[i], col_lower_[Rindex[i]], col_upper_[Rindex[i]]);
+    tryLowerPropagation(i, maxactivity - actcontribution);
   }
 
   return numchgs;
@@ -2357,7 +2374,10 @@ HighsDomainChange HighsDomain::backtrack() {
 }
 
 bool HighsDomain::propagate() {
-  std::vector<HighsInt> propagateinds;
+  auto& propagateinds = propagationIndicesBuffer_;
+  auto& changedbounds = propagationChangeBuffer_;
+  auto& changedboundsStart = propagationChangeStart_;
+  propagateinds.clear();
 
   auto havePropagationRows = [&]() {
     if (!propagateinds_.empty()) return true;
@@ -2376,15 +2396,6 @@ bool HighsDomain::propagate() {
   };
 
   if (!havePropagationRows()) return false;
-
-  size_t changedboundsize = 2 * mipsolver->mipdata_->ARvalue_.size();
-
-  for (const auto& cutpoolprop : cutpoolpropagation)
-    changedboundsize = std::max(
-        changedboundsize, cutpoolprop.cutpool->getMatrix().nonzeroCapacity());
-
-  std::unique_ptr<HighsDomainChange[]> changedbounds(
-      new HighsDomainChange[changedboundsize]);
 
   while (havePropagationRows()) {
     if (objProp_.isActive()) objProp_.propagate();
@@ -2414,8 +2425,25 @@ bool HighsDomain::propagate() {
       }
 
       if (!infeasible_) {
-        propRowNumChangedBounds_.assign(
-            numproprows, std::make_pair(HighsInt{0}, HighsInt{0}));
+        if (static_cast<HighsInt>(propRowNumChangedBounds_.size()) <
+            numproprows)
+          propRowNumChangedBounds_.resize(numproprows);
+        std::fill(propRowNumChangedBounds_.begin(),
+                  propRowNumChangedBounds_.begin() + numproprows,
+                  std::make_pair(HighsInt{0}, HighsInt{0}));
+        if (static_cast<HighsInt>(changedboundsStart.size()) < numproprows)
+          changedboundsStart.resize(numproprows);
+
+        size_t requiredChangeSlots = 0;
+        for (HighsInt k = 0; k != numproprows; ++k) {
+          const HighsInt row = propagateinds[k];
+          changedboundsStart[k] = requiredChangeSlots;
+          requiredChangeSlots +=
+              2 * static_cast<size_t>(mipsolver->mipdata_->ARstart_[row + 1] -
+                                      mipsolver->mipdata_->ARstart_[row]);
+        }
+        if (changedbounds.size() < requiredChangeSlots)
+          changedbounds.resize(requiredChangeSlots);
 
         auto propagateIndex = [&](HighsInt k) {
           // for (HighsInt k = 0; k != numproprows; ++k) {
@@ -2436,7 +2464,8 @@ bool HighsDomain::propagate() {
             activitymin_[i].renormalize();
             propRowNumChangedBounds_[k].first = propagateRowUpper(
                 Rindex, Rvalue, Rlen, mipsolver->rowUpper(i), activitymin_[i],
-                activitymininf_[i], &changedbounds[2 * start]);
+                activitymininf_[i],
+                changedbounds.data() + changedboundsStart[k]);
 
             recomputeCapThreshold = true;
           }
@@ -2451,7 +2480,8 @@ bool HighsDomain::propagate() {
             propRowNumChangedBounds_[k].second = propagateRowLower(
                 Rindex, Rvalue, Rlen, mipsolver->rowLower(i), activitymax_[i],
                 activitymaxinf_[i],
-                &changedbounds[2 * start + propRowNumChangedBounds_[k].first]);
+                changedbounds.data() + changedboundsStart[k] +
+                    propRowNumChangedBounds_[k].first);
 
             recomputeCapThreshold = true;
           }
@@ -2467,18 +2497,18 @@ bool HighsDomain::propagate() {
           HighsInt i = propagateinds[k];
 
           if (propRowNumChangedBounds_[k].first != 0) {
-            HighsInt start = 2 * mipsolver->mipdata_->ARstart_[i];
-            HighsInt end = start + propRowNumChangedBounds_[k].first;
-            for (HighsInt j = start; j != end && !infeasible_; ++j)
+            size_t start = changedboundsStart[k];
+            size_t end = start + propRowNumChangedBounds_[k].first;
+            for (size_t j = start; j != end && !infeasible_; ++j)
               changeBound(changedbounds[j], Reason::modelRowUpper(i));
 
             if (infeasible_) break;
           }
           if (propRowNumChangedBounds_[k].second != 0) {
-            HighsInt start = 2 * mipsolver->mipdata_->ARstart_[i] +
-                             propRowNumChangedBounds_[k].first;
-            HighsInt end = start + propRowNumChangedBounds_[k].second;
-            for (HighsInt j = start; j != end && !infeasible_; ++j)
+            size_t start = changedboundsStart[k] +
+                           propRowNumChangedBounds_[k].first;
+            size_t end = start + propRowNumChangedBounds_[k].second;
+            for (size_t j = start; j != end && !infeasible_; ++j)
               changeBound(changedbounds[j], Reason::modelRowLower(i));
 
             if (infeasible_) break;
@@ -2502,8 +2532,26 @@ bool HighsDomain::propagate() {
         }
 
         if (!infeasible_) {
-          propRowNumChangedBounds_.assign(
-              numproprows, std::make_pair(HighsInt{0}, HighsInt{0}));
+          if (static_cast<HighsInt>(propRowNumChangedBounds_.size()) <
+              numproprows)
+            propRowNumChangedBounds_.resize(numproprows);
+          std::fill(propRowNumChangedBounds_.begin(),
+                    propRowNumChangedBounds_.begin() + numproprows,
+                    std::make_pair(HighsInt{0}, HighsInt{0}));
+          if (static_cast<HighsInt>(changedboundsStart.size()) < numproprows)
+            changedboundsStart.resize(numproprows);
+
+          size_t requiredChangeSlots = 0;
+          for (HighsInt k = 0; k != numproprows; ++k) {
+            const HighsInt cut = propagateinds[k];
+            changedboundsStart[k] = requiredChangeSlots;
+            if ((cutpoolprop.propagatecutflags_[cut] & 2) == 0)
+              requiredChangeSlots += static_cast<size_t>(
+                  cutpoolprop.cutpool->getMatrix().getRowEnd(cut) -
+                  cutpoolprop.cutpool->getMatrix().getRowStart(cut));
+          }
+          if (changedbounds.size() < requiredChangeSlots)
+            changedbounds.resize(requiredChangeSlots);
 
           auto propagateIndex = [&](HighsInt k) {
             HighsInt i = propagateinds[k];
@@ -2519,8 +2567,7 @@ bool HighsDomain::propagate() {
             propRowNumChangedBounds_[k].first = propagateRowUpper(
                 Rindex, Rvalue, Rlen, cutpoolprop.cutpool->getRhs()[i],
                 cutpoolprop.activitycuts_[i], cutpoolprop.activitycutsinf_[i],
-                &changedbounds[cutpoolprop.cutpool->getMatrix().getRowStart(
-                    i)]);
+                changedbounds.data() + changedboundsStart[k]);
 
             cutpoolprop.recomputeCapacityThreshold(i);
           };
@@ -2534,9 +2581,9 @@ bool HighsDomain::propagate() {
             if (propRowNumChangedBounds_[k].first != 0) {
               cutpoolprop.cutpool->resetAge(
                   i, mipsolver->mipdata_->parallelLockActive());
-              HighsInt start = cutpoolprop.cutpool->getMatrix().getRowStart(i);
-              HighsInt end = start + propRowNumChangedBounds_[k].first;
-              for (HighsInt j = start; j != end && !infeasible_; ++j)
+              size_t start = changedboundsStart[k];
+              size_t end = start + propRowNumChangedBounds_[k].first;
+              for (size_t j = start; j != end && !infeasible_; ++j)
                 changeBound(changedbounds[j], Reason::cut(cutpool, i));
             }
 
