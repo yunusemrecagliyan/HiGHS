@@ -1388,6 +1388,10 @@ void HEkkDual::iterationAnalysis() {
     const bool switch_to_devex = ekk_instance_.switchToDevex();
     if (switch_to_devex) {
       edge_weight_mode = EdgeWeightMode::kDevex;
+      // The edge weights are no longer DSE weights, so ensure that
+      // this is recorded: otherwise a later dual simplex solve would
+      // treat the Devex weights as DSE weights
+      ekk_instance_.status_.has_dual_steepest_edge_weights = false;
       initialiseDevexFramework();
     }
   }
