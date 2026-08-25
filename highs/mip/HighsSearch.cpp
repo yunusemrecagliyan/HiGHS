@@ -127,11 +127,15 @@ void HighsSearch::setRENSNeighbourhood(const std::vector<double>& lpsol) {
 }
 
 void HighsSearch::createNewNode() {
+  ++evalEpoch;
   nodestack.emplace_back();
   nodestack.back().domgchgStackPos = localdom.getDomainChangeStack().size();
 }
 
-void HighsSearch::cutoffNode() { nodestack.back().opensubtrees = 0; }
+void HighsSearch::cutoffNode() {
+  ++evalEpoch;
+  nodestack.back().opensubtrees = 0;
+}
 
 void HighsSearch::setMinReliable(HighsInt minreliable) {
   pseudocost.setMinReliable(minreliable);
@@ -140,6 +144,7 @@ void HighsSearch::setMinReliable(HighsInt minreliable) {
 void HighsSearch::branchDownwards(HighsInt col, double newub,
                                   double branchpoint) {
   NodeData& currnode = nodestack.back();
+  ++evalEpoch;
 
   assert(currnode.opensubtrees == 2);
   assert(mipsolver.isColIntegral(col));
@@ -163,6 +168,7 @@ void HighsSearch::branchDownwards(HighsInt col, double newub,
 void HighsSearch::branchUpwards(HighsInt col, double newlb,
                                 double branchpoint) {
   NodeData& currnode = nodestack.back();
+  ++evalEpoch;
 
   assert(currnode.opensubtrees == 2);
   assert(mipsolver.isColIntegral(col));
@@ -770,6 +776,7 @@ const HighsSearch::NodeData* HighsSearch::getParentNodeData() const {
 }
 
 void HighsSearch::stashCurrentNode() {
+  ++evalEpoch;
   auto oldchangedcols = localdom.getChangedCols().size();
   bool prune = nodestack.back().lower_bound > getCutoffBound();
   if (!prune) {
@@ -800,6 +807,7 @@ void HighsSearch::stashCurrentNode() {
 
 void HighsSearch::stashOpenNodes() {
   if (nodestack.empty()) return;
+  ++evalEpoch;
 
   // get the basis of the node highest up in the tree
   std::shared_ptr<const HighsBasis> basis;
@@ -902,6 +910,7 @@ void HighsSearch::resetLocalDomain() {
 }
 
 void HighsSearch::installNode(HighsNodeQueue::OpenNode&& node) {
+  ++evalEpoch;
   localdom.setDomainChangeStack(node.domchgstack, node.branchings);
   bool globalSymmetriesValid = true;
   if (mipsolver.mipdata_->globalOrbits) {
@@ -927,6 +936,114 @@ void HighsSearch::installNode(HighsNodeQueue::OpenNode&& node) {
   depthoffset = node.depth - 1;
 }
 
+void HighsSearch::markNodeEvaluated() {
+  evalSnapshotValid = true;
+  evalSnapshotEpoch = evalEpoch;
+  evalSnapshotInHeuristic = inheuristic;
+  evalSnapshotLp = lp;
+  evalSnapshotUpperLimit = getUpperLimit();
+  evalSnapshotOptimalityLimit = mipworker.getOptimalityLimit();
+  evalSnapshotLocalDomSize = localdom.getDomainChangeStack().size();
+  evalSnapshotGlobalDomSize = getDomain().getDomainChangeStack().size();
+  evalSnapshotNumCuts = getCutPool().getNumCuts();
+  evalSnapshotNumConflicts = getConflictPool().getNumConflicts();
+  evalSnapshotLpNumRows = lp->getLp().num_row_;
+  evalSnapshotLpNumCols = lp->getLp().num_col_;
+}
+
+bool HighsSearch::currentNodeEvalCurrent() const {
+  static const char* off = getenv("HIGHS_DEDUP_OFF");
+  if (off) return false;
+  if (!evalSnapshotValid || nodestack.empty()) return false;
+  // Any structural change on the node stack (node installed, child or
+  // sibling pushed, nodes popped) invalidates the recorded evaluation.
+  if (evalSnapshotEpoch != evalEpoch) return false;
+  if (inheuristic != evalSnapshotInHeuristic) return false;
+  // The LP relaxation object must be the one the evaluation ran on.
+  if (lp != evalSnapshotLp) return false;
+  // A new incumbent lowers the upper limit and can turn prunable bounds
+  // checks and red-cost fixing in a re-evaluation.
+  if (getUpperLimit() != evalSnapshotUpperLimit) return false;
+  if (mipworker.getOptimalityLimit() != evalSnapshotOptimalityLimit)
+    return false;
+  // Any bound change from propagation, separation or conflict analysis
+  // requires a fresh evaluation.
+  if (localdom.getDomainChangeStack().size() != evalSnapshotLocalDomSize)
+    return false;
+  if (getDomain().getDomainChangeStack().size() != evalSnapshotGlobalDomSize)
+    return false;
+  if (getCutPool().getNumCuts() != evalSnapshotNumCuts) return false;
+  // Conflict pool additions from separation or removals by aging since the
+  // recorded evaluation change the work and propagation a re-evaluation
+  // would perform, so the state is no longer the evaluated one.
+  if (getConflictPool().getNumConflicts() != evalSnapshotNumConflicts)
+    return false;
+  if (lp->getLp().num_row_ != evalSnapshotLpNumRows ||
+      lp->getLp().num_col_ != evalSnapshotLpNumCols)
+    return false;
+  // Infeasibility flags may be raised without growing the domain change
+  // stacks; never treat such a state as unchanged.
+  if (localdom.infeasible() || getDomain().infeasible()) return false;
+  return true;
+}
+
+void HighsSearch::replayNodeEvalPseudocostUpdates() {
+  assert(currentNodeEvalCurrent());
+  static int64_t dbgMainReplays = 0;
+  static int64_t dbgSubReplays = 0;
+  const char* dbg = getenv("HIGHS_DEDUP_DEBUG");
+  bool dbgPrint = false;
+  if (dbg) {
+    if (mipsolver.submip)
+      ++dbgSubReplays;
+    else
+      ++dbgMainReplays;
+    dbgPrint = !mipsolver.submip && dbgMainReplays <= 50;
+  }
+  NodeData& currnode = nodestack.back();
+  const NodeData* parent = getParentNodeData();
+
+  // A re-evaluation recomputes the node estimate from the pseudocost state
+  // that includes the observations of all previous evaluations, before adding
+  // its own duplicate observation. Mirror that here, because the estimate is
+  // inherited by child nodes and feeds plunge and node-queue decisions.
+  currnode.estimate = lp->computeBestEstimate(pseudocost);
+
+  if (parent == nullptr) {
+    if (dbgPrint)
+      printf("[dedup] mainreplay#%lld depth=%d (no parent)\n",
+             (long long)dbgMainReplays, (int)getCurrentDepth());
+    return;
+  }
+  if (dbgPrint)
+    printf("[dedup] mainreplay#%lld depth=%d col=%d\n",
+           (long long)dbgMainReplays, (int)getCurrentDepth(),
+           (int)parent->branchingdecision.column);
+
+  // Observation a re-evaluation would add before solving the LP: the number
+  // of inferences is unchanged, as the domain change stack is part of the
+  // recorded state.
+  const int64_t inferences =
+      localdom.getDomainChangeStack().size() - (currnode.domgchgStackPos + 1);
+  pseudocost.addInferenceObservation(
+      parent->branchingdecision.column, inferences,
+      parent->branchingdecision.boundtype == HighsBoundType::kLower);
+
+  // Observation a successful LP resolve in the re-evaluation would add: the
+  // stored lp objective of the current node is the one the recorded
+  // evaluation computed, and it is only set when the LP was solved to dual
+  // optimality.
+  if (currnode.lp_objective != -kHighsInf &&
+      parent->lp_objective != -kHighsInf &&
+      parent->branching_point != parent->branchingdecision.boundval) {
+    double delta = parent->branchingdecision.boundval - parent->branching_point;
+    double objdelta =
+        std::max(0.0, currnode.lp_objective - parent->lp_objective);
+    pseudocost.addObservation(parent->branchingdecision.column, delta,
+                              objdelta);
+  }
+}
+
 HighsSearch::NodeResult HighsSearch::evaluateNode() {
   assert(!nodestack.empty());
   NodeData& currnode = nodestack.back();
@@ -939,9 +1056,20 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
   // fixings cannot overflow the stack; `continue` reproduces the exact
   // behaviour of the former tail call.
   NodeResult result = NodeResult::kOpen;
+  // A full evaluation can add reconvergence conflicts to the conflict pool as
+  // a side effect of computeBasicDegenerateDuals() and red-cost propagation.
+  // The pool keeps duplicates, so repeating such an evaluation adds the same
+  // conflicts again, marks them for propagation and thereby strengthens
+  // downstream pruning. An evaluation that produced conflicts is therefore
+  // never recorded for reuse below.
+  const HighsInt numConflictsAtEntry = getConflictPool().getNumConflicts();
   while (true) {
-  if (!inheuristic && currnode.lower_bound > mipworker.getOptimalityLimit())
+  if (!inheuristic && currnode.lower_bound > mipworker.getOptimalityLimit()) {
+    // No full evaluation ran, so a previously recorded evaluation of this
+    // node must not be reused.
+    evalSnapshotValid = false;
     return NodeResult::kSubOptimal;
+  }
 
   localdom.propagate();
 
@@ -1188,8 +1316,46 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
     }
   }
 
+  // Record the completed evaluation so that the redundant re-evaluations of
+  // the same node and LP state in the search loop (before running primal
+  // heuristics and at the start of a dive) can be skipped. Evaluations that
+  // ended with anything but an open node, evaluations inside primal
+  // heuristics, and evaluations whose degenerate-dual / red-cost pipeline
+  // produced conflicts are never recorded.
+  if (result == NodeResult::kOpen && !inheuristic &&
+      getConflictPool().getNumConflicts() == numConflictsAtEntry)
+    markNodeEvaluated();
+  else
+    evalSnapshotValid = false;
+
+  static int64_t dbgEvalDone = 0;
+  static int64_t dbgEvalConflict = 0;
+  const char* dbg = getenv("HIGHS_DEDUP_DEBUG");
+  if (dbg) {
+    ++dbgEvalDone;
+    if (result == NodeResult::kOpen && !inheuristic &&
+        getConflictPool().getNumConflicts() != numConflictsAtEntry)
+      ++dbgEvalConflict;
+    if (dbgEvalDone % 1000 == 1)
+      printf("[dedup] fulleval#%lld conflictproducing=%lld result=%d "
+             "submip=%d\n",
+             (long long)dbgEvalDone, (long long)dbgEvalConflict, (int)result,
+             (int)mipsolver.submip);
+  }
+
   return result;
 }
+
+namespace {
+int64_t dedupDbgMainReplays = 0;
+int64_t dedupDbgSubReplays = 0;
+int64_t dedupDbgEvals = 0;
+void dedupDebugReport() {
+  printf("[dedup] summary evals=%lld mainreplays=%lld subreplays=%lld\n",
+         (long long)dedupDbgEvals, (long long)dedupDbgMainReplays,
+         (long long)dedupDbgSubReplays);
+}
+}  // namespace
 
 HighsSearch::NodeResult HighsSearch::branch() {
   assert(localdom.getChangedCols().empty());
@@ -1580,6 +1746,7 @@ HighsSearch::NodeResult HighsSearch::branch() {
 
   // finally open a new node with the branching decision added
   // and remember that we have one open subtree left
+  ++evalEpoch;
   HighsInt domchgPos = localdom.getDomainChangeStack().size();
 
   bool passStabilizerToChildNode =
@@ -1599,6 +1766,7 @@ bool HighsSearch::backtrack(bool recoverBasis) {
   if (nodestack.empty()) return false;
   assert(!nodestack.empty());
   assert(nodestack.back().opensubtrees == 0);
+  ++evalEpoch;
   while (true) {
     while (nodestack.back().opensubtrees == 0) {
       countTreeWeight = true;
@@ -1722,6 +1890,7 @@ bool HighsSearch::backtrackPlunge() {
   if (nodestack.empty()) return false;
   assert(!nodestack.empty());
   assert(nodestack.back().opensubtrees == 0);
+  ++evalEpoch;
 
   while (true) {
     while (nodestack.back().opensubtrees == 0) {
@@ -1869,6 +2038,7 @@ bool HighsSearch::backtrackPlunge() {
 bool HighsSearch::backtrackUntilDepth(HighsInt targetDepth) {
   if (nodestack.empty()) return false;
   assert(!nodestack.empty());
+  ++evalEpoch;
   if (getCurrentDepth() >= targetDepth) nodestack.back().opensubtrees = 0;
 
   while (nodestack.back().opensubtrees == 0) {
@@ -1936,7 +2106,18 @@ HighsSearch::NodeResult HighsSearch::dive(int64_t nodeLim) {
 
   do {
     ++nnodes;
-    NodeResult result = evaluateNode();
+    // The plunge root is usually evaluated right before the dive starts
+    // (before separation or inside the primal heuristics step). When nothing
+    // changed since that full evaluation, repeating the whole pipeline is
+    // redundant: reuse the recorded kOpen result and only add the pseudocost
+    // observations the re-evaluation would have contributed.
+    NodeResult result;
+    if (currentNodeEvalCurrent()) {
+      replayNodeEvalPseudocostUpdates();
+      result = NodeResult::kOpen;
+    } else {
+      result = evaluateNode();
+    }
 
     if (checkLimits(nnodes)) return result;
 

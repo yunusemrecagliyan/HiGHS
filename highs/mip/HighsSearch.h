@@ -52,6 +52,27 @@ class HighsSearch {
   bool inheuristic;
   bool countTreeWeight;
 
+  // Redundant node-evaluation elimination. A full evaluation of the current
+  // node (propagation, symmetry, domain flush + LP resolve, aging, estimate
+  // computation, degenerate duals) is expensive and is repeated up to three
+  // times per node in the search loop. The snapshot below records the state
+  // for which the last completed full evaluation is valid, so duplicated
+  // evaluations can be skipped whenever no cuts were added or aged out, no
+  // bound changes happened and no new incumbent arrived.
+  uint64_t evalEpoch = 0;
+  bool evalSnapshotValid = false;
+  uint64_t evalSnapshotEpoch = 0;
+  bool evalSnapshotInHeuristic = false;
+  const HighsLpRelaxation* evalSnapshotLp = nullptr;
+  double evalSnapshotUpperLimit = kHighsInf;
+  double evalSnapshotOptimalityLimit = kHighsInf;
+  size_t evalSnapshotLocalDomSize = 0;
+  size_t evalSnapshotGlobalDomSize = 0;
+  HighsInt evalSnapshotNumCuts = -1;
+  HighsInt evalSnapshotNumConflicts = -1;
+  HighsInt evalSnapshotLpNumRows = -1;
+  HighsInt evalSnapshotLpNumCols = -1;
+
  public:
   enum class ChildSelectionRule {
     kUp,
@@ -234,6 +255,31 @@ class HighsSearch {
   const NodeData* getParentNodeData() const;
 
   NodeResult evaluateNode();
+
+  /// Records that the current node has just been fully evaluated and stores
+  /// the state the evaluation result is valid for, so that redundant
+  /// re-evaluations of the identical state can be detected and skipped.
+  /// Must not be called for evaluations whose degenerate-dual / red-cost
+  /// pipeline added conflicts to the conflict pool: repeating such an
+  /// evaluation adds those reconvergence conflicts again (the pool keeps
+  /// duplicates) and propagates them, so the re-evaluation is not redundant.
+  void markNodeEvaluated();
+
+  /// Adds the pseudocost observations that a redundant re-evaluation of the
+  /// current node would add. When the recorded evaluation is still valid,
+  /// such a re-evaluation observes exactly the same values again (the
+  /// branching decision, LP objective and domain stack are unchanged), so
+  /// replaying the two cheap updates keeps the pseudocost statistics of the
+  /// baseline behaviour without repeating the expensive evaluation pipeline.
+  /// Requires currentNodeEvalCurrent() to hold.
+  void replayNodeEvalPseudocostUpdates();
+
+  /// Returns true when the last full evaluation of the currently installed
+  /// node is still valid, i.e. evaluateNode() would repeat identical work:
+  /// no cuts were added or aged out, no conflicts were added or removed, no
+  /// bound changes happened on the local or global domain and the upper limit
+  /// did not change.
+  bool currentNodeEvalCurrent() const;
 
   NodeResult branch();
 

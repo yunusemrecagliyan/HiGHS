@@ -747,15 +747,25 @@ restart:
 
   auto runHeuristics = [&](const HighsInt i, bool& infeasible) -> bool {
     HighsMipWorker& worker = mipdata_->workers[i];
-    if (!mipdata_->parallelLockActive())
-      profiling_->start(kMipClockDiveEvaluateNode);
-    const HighsSearch::NodeResult evaluate_node_result =
-        worker.search_ptr_->evaluateNode();
-    if (!mipdata_->parallelLockActive())
-      profiling_->stop(kMipClockDiveEvaluateNode);
+    // The node was fully evaluated just before separation. When separation
+    // produced neither cuts nor bound changes and no new incumbent arrived,
+    // re-evaluating would repeat the identical propagate / LP resolve /
+    // estimate pipeline on the same state, so only the pseudocost
+    // observations of that re-evaluation are added and its recorded result
+    // (open, not pruned) is reused.
+    if (!worker.search_ptr_->currentNodeEvalCurrent()) {
+      if (!mipdata_->parallelLockActive())
+        profiling_->start(kMipClockDiveEvaluateNode);
+      const HighsSearch::NodeResult evaluate_node_result =
+          worker.search_ptr_->evaluateNode();
+      if (!mipdata_->parallelLockActive())
+        profiling_->stop(kMipClockDiveEvaluateNode);
 
-    if (evaluate_node_result == HighsSearch::NodeResult::kSubOptimal) {
-      return true;
+      if (evaluate_node_result == HighsSearch::NodeResult::kSubOptimal) {
+        return true;
+      }
+    } else {
+      worker.search_ptr_->replayNodeEvalPseudocostUpdates();
     }
 
     if (worker.search_ptr_->currentNodePruned()) {
