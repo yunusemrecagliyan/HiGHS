@@ -358,6 +358,14 @@ class HPresolve {
 
   bool silentLog() const;
 
+  // VI-aware linear constraint propagation (Phase 1 of Algorithm 2 in Chen et
+  // al. 2026, "Exploiting Variable Implications in Presolve for MIP"). For
+  // each row side with finite rhs, the implied row activity is computed for
+  // every binary of the row under both values of the binary, using the
+  // implication lists and the clique table. If a value provably violates the
+  // row side, the binary is fixed to the opposite value via the domain.
+  Result viLinearPropagation();
+
  public:
   // for LP presolve
   bool okSetInput(HighsLp& model_, const HighsOptions& options_,
