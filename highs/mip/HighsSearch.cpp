@@ -455,16 +455,17 @@ HighsInt HighsSearch::selectBranchingCandidate(int64_t maxSbIters,
             HighsInt newStackSize = localdom.getDomainChangeStack().size();
 
             bool solutionValid = true;
+            const auto& curStack = localdom.getDomainChangeStack();
             for (HighsInt j = domchgStackSize + 1; j < newStackSize; ++j) {
-              if (domchgstack[j].boundtype == HighsBoundType::kLower) {
-                if (domchgstack[j].boundval >
-                    sol[domchgstack[j].column] + getFeasTol()) {
+              if (curStack[j].boundtype == HighsBoundType::kLower) {
+                if (curStack[j].boundval >
+                    sol[curStack[j].column] + getFeasTol()) {
                   solutionValid = false;
                   break;
                 }
               } else {
-                if (domchgstack[j].boundval <
-                    sol[domchgstack[j].column] - getFeasTol()) {
+                if (curStack[j].boundval <
+                    sol[curStack[j].column] - getFeasTol()) {
                   solutionValid = false;
                   break;
                 }
@@ -508,16 +509,17 @@ HighsInt HighsSearch::selectBranchingCandidate(int64_t maxSbIters,
             HighsInt newStackSize = localdom.getDomainChangeStack().size();
 
             bool solutionValid = true;
+            const auto& curStack = localdom.getDomainChangeStack();
             for (HighsInt j = domchgStackSize + 1; j < newStackSize; ++j) {
-              if (domchgstack[j].boundtype == HighsBoundType::kLower) {
-                if (domchgstack[j].boundval >
-                    sol[domchgstack[j].column] + getFeasTol()) {
+              if (curStack[j].boundtype == HighsBoundType::kLower) {
+                if (curStack[j].boundval >
+                    sol[curStack[j].column] + getFeasTol()) {
                   solutionValid = false;
                   break;
                 }
               } else {
-                if (domchgstack[j].boundval <
-                    sol[domchgstack[j].column] - getFeasTol()) {
+                if (curStack[j].boundval <
+                    sol[curStack[j].column] - getFeasTol()) {
                   solutionValid = false;
                   break;
                 }
@@ -892,6 +894,12 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
 
   const auto& domchgstack = localdom.getDomainChangeStack();
 
+  // Red-cost fixing loops re-evaluate the node with a tighter domain. The
+  // recursion was converted into a loop so that long chains of successive
+  // fixings cannot overflow the stack; `continue` reproduces the exact
+  // behaviour of the former tail call.
+  NodeResult result = NodeResult::kOpen;
+  while (true) {
   if (!inheuristic && currnode.lower_bound > mipworker.getOptimalityLimit())
     return NodeResult::kSubOptimal;
 
@@ -917,8 +925,6 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
         parent->branchingdecision.column, inferences,
         parent->branchingdecision.boundtype == HighsBoundType::kLower);
   }
-
-  NodeResult result = NodeResult::kOpen;
 
   if (localdom.infeasible()) {
     result = NodeResult::kDomainInfeasible;
@@ -968,8 +974,8 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
       localdom.conflictAnalysis(getConflictPool(), mipworker.getGlobalDomain(),
                                 pseudocost);
     } else if (lp->scaledOptimal(status)) {
-      lp->storeBasis();
       lp->performAging();
+      lp->storeBasis();
 
       currnode.nodeBasis = lp->getStoredBasis();
       currnode.estimate = lp->computeBestEstimate(pseudocost);
@@ -1058,10 +1064,10 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
                   lp->flushDomain(localdom);
                   localdom.clearChangedCols();
                 } else {
-                  return evaluateNode();
+                  continue;
                 }
               } else {
-                return evaluateNode();
+                continue;
               }
             }
           } else {
@@ -1090,10 +1096,10 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
                     lp->flushDomain(localdom);
                     localdom.clearChangedCols();
                   } else {
-                    return evaluateNode();
+                    continue;
                   }
                 } else {
-                  return evaluateNode();
+                  continue;
                 }
               }
             }
@@ -1127,6 +1133,8 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
                                         upbranch);
       }
     }
+  }
+  break;
   }
 
   if (result != NodeResult::kOpen) {
