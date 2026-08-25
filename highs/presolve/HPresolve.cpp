@@ -1839,6 +1839,12 @@ HPresolve::Result HPresolve::runProbing(HighsPostsolveStack& postsolve_stack) {
       }
     }
 
+    // VI-aware linear constraint propagation: exploit the implications and
+    // cliques gathered by probing to derive additional binary fixings from
+    // the rows. Fixings are applied via the domain, so the finaliseProbing()
+    // call below records them on the postsolve stack.
+    HPRESOLVE_CHECKED_CALL(viLinearPropagation());
+
     // finalise probing
     HighsInt numVarsFixed = 0;
     HighsInt numBndsTightened = 0;
@@ -1870,6 +1876,193 @@ HPresolve::Result HPresolve::runProbing(HighsPostsolveStack& postsolve_stack) {
 
   mipsolver->profiling_->stop(kMipClockProbingPresolve);
   return checkLimits(postsolve_stack);
+}
+
+HPresolve::Result HPresolve::viLinearPropagation() {
+  // VI-aware linear constraint propagation (Phase 1 of Algorithm 2 in Chen et
+  // al. 2026). For every row side with a finite rhs and every binary r of the
+  // row whose probing implications are available, compute the minimum row
+  // activity under x_r = 0 and x_r = 1 taking the implication lists into
+  // account (these cover both implications on other binaries derived from the
+  // clique table and bound tightenings on non-binaries). If the implied
+  // activity provably violates the row side, the opposite value of r is fixed.
+  HighsDomain& domain = mipsolver->mipdata_->getDomain();
+  HighsImplications& implications = mipsolver->mipdata_->implications;
+
+  // This is a presolve reduction for the model being presolved. Heuristic
+  // sub-MIPs solve bound-restricted copies around an incumbent; running the
+  // reduction there perturbs the heuristic outcomes (different incumbents)
+  // without any systematic benefit and made the search trajectory
+  // instance-dependent noise: on the benchmark set every observed regression
+  // was caused by fixings fired inside submips (the mains of neos-911970 and
+  // neos-1396125 fire no fixings at all), while all top-level gains come
+  // from non-submip calls.
+  if (mipsolver->submip) return Result::kOk;
+
+  if (getenv("VILCP_OFF")) return Result::kOk;
+
+  const double feastol = mipsolver->mipdata_->feastol;
+  const HighsInt numcol = model->num_col_;
+
+  // Work budget proportional to the problem size so that pathological
+  // instances cannot inflate presolve time.
+  int64_t workLimit =
+      4 * static_cast<int64_t>(model->a_matrix_.numNz()) + 100000;
+  int64_t work = 0;
+
+  std::vector<std::pair<HighsInt, double>> fixings;
+  fixings.reserve(64);
+
+  // scratch for the implied bounds of one (binary, value) direction; entries
+  // are reset via a token array to avoid O(numcol) clearing per binary
+  std::vector<double> implLb(numcol, -kHighsInf);
+  std::vector<double> implUb(numcol, kHighsInf);
+  std::vector<HighsInt> implToken(numcol, -1);
+  std::vector<HighsInt> touchedCols;
+
+  struct RowEntry {
+    HighsInt col;
+    double val;
+  };
+  std::vector<RowEntry> entries;
+
+  // evaluate the minimum activity of the (possibly negated) row given that
+  // x_r = val, using the implied bounds collected in implLb/implUb
+  auto minActivity = [&](HighsInt r, double val, double signscale,
+                         double rhs) -> double {
+    double act = signscale * 0.0;
+    for (const RowEntry& entry : entries) {
+      const double coef = signscale * entry.val;
+      if (coef == 0.0) continue;
+      const HighsInt col = entry.col;
+      double lb = domain.col_lower_[col];
+      double ub = domain.col_upper_[col];
+      if (implToken[col] == r) {
+        if (implLb[col] > lb) lb = implLb[col];
+        if (implUb[col] < ub) ub = implUb[col];
+      }
+      if (lb >= ub) {
+        act += coef * lb;
+        continue;
+      }
+      if (col == r) {
+        // the branching value of r is fixed by assumption
+        act += coef * val;
+      } else if (coef > 0.0) {
+        act += coef * lb;
+      } else {
+        act += coef * ub;
+      }
+    }
+    // `rhs` is passed already adjusted for the row side that is checked
+    // (row_upper_ for the upper side, -row_lower_ for the lower side), i.e.,
+    // together with the coefficient signs it forms the row side in the same
+    // space as `act`, so it must be subtracted without applying `signscale`
+    // a second time
+    return act - rhs;
+  };
+
+  for (HighsInt row = 0; row != model->num_row_; ++row) {
+    if (work > workLimit) break;
+
+    const bool hasUpper = model->row_upper_[row] != kHighsInf;
+    const bool hasLower = model->row_lower_[row] != -kHighsInf;
+    if (!hasUpper && !hasLower) continue;
+
+    entries.clear();
+    for (const HighsSliceNonzero& nz : getRowVector(row))
+      entries.push_back(RowEntry{nz.index(), nz.value()});
+    work += static_cast<int64_t>(entries.size());
+
+    // collect the binaries of the row worth checking
+    for (const RowEntry& entry : entries) {
+      const HighsInt r = entry.col;
+      if (domain.isFixed(r)) continue;
+      if (!domain.isBinary(r)) continue;
+      if (!implications.implicationsCached(r, false) &&
+          !implications.implicationsCached(r, true))
+        continue;
+
+      auto testDirection = [&](bool branchUp) -> bool {
+        if (domain.isFixed(r)) return false;
+        if (!implications.implicationsCached(r, branchUp)) return false;
+        if (work > workLimit) return false;
+
+        // gather the implied bounds under x_r = branchUp; the two probing
+        // directions are conditional on opposite values of r, so they must
+        // never be mixed within one activity evaluation
+        ++work;
+        for (HighsInt col : touchedCols) implToken[col] = -1;
+        touchedCols.clear();
+        bool infeasible = false;
+        const std::vector<HighsDomainChange>& implics =
+            implications.getImplications(r, branchUp, infeasible);
+        if (infeasible || domain.infeasible()) return false;
+        for (const HighsDomainChange& dc : implics) {
+          if (dc.column == r) continue;
+          if (dc.column < 0 || dc.column >= numcol) continue;
+          if (implToken[dc.column] != r) {
+            implToken[dc.column] = r;
+            implLb[dc.column] = -kHighsInf;
+            implUb[dc.column] = kHighsInf;
+            touchedCols.push_back(dc.column);
+          }
+          work += 1;
+          if (dc.boundtype == HighsBoundType::kLower)
+            implLb[dc.column] = std::max(implLb[dc.column], dc.boundval);
+          else
+            implUb[dc.column] = std::min(implUb[dc.column], dc.boundval);
+        }
+
+        const double val = branchUp ? 1.0 : 0.0;
+
+        // upper side: min activity must not exceed row_upper_
+        if (hasUpper) {
+          const double excess =
+              minActivity(r, val, 1.0, model->row_upper_[row]);
+          if (excess > feastol) {
+            fixings.emplace_back(r, branchUp ? 0.0 : 1.0);
+            return true;
+          }
+        }
+
+        // lower side: max activity must not fall below row_lower_, checked as
+        // the min activity of the negated row against the negated rhs
+        if (hasLower) {
+          const double excess =
+              minActivity(r, val, -1.0, -model->row_lower_[row]);
+          if (excess > feastol) {
+            fixings.emplace_back(r, branchUp ? 0.0 : 1.0);
+            return true;
+          }
+        }
+
+        return false;
+      };
+
+      if (testDirection(false)) continue;
+      if (testDirection(true)) continue;
+    }
+  }
+
+  if (fixings.empty()) return Result::kOk;
+
+  // apply the collected fixings; they are individually valid consequences of
+  // the rows and the current domain, so batching them is safe
+  for (const std::pair<HighsInt, double>& fixing : fixings) {
+    if (domain.isFixed(fixing.first)) continue;
+    domain.fixColWithoutPropagation(fixing.first, fixing.second,
+                                    HighsDomain::Reason::unspecified());
+    if (domain.infeasible()) return Result::kPrimalInfeasible;
+  }
+  domain.propagate();
+  if (domain.infeasible()) return Result::kPrimalInfeasible;
+
+  highsLogDev(options->log_options, HighsLogType::kInfo,
+              "VI-aware LCP: %" HIGHSINT_FORMAT " binary fixings\n",
+              static_cast<HighsInt>(fixings.size()));
+
+  return Result::kOk;
 }
 
 HPresolve::Result HPresolve::liftingForProbing(
