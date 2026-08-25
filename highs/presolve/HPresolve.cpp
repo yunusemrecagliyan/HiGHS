@@ -1889,6 +1889,16 @@ HPresolve::Result HPresolve::viLinearPropagation() {
   HighsDomain& domain = mipsolver->mipdata_->getDomain();
   HighsImplications& implications = mipsolver->mipdata_->implications;
 
+  // This is a presolve reduction for the model being presolved. Heuristic
+  // sub-MIPs solve bound-restricted copies around an incumbent; running the
+  // reduction there perturbs the heuristic outcomes (different incumbents)
+  // without any systematic benefit and made the search trajectory
+  // instance-dependent noise: on the benchmark set every observed regression
+  // was caused by fixings fired inside submips (the mains of neos-911970 and
+  // neos-1396125 fire no fixings at all), while all top-level gains come
+  // from non-submip calls.
+  if (mipsolver->submip) return Result::kOk;
+
   if (getenv("VILCP_OFF")) return Result::kOk;
 
   const double feastol = mipsolver->mipdata_->feastol;
@@ -1944,7 +1954,12 @@ HPresolve::Result HPresolve::viLinearPropagation() {
         act += coef * ub;
       }
     }
-    return act - signscale * rhs;
+    // `rhs` is passed already adjusted for the row side that is checked
+    // (row_upper_ for the upper side, -row_lower_ for the lower side), i.e.,
+    // together with the coefficient signs it forms the row side in the same
+    // space as `act`, so it must be subtracted without applying `signscale`
+    // a second time
+    return act - rhs;
   };
 
   for (HighsInt row = 0; row != model->num_row_; ++row) {
