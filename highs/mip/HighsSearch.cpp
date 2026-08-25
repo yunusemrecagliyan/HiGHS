@@ -906,6 +906,7 @@ void HighsSearch::markNodeEvaluated() {
   evalSnapshotLocalDomSize = localdom.getDomainChangeStack().size();
   evalSnapshotGlobalDomSize = getDomain().getDomainChangeStack().size();
   evalSnapshotNumCuts = getCutPool().getNumCuts();
+  evalSnapshotNumConflicts = getConflictPool().getNumConflicts();
   evalSnapshotLpNumRows = lp->getLp().num_row_;
   evalSnapshotLpNumCols = lp->getLp().num_col_;
 }
@@ -932,6 +933,11 @@ bool HighsSearch::currentNodeEvalCurrent() const {
   if (getDomain().getDomainChangeStack().size() != evalSnapshotGlobalDomSize)
     return false;
   if (getCutPool().getNumCuts() != evalSnapshotNumCuts) return false;
+  // Conflict pool additions from separation or removals by aging since the
+  // recorded evaluation change the work and propagation a re-evaluation
+  // would perform, so the state is no longer the evaluated one.
+  if (getConflictPool().getNumConflicts() != evalSnapshotNumConflicts)
+    return false;
   if (lp->getLp().num_row_ != evalSnapshotLpNumRows ||
       lp->getLp().num_col_ != evalSnapshotLpNumCols)
     return false;
@@ -956,6 +962,12 @@ void HighsSearch::replayNodeEvalPseudocostUpdates() {
   }
   NodeData& currnode = nodestack.back();
   const NodeData* parent = getParentNodeData();
+
+  // A re-evaluation recomputes the node estimate from the pseudocost state
+  // that includes the observations of all previous evaluations, before adding
+  // its own duplicate observation. Mirror that here, because the estimate is
+  // inherited by child nodes and feeds plunge and node-queue decisions.
+  currnode.estimate = lp->computeBestEstimate(pseudocost);
 
   if (parent == nullptr) {
     if (dbgPrint)
@@ -1004,6 +1016,13 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
   // fixings cannot overflow the stack; `continue` reproduces the exact
   // behaviour of the former tail call.
   NodeResult result = NodeResult::kOpen;
+  // A full evaluation can add reconvergence conflicts to the conflict pool as
+  // a side effect of computeBasicDegenerateDuals() and red-cost propagation.
+  // The pool keeps duplicates, so repeating such an evaluation adds the same
+  // conflicts again, marks them for propagation and thereby strengthens
+  // downstream pruning. An evaluation that produced conflicts is therefore
+  // never recorded for reuse below.
+  const HighsInt numConflictsAtEntry = getConflictPool().getNumConflicts();
   while (true) {
   if (!inheuristic && currnode.lower_bound > mipworker.getOptimalityLimit()) {
     // No full evaluation ran, so a previously recorded evaluation of this
@@ -1260,20 +1279,28 @@ HighsSearch::NodeResult HighsSearch::evaluateNode() {
   // Record the completed evaluation so that the redundant re-evaluations of
   // the same node and LP state in the search loop (before running primal
   // heuristics and at the start of a dive) can be skipped. Evaluations that
-  // ended with anything but an open node, and evaluations inside primal
-  // heuristics, are never recorded.
-  if (result == NodeResult::kOpen && !inheuristic)
+  // ended with anything but an open node, evaluations inside primal
+  // heuristics, and evaluations whose degenerate-dual / red-cost pipeline
+  // produced conflicts are never recorded.
+  if (result == NodeResult::kOpen && !inheuristic &&
+      getConflictPool().getNumConflicts() == numConflictsAtEntry)
     markNodeEvaluated();
   else
     evalSnapshotValid = false;
 
   static int64_t dbgEvalDone = 0;
+  static int64_t dbgEvalConflict = 0;
   const char* dbg = getenv("HIGHS_DEDUP_DEBUG");
   if (dbg) {
     ++dbgEvalDone;
+    if (result == NodeResult::kOpen && !inheuristic &&
+        getConflictPool().getNumConflicts() != numConflictsAtEntry)
+      ++dbgEvalConflict;
     if (dbgEvalDone % 1000 == 1)
-      printf("[dedup] fulleval#%lld result=%d submip=%d\n",
-             (long long)dbgEvalDone, (int)result, (int)mipsolver.submip);
+      printf("[dedup] fulleval#%lld conflictproducing=%lld result=%d "
+             "submip=%d\n",
+             (long long)dbgEvalDone, (long long)dbgEvalConflict, (int)result,
+             (int)mipsolver.submip);
   }
 
   return result;

@@ -69,6 +69,7 @@ class HighsSearch {
   size_t evalSnapshotLocalDomSize = 0;
   size_t evalSnapshotGlobalDomSize = 0;
   HighsInt evalSnapshotNumCuts = -1;
+  HighsInt evalSnapshotNumConflicts = -1;
   HighsInt evalSnapshotLpNumRows = -1;
   HighsInt evalSnapshotLpNumCols = -1;
 
@@ -258,6 +259,10 @@ class HighsSearch {
   /// Records that the current node has just been fully evaluated and stores
   /// the state the evaluation result is valid for, so that redundant
   /// re-evaluations of the identical state can be detected and skipped.
+  /// Must not be called for evaluations whose degenerate-dual / red-cost
+  /// pipeline added conflicts to the conflict pool: repeating such an
+  /// evaluation adds those reconvergence conflicts again (the pool keeps
+  /// duplicates) and propagates them, so the re-evaluation is not redundant.
   void markNodeEvaluated();
 
   /// Adds the pseudocost observations that a redundant re-evaluation of the
@@ -271,8 +276,9 @@ class HighsSearch {
 
   /// Returns true when the last full evaluation of the currently installed
   /// node is still valid, i.e. evaluateNode() would repeat identical work:
-  /// no cuts were added or aged out, no bound changes happened on the local
-  /// or global domain and the upper limit did not change.
+  /// no cuts were added or aged out, no conflicts were added or removed, no
+  /// bound changes happened on the local or global domain and the upper limit
+  /// did not change.
   bool currentNodeEvalCurrent() const;
 
   NodeResult branch();
