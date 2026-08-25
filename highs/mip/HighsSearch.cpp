@@ -413,6 +413,13 @@ HighsInt HighsSearch::selectBranchingCandidate(int64_t maxSbIters,
       return candidate;
     }
 
+    // The objective limit must be active for every strong-branching child
+    // solve: it lets HEkkDual terminate a child whose dual objective proves
+    // that its optimum lies above the cutoff (model status kObjectiveBound).
+    // The limit persists through Playground::solveLp and is refreshed here
+    // whenever a new candidate is evaluated, so child solves always branch
+    // against the current cutoff (it is also refreshed right after an
+    // incumbent is found during strong branching, see below).
     lp->setObjectiveLimit(getUpperLimit());
 
     HighsInt col = fracints[candidate].first;
@@ -671,6 +678,20 @@ HighsInt HighsSearch::selectBranchingCandidate(int64_t maxSbIters,
           }
         }
       } else if (status == HighsLpRelaxation::Status::kInfeasible) {
+        // Covers both a primal-infeasible child and a child whose re-solve
+        // was terminated by the objective limit because its (exact) dual
+        // objective proved that its optimum lies above the cutoff
+        // (HEkkDual reports such solves with model status kObjectiveBound,
+        // which HighsLpRelaxation::run maps to kInfeasible). In both cases
+        // the child subtree cannot contain an improving solution, so the
+        // direction is pruned: addInfeasibleConflict() handles the
+        // objective-bound case through the stored dual upper-bound proof,
+        // the cutoff observation feeds the pseudocost, and the search
+        // commits to branching on this column with only the opposite
+        // direction open. The proven child bound (>= the objective limit)
+        // is intentionally not recorded in up/downbound since returning -1
+        // below commits this branching decision immediately, so the bounds
+        // of this call are never consulted afterwards.
         mipsolver.mipdata_->debugSolution.nodePruned(localdom);
         addInfeasibleConflict();
         pseudocost.addCutoffObservation(col, upbranch);
@@ -687,10 +708,29 @@ HighsInt HighsSearch::selectBranchingCandidate(int64_t maxSbIters,
         depthoffset -= 1;
 
         return true;
+      } else if (lp->getLpSolver().getModelStatus() ==
+                 HighsModelStatus::kIterationLimit) {
+        // The child re-solve was stopped by an iteration limit without
+        // terminating with an objective bound above the cutoff, so nothing
+        // is proven about the child's bound: do not feed the partial
+        // objective into the pseudocost and do not mark the direction as
+        // evaluated. Fall back to the pseudocost estimate for this node -
+        // exactly like candidates whose pseudocost is already reliable - so
+        // that the candidate keeps its branching utility, cannot be retried
+        // within this call, and remains eligible for evaluation at other
+        // nodes.
+        if (upbranch) {
+          upscore[candidate] = pseudocost.getPseudocostUp(col, fracval);
+          upscorereliable[candidate] = true;
+        } else {
+          downscore[candidate] = pseudocost.getPseudocostDown(col, fracval);
+          downscorereliable[candidate] = true;
+        }
       } else {
-        // printf("todo2\n");
-        // in case of an LP error we set the score of this variable to zero to
-        // avoid choosing it as branching candidate if possible
+        // Genuine LP failure (kError from a solve that was not stopped by
+        // an iteration limit): the outcome of this candidate is unknown, so
+        // set its score to zero to avoid choosing it as branching candidate
+        // if possible.
         downscore[candidate] = 0.0;
         upscore[candidate] = 0.0;
         downscorereliable[candidate] = 1;
