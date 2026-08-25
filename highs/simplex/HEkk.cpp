@@ -3828,7 +3828,10 @@ HighsStatus HEkk::getIterate() {
   this->simplex_nla_.getInvert();
   this->basis_ = iterate.basis_;
   if (iterate.dual_edge_weight_.size()) {
+    // Weights are saved in putIterate only when they are DSE weights
+    // for the saved basis, so restore the status along with them
     this->dual_edge_weight_ = iterate.dual_edge_weight_;
+    this->status_.has_dual_steepest_edge_weights = true;
   } else {
     this->status_.has_dual_steepest_edge_weights = false;
   }
