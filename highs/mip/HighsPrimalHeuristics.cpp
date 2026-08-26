@@ -510,6 +510,10 @@ void HighsPrimalHeuristics::diving(HighsMipWorker& worker) {
   lprelax.setMipWorker(worker);
   lprelax.setProfiling(mipsolver.profiling_);
   lprelax.loadModel();
+  const int64_t lpIters0 = lprelax.getNumLpIterations();
+  auto bookDiveLpIters = [&]() {
+    worker.getHeurLpIterations() += lprelax.getNumLpIterations() - lpIters0;
+  };
   lprelax.setIterationLimit(
       std::max(int64_t{10000}, 2 * mipsolver.mipdata_->firstrootlpiters));
   lprelax.getLpSolver().changeColsBounds(0, mipsolver.numCol() - 1,
@@ -531,7 +535,10 @@ void HighsPrimalHeuristics::diving(HighsMipWorker& worker) {
   fixingVals.reserve(intcols.size());
   while (true) {
     const HighsLpRelaxation::Status status = lprelax.run();
-    if (status != HighsLpRelaxation::Status::kOptimal) return;
+    if (status != HighsLpRelaxation::Status::kOptimal) {
+      bookDiveLpIters();
+      return;
+    }
     const std::vector<double>& sol =
         lprelax.getLpSolver().getSolution().col_value;
     fixingCols.clear();
@@ -574,6 +581,7 @@ void HighsPrimalHeuristics::diving(HighsMipWorker& worker) {
     if (fixingCols.empty() && best_col == -1) {
       // All integer variables are integral: try the resulting solution
       trySolution(sol, kSolutionSourceHeuristic, worker);
+      bookDiveLpIters();
       return;
     }
 
@@ -592,6 +600,7 @@ void HighsPrimalHeuristics::diving(HighsMipWorker& worker) {
       localdom.conflictAnalysis(worker.getConflictPool(),
                                 worker.getGlobalDomain(),
                                 worker.getPseudocost());
+      bookDiveLpIters();
       return;
     }
     lprelax.flushDomain(localdom, true);
@@ -1521,6 +1530,7 @@ void HighsPrimalHeuristics::randomizedRounding(
     lprelax.setMipWorker(worker);
     lprelax.setProfiling(mipsolver.profiling_);
     lprelax.loadModel();
+    const int64_t lpIters0 = lprelax.getNumLpIterations();
     lprelax.setIterationLimit(
         std::max(int64_t{10000}, 2 * mipsolver.mipdata_->firstrootlpiters));
     lprelax.getLpSolver().changeColsBounds(0, mipsolver.numCol() - 1,
@@ -1560,6 +1570,8 @@ void HighsPrimalHeuristics::randomizedRounding(
                    lprelax.getObjective(), kSolutionSourceRandomizedRounding,
                    worker);
     }
+
+    worker.getHeurLpIterations() += lprelax.getNumLpIterations() - lpIters0;
   } else {
     trySolution(localdom.col_lower_, kSolutionSourceRandomizedRounding, worker);
   }
