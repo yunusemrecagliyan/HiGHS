@@ -1319,6 +1319,15 @@ restart:
       };
       dbgPrint("enter");
 
+      // Flush per-worker heuristic LP iteration counters into the global
+      // budget before the gate is consulted anywhere: async workers run
+      // heuristics between epochs, and moreHeuristicsAllowed() reads stale
+      // totals if their local spend is not merged at epoch boundaries.
+      // (Prevents N-worker amplification where each worker sees a fresh
+      // budget unaware of co-workers' concurrent heuristic spend.)
+      for (HighsInt i = 0; i < workersInFlight; ++i)
+        mipdata_->heuristics.flushStatistics(*this, mipdata_->workers[i]);
+
       // Sync global pseudo-cost with worker information and hand the
       // global observations to all workers (superset of the baseline
       // resetWorkerPseudoCosts, which only covered assigned workers).
