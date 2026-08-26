@@ -1089,6 +1089,18 @@ restart:
     // thread-safe - suspend the instrumentation while async workers run.
     heurStatsSuspended = true;
 
+    // Async + PAMI is a proven thrash combination (glass4 @8t PB 1733M
+    // serial vs 1841M/1925M with simplex_strategy 2/3): force serial dual
+    // simplex while async workers run. PAMI can be re-enabled per solve by
+    // leaving mip_async_node_fetch off.
+    HighsInt savedSimplexStrategy = -1;
+    if (options_mip_->simplex_strategy == kSimplexStrategyDualMulti ||
+        options_mip_->simplex_strategy == kSimplexStrategyDualTasks) {
+      savedSimplexStrategy = options_mip_->simplex_strategy;
+      mipdata_->getLp().getLpSolver().setOptionValue("simplex_strategy",
+                                                     kSimplexStrategyDual);
+    }
+
     const bool parallelLockRestore = mipdata_->parallelLockActive();
     // Behave like the parallel phase of the baseline: parallelLockActive()
     // makes the search/heuristics/cliquetable paths take their
@@ -1658,6 +1670,11 @@ restart:
 
     setParallelLock(parallelLockRestore);
     heurStatsSuspended = false;
+
+    if (savedSimplexStrategy >= 0) {
+      mipdata_->getLp().getLpSolver().setOptionValue("simplex_strategy",
+                                                     savedSimplexStrategy);
+    }
 
     // A restart vote fired inside the async session: apply the restart here
     // on the caller thread (pool/pseudocost state is synced and all workers
