@@ -59,7 +59,13 @@ HighsStatus HEkkDual::solve(const bool pass_force_phase2) {
 
   // Determine the duals without cost perturbation
   ekk_instance_.initialiseCost(SimplexAlgorithm::kDual, kSolvePhaseUnknown);
-  ekk_instance_.computeDual();
+  // HEkk::solve() -> initialiseForSolve() has already computed the duals from
+  // the same freshly copied, unperturbed costs; nothing between the two calls
+  // mutates workCost_/workShift_/basis_, so recomputing them here repeats a
+  // full BTRAN + PRICE with identical inputs.
+  if (!getenv("HIGHS_REDUNDANT_DUAL")) {
+    ekk_instance_.computeDual();
+  }
   ekk_instance_.computeSimplexDualInfeasible();
   // Record whether the solution with unperturbed costs is dual feasible
   const bool dual_feasible_with_unperturbed_costs =
