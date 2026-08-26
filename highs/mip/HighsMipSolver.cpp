@@ -1081,6 +1081,9 @@ restart:
   // restart were required, the mode would fall back by ending cleanly into
   // the normal exit path of run().
   // ------------------------------------------------------------------
+  bool asyncRequestsRestart = false;       // restart vote fired in async
+  bool restartRequestedAfterAsync = false; // performRestart was applied and
+                                           // the barriered loop may resume
   auto asyncRunNodeFetch = [&]() {
     // The static HEUR_STATS accumulators inside runHeuristics are not
     // thread-safe - suspend the instrumentation while async workers run.
@@ -1112,7 +1115,6 @@ restart:
     int64_t numStallNodesAsync = 0;
     std::vector<HighsInt> epochIndices;
     epochIndices.reserve(static_cast<size_t>(max_num_workers) + 1);
-
     // Periodic synchronization: heavy plunging keeps children flowing into
     // the shared queue continuously, so the natural all-idle condition can
     // stay unreached for very long stretches. Every epochFetchBudget node
@@ -1484,6 +1486,24 @@ restart:
         worker.upper_limit = mipdata_->upper_limit;
         worker.optimality_limit = mipdata_->optimality_limit;
       }
+
+      // Restart voting (port of the baseline barriered check): the search
+      // treeweight accumulated across all workers feeds the same
+      // checkRestart() heuristic used by the serial loop. A triggered
+      // restart leaves async mode with a special flag; the caller then
+      // performs performRestart() itself and re-enters the barriered loop.
+      if (!submip && options_mip_->mip_allow_restart) {
+        const RestartVote vote =
+            checkRestart(master_worker, workersInFlight / 2,
+                         master_worker.search_ptr_->treeweight);
+        if (vote == RestartVote::kWouldRestart) {
+          dbgPrint("restart-vote");
+          asyncRequestsRestart = true;
+          terminateAll = true;
+          stopRequested.store(true, std::memory_order_relaxed);
+          return;
+        }
+      }
     };
 
     // ---------------- persistent worker body ----------------
@@ -1638,6 +1658,17 @@ restart:
 
     setParallelLock(parallelLockRestore);
     heurStatsSuspended = false;
+
+    // A restart vote fired inside the async session: apply the restart here
+    // on the caller thread (pool/pseudocost state is synced and all workers
+    // are joined), then let the caller resume the barriered loop, which
+    // re-runs presolve + root evaluation on the tightened model.
+    if (asyncRequestsRestart && !terminate()) {
+      profiling_->start(kMipClockPerformRestart);
+      performRestart();
+      profiling_->stop(kMipClockPerformRestart);
+      restartRequestedAfterAsync = modelstatus_ == HighsModelStatus::kNotset;
+    }
   };
 
   // Main solve loop
@@ -1657,6 +1688,15 @@ restart:
         mipdata_->hasMultipleWorkers() && max_num_workers > 1 &&
         nodeLim == maxNodesPerWorkerLim) {
       asyncRunNodeFetch();
+      // A sync-epoch restart vote inside async mode applied
+      // performRestart(); the barriered loop resumes on the tightened
+      // model instead of terminating the search.
+      if (restartRequestedAfterAsync) {
+        restartRequestedAfterAsync = false;
+        if (!mipdata_->nodequeue.empty() && !terminate()) {
+          goto restart;
+        }
+      }
       break;
     }
 
