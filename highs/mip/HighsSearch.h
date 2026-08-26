@@ -63,6 +63,7 @@ class HighsSearch {
   bool evalSnapshotValid = false;
   uint64_t evalSnapshotEpoch = 0;
   bool evalSnapshotInHeuristic = false;
+  int evalSkipsSinceFull = 0;
   const HighsLpRelaxation* evalSnapshotLp = nullptr;
   double evalSnapshotUpperLimit = kHighsInf;
   double evalSnapshotOptimalityLimit = kHighsInf;

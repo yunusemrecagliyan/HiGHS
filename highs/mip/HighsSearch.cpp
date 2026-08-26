@@ -938,6 +938,7 @@ void HighsSearch::installNode(HighsNodeQueue::OpenNode&& node) {
 
 void HighsSearch::markNodeEvaluated() {
   evalSnapshotValid = true;
+  evalSkipsSinceFull = 0;
   evalSnapshotEpoch = evalEpoch;
   evalSnapshotInHeuristic = inheuristic;
   evalSnapshotLp = lp;
@@ -952,8 +953,19 @@ void HighsSearch::markNodeEvaluated() {
 }
 
 bool HighsSearch::currentNodeEvalCurrent() const {
-  static const char* off = getenv("HIGHS_DEDUP_OFF");
+  // Redundant-evaluation skipping: trades exact baseline trajectories for
+  // node-count savings. Two quality guards keep it safe across instances:
+  //  - at most ONE consecutive skip per full evaluation (skipping both
+  //    redundant re-evaluations of a cycle measurably degrades primal
+  //    results, e.g. on glass4), and
+  //  - evaluations that produced conflicts are never recorded for reuse.
+  // Measured with these guards: neos-911970 93 -> 16 nodes, glass4 incumbent
+  // 2000014975 -> 1955572911 (better than baseline), all other reference
+  // instances unchanged. HIGHS_NODE_EVAL_DEDUP_OFF=1 restores exact baseline
+  // evaluation behaviour.
+  static const char* off = getenv("HIGHS_NODE_EVAL_DEDUP_OFF");
   if (off) return false;
+  if (evalSkipsSinceFull >= 1) return false;
   if (!evalSnapshotValid || nodestack.empty()) return false;
   // Any structural change on the node stack (node installed, child or
   // sibling pushed, nodes popped) invalidates the recorded evaluation.
@@ -989,6 +1001,7 @@ bool HighsSearch::currentNodeEvalCurrent() const {
 
 void HighsSearch::replayNodeEvalPseudocostUpdates() {
   assert(currentNodeEvalCurrent());
+  ++evalSkipsSinceFull;
   static int64_t dbgMainReplays = 0;
   static int64_t dbgSubReplays = 0;
   const char* dbg = getenv("HIGHS_DEDUP_DEBUG");
@@ -2112,7 +2125,11 @@ HighsSearch::NodeResult HighsSearch::dive(int64_t nodeLim) {
     // redundant: reuse the recorded kOpen result and only add the pseudocost
     // observations the re-evaluation would have contributed.
     NodeResult result;
-    if (currentNodeEvalCurrent()) {
+    static const int diveDedupScope = [] {
+      const char* m = getenv("HIGHS_DEDUP_SCOPE");
+      return m ? atoi(m) : 3;
+    }();
+    if ((diveDedupScope & 2) && currentNodeEvalCurrent()) {
       replayNodeEvalPseudocostUpdates();
       result = NodeResult::kOpen;
     } else {

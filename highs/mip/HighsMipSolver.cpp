@@ -747,13 +747,60 @@ restart:
 
   auto runHeuristics = [&](const HighsInt i, bool& infeasible) -> bool {
     HighsMipWorker& worker = mipdata_->workers[i];
+
+    // HEUR_STATS=1: per-heuristic call/time/improvement accounting
+    struct HeurStats {
+      int64_t calls = 0;
+      double ms = 0.0;
+      int64_t improvements = 0;
+    };
+    static HeurStats hstats[6];
+    static const char* hnames[6] = {"CAR", "RR", "DIV", "RENS", "RINS", "LB"};
+    static std::chrono::steady_clock::time_point hstatsT0 =
+        std::chrono::steady_clock::now();
+    static bool hstatsReg = [] {
+      atexit([] {
+        if (!getenv("HEUR_STATS")) return;
+        FILE* f = fopen("heur_stats.txt", "w");
+        if (!f) return;
+        const double tot =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          hstatsT0)
+                .count();
+        fprintf(f, "total=%.2fs\n", tot);
+        for (int t = 0; t < 6; ++t)
+          fprintf(f, "%5s calls=%lld ms=%.0f improvements=%lld\n", hnames[t],
+                  (long long)hstats[t].calls, hstats[t].ms,
+                  (long long)hstats[t].improvements);
+        fclose(f);
+      });
+      return true;
+    }();
+#define HEUR_RUN(IDX, STMT)                                                   \
+  do {                                                                        \
+    const double heurUlBefore = mipdata_->upper_limit;                        \
+    const auto heurT0 = std::chrono::steady_clock::now();                     \
+    STMT;                                                                     \
+    hstats[IDX].calls++;                                                      \
+    hstats[IDX].ms += std::chrono::duration<double, std::milli>(              \
+                          std::chrono::steady_clock::now() - heurT0)          \
+                          .count();                                           \
+    if (mipdata_->upper_limit < heurUlBefore - 1e-9)                          \
+      hstats[IDX].improvements++;                                             \
+  } while (0)
+
     // The node was fully evaluated just before separation. When separation
     // produced neither cuts nor bound changes and no new incumbent arrived,
     // re-evaluating would repeat the identical propagate / LP resolve /
     // estimate pipeline on the same state, so only the pseudocost
     // observations of that re-evaluation are added and its recorded result
     // (open, not pruned) is reused.
-    if (!worker.search_ptr_->currentNodeEvalCurrent()) {
+    // Scope bit 1 gates the runHeuristics re-evaluation skip.
+    static const int heurDedupScope = [] {
+      const char* m = getenv("HIGHS_DEDUP_SCOPE");
+      return m ? atoi(m) : 3;
+    }();
+    if (!((heurDedupScope & 1) && worker.search_ptr_->currentNodeEvalCurrent())) {
       if (!mipdata_->parallelLockActive())
         profiling_->start(kMipClockDiveEvaluateNode);
       const HighsSearch::NodeResult evaluate_node_result =
@@ -776,16 +823,20 @@ restart:
     if (!mipdata_->parallelLockActive())
       profiling_->start(kMipClockDivePrimalHeuristics);
     if (mipdata_->incumbent.empty()) {
-      mipdata_->heuristics.constraintAwareRounding(
-          worker,
-          worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+      HEUR_RUN(0, {
+        mipdata_->heuristics.constraintAwareRounding(
+            worker,
+            worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+      });
     }
     if (mipdata_->incumbent.empty()) {
       if (!mipdata_->parallelLockActive())
         profiling_->start(kMipClockDiveRandomizedRounding);
-      mipdata_->heuristics.randomizedRounding(
-          worker,
-          worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+      HEUR_RUN(1, {
+        mipdata_->heuristics.randomizedRounding(
+            worker,
+            worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+      });
       if (!mipdata_->parallelLockActive())
         profiling_->stop(kMipClockDiveRandomizedRounding);
     }
@@ -793,7 +844,7 @@ restart:
       if (options_mip_->mip_heuristic_run_diving) {
         if (!mipdata_->parallelLockActive())
           profiling_->start(kMipClockDiveRandomizedRounding);
-        mipdata_->heuristics.diving(worker);
+        HEUR_RUN(2, { mipdata_->heuristics.diving(worker); });
         if (!mipdata_->parallelLockActive())
           profiling_->stop(kMipClockDiveRandomizedRounding);
       }
@@ -802,9 +853,11 @@ restart:
       if (options_mip_->mip_heuristic_run_rens) {
         if (!mipdata_->parallelLockActive())
           profiling_->start(kMipClockDiveRens);
-        mipdata_->heuristics.RENS(
-            worker,
-            worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+        HEUR_RUN(3, {
+          mipdata_->heuristics.RENS(
+              worker,
+              worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+        });
         if (!mipdata_->parallelLockActive())
           profiling_->stop(kMipClockDiveRens);
       }
@@ -812,18 +865,22 @@ restart:
       if (options_mip_->mip_heuristic_run_rins) {
         if (!mipdata_->parallelLockActive())
           profiling_->start(kMipClockDiveRins);
-        mipdata_->heuristics.RINS(
-            worker,
-            worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+        HEUR_RUN(4, {
+          mipdata_->heuristics.RINS(
+              worker,
+              worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+        });
         if (!mipdata_->parallelLockActive())
           profiling_->stop(kMipClockDiveRins);
       }
       if (options_mip_->mip_heuristic_run_local_branching) {
         if (!mipdata_->parallelLockActive())
           profiling_->start(kMipClockDiveRins);
-        mipdata_->heuristics.localBranching(
-            worker,
-            worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+        HEUR_RUN(5, {
+          mipdata_->heuristics.localBranching(
+              worker,
+              worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+        });
         if (!mipdata_->parallelLockActive())
           profiling_->stop(kMipClockDiveRins);
       }
