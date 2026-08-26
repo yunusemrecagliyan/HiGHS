@@ -1081,10 +1081,25 @@ restart:
   // restart were required, the mode would fall back by ending cleanly into
   // the normal exit path of run().
   // ------------------------------------------------------------------
+  bool asyncRequestsRestart = false;       // restart vote fired in async
+  bool restartRequestedAfterAsync = false; // performRestart was applied and
+                                           // the barriered loop may resume
   auto asyncRunNodeFetch = [&]() {
     // The static HEUR_STATS accumulators inside runHeuristics are not
     // thread-safe - suspend the instrumentation while async workers run.
     heurStatsSuspended = true;
+
+    // Async + PAMI is a proven thrash combination (glass4 @8t PB 1733M
+    // serial vs 1841M/1925M with simplex_strategy 2/3): force serial dual
+    // simplex while async workers run. PAMI can be re-enabled per solve by
+    // leaving mip_async_node_fetch off.
+    HighsInt savedSimplexStrategy = -1;
+    if (options_mip_->simplex_strategy == kSimplexStrategyDualMulti ||
+        options_mip_->simplex_strategy == kSimplexStrategyDualTasks) {
+      savedSimplexStrategy = options_mip_->simplex_strategy;
+      mipdata_->getLp().getLpSolver().setOptionValue("simplex_strategy",
+                                                     kSimplexStrategyDual);
+    }
 
     const bool parallelLockRestore = mipdata_->parallelLockActive();
     // Behave like the parallel phase of the baseline: parallelLockActive()
@@ -1112,7 +1127,6 @@ restart:
     int64_t numStallNodesAsync = 0;
     std::vector<HighsInt> epochIndices;
     epochIndices.reserve(static_cast<size_t>(max_num_workers) + 1);
-
     // Periodic synchronization: heavy plunging keeps children flowing into
     // the shared queue continuously, so the natural all-idle condition can
     // stay unreached for very long stretches. Every epochFetchBudget node
@@ -1305,6 +1319,15 @@ restart:
       };
       dbgPrint("enter");
 
+      // Flush per-worker heuristic LP iteration counters into the global
+      // budget before the gate is consulted anywhere: async workers run
+      // heuristics between epochs, and moreHeuristicsAllowed() reads stale
+      // totals if their local spend is not merged at epoch boundaries.
+      // (Prevents N-worker amplification where each worker sees a fresh
+      // budget unaware of co-workers' concurrent heuristic spend.)
+      for (HighsInt i = 0; i < workersInFlight; ++i)
+        mipdata_->heuristics.flushStatistics(*this, mipdata_->workers[i]);
+
       // Sync global pseudo-cost with worker information and hand the
       // global observations to all workers (superset of the baseline
       // resetWorkerPseudoCosts, which only covered assigned workers).
@@ -1417,9 +1440,18 @@ restart:
         return;
       }
 
-      // Sync global information (port).
+      // Sync global information (port). The pool merge must run with the
+      // parallel lock released: syncPools early-outs while
+      // parallelLockActive() is true (silent no-op that would leave the
+      // async session without any cross-worker cut/conflict sharing).
+      // Safe here because all other workers are parked on nodefetch_mutex
+      // for the whole epoch.
       profiling_->start(kMipClockDomainPropgate);
-      syncPools(epochIndices);
+      {
+        setParallelLock(false);
+        syncPools(epochIndices);
+        setParallelLock(true);
+      }
       syncGlobalDomain(epochIndices);
       mipdata_->getDomain().propagate();
       profiling_->stop(kMipClockDomainPropgate);
@@ -1483,6 +1515,24 @@ restart:
         worker.upper_bound = mipdata_->upper_bound;
         worker.upper_limit = mipdata_->upper_limit;
         worker.optimality_limit = mipdata_->optimality_limit;
+      }
+
+      // Restart voting (port of the baseline barriered check): the search
+      // treeweight accumulated across all workers feeds the same
+      // checkRestart() heuristic used by the serial loop. A triggered
+      // restart leaves async mode with a special flag; the caller then
+      // performs performRestart() itself and re-enters the barriered loop.
+      if (!submip && options_mip_->mip_allow_restart) {
+        const RestartVote vote =
+            checkRestart(master_worker, workersInFlight / 2,
+                         master_worker.search_ptr_->treeweight);
+        if (vote == RestartVote::kWouldRestart) {
+          dbgPrint("restart-vote");
+          asyncRequestsRestart = true;
+          terminateAll = true;
+          stopRequested.store(true, std::memory_order_relaxed);
+          return;
+        }
       }
     };
 
@@ -1638,6 +1688,22 @@ restart:
 
     setParallelLock(parallelLockRestore);
     heurStatsSuspended = false;
+
+    if (savedSimplexStrategy >= 0) {
+      mipdata_->getLp().getLpSolver().setOptionValue("simplex_strategy",
+                                                     savedSimplexStrategy);
+    }
+
+    // A restart vote fired inside the async session: apply the restart here
+    // on the caller thread (pool/pseudocost state is synced and all workers
+    // are joined), then let the caller resume the barriered loop, which
+    // re-runs presolve + root evaluation on the tightened model.
+    if (asyncRequestsRestart && !terminate()) {
+      profiling_->start(kMipClockPerformRestart);
+      performRestart();
+      profiling_->stop(kMipClockPerformRestart);
+      restartRequestedAfterAsync = modelstatus_ == HighsModelStatus::kNotset;
+    }
   };
 
   // Main solve loop
@@ -1683,6 +1749,15 @@ restart:
         mipdata_->hasMultipleWorkers() && max_num_workers > 1 &&
         nodeLim == maxNodesPerWorkerLim) {
       asyncRunNodeFetch();
+      // A sync-epoch restart vote inside async mode applied
+      // performRestart(); the barriered loop resumes on the tightened
+      // model instead of terminating the search.
+      if (restartRequestedAfterAsync) {
+        restartRequestedAfterAsync = false;
+        if (!mipdata_->nodequeue.empty() && !terminate()) {
+          goto restart;
+        }
+      }
       break;
     }
 
