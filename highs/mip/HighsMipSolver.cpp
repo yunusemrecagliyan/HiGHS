@@ -7,6 +7,13 @@
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 #include "mip/HighsMipSolver.h"
 
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <memory>
+#include <mutex>
+
 #include "lp_data/HighsLpUtils.h"
 #include "lp_data/HighsModelUtils.h"
 #include "mip/HighsCliqueTable.h"
@@ -745,10 +752,12 @@ restart:
     return false;
   };
 
+  // HEUR_STATS=1: per-heuristic call/time/improvement accounting
+  // heurStatsSuspended: the static accumulators inside runHeuristics are not
+  // thread-safe; they are disabled while asynchronous node-fetch mode runs.
+  bool heurStatsSuspended = false;
   auto runHeuristics = [&](const HighsInt i, bool& infeasible) -> bool {
     HighsMipWorker& worker = mipdata_->workers[i];
-
-    // HEUR_STATS=1: per-heuristic call/time/improvement accounting
     struct HeurStats {
       int64_t calls = 0;
       double ms = 0.0;
@@ -781,12 +790,14 @@ restart:
     const double heurUlBefore = mipdata_->upper_limit;                        \
     const auto heurT0 = std::chrono::steady_clock::now();                     \
     STMT;                                                                     \
-    hstats[IDX].calls++;                                                      \
-    hstats[IDX].ms += std::chrono::duration<double, std::milli>(              \
-                          std::chrono::steady_clock::now() - heurT0)          \
-                          .count();                                           \
-    if (mipdata_->upper_limit < heurUlBefore - 1e-9)                          \
-      hstats[IDX].improvements++;                                             \
+    if (!heurStatsSuspended) {                                                \
+      hstats[IDX].calls++;                                                    \
+      hstats[IDX].ms += std::chrono::duration<double, std::milli>(            \
+                            std::chrono::steady_clock::now() - heurT0)        \
+                            .count();                                         \
+      if (mipdata_->upper_limit < heurUlBefore - 1e-9)                        \
+        hstats[IDX].improvements++;                                           \
+    }                                                                         \
   } while (0)
 
     // The node was fully evaluated just before separation. When separation
@@ -1030,6 +1041,605 @@ restart:
     worker.resetSepaStats();
   };
 
+  // ------------------------------------------------------------------
+  // Optional nondeterministic asynchronous node-fetching mode
+  // (option mip_async_node_fetch).
+  //
+  // Once the ramp-up phase of the barrier-synchronized loop below has
+  // completed (nodeLim == maxNodesPerWorkerLim), instead of entering further
+  // barriered rounds (prepareNodes assigns <= 2 nodes per worker, one
+  // processNodes round-trip, then a fully synchronous tail), one persistent
+  // task per worker is started. Every worker task loops:
+  //
+  //   1. under nodefetch_mutex: fetch exactly one node from the shared
+  //      nodequeue. Divergence from prepareNodes: the bestNode/bestBound
+  //      alternation (including the i==0 j==0 special case) is NOT
+  //      replicated - async mode always pops the best-bound node and the
+  //      lastLbLeave bookkeeping is best effort only.
+  //   2. outside any lock: run the same inner pipeline as the processNode
+  //      lambda of processNodes (evaluate -> separation -> primal
+  //      heuristics -> dive/plunge chain), minus the restart vote tail.
+  //   3. open children produced by the search are pushed DIRECTLY into the
+  //      shared nodequeue under nodefetch_mutex as soon as they are
+  //      stashed (the baseline buffers them locally until round end). This
+  //      immediate cross-worker sharing is the intentional source of
+  //      nondeterminism of this mode.
+  //
+  // Whenever a worker finds the shared queue empty and no other worker is
+  // processing a node, that (last-idle) worker executes a full
+  // synchronization epoch - equivalent to the serial tail of one baseline
+  // round - while holding nodefetch_mutex, so no other worker can touch
+  // shared MIP data during the epoch: early-termination resolution,
+  // per-worker open-node/statistics flushing, incumbent merging through
+  // addIncumbent, pseudo-cost syncing, cut/conflict pool syncing, global
+  // domain sync + propagation, pruning of infeasible nodes, dual bound
+  // updates, logging, global limit checks and worker spawning. Afterwards
+  // all workers are woken and fetching resumes.
+  //
+  // Restart votes are DISABLED in async mode (documented simplification);
+  // restarts outside the node loop (pre-search/root) are unaffected. If a
+  // restart were required, the mode would fall back by ending cleanly into
+  // the normal exit path of run().
+  // ------------------------------------------------------------------
+  auto asyncRunNodeFetch = [&]() {
+    // The static HEUR_STATS accumulators inside runHeuristics are not
+    // thread-safe - suspend the instrumentation while async workers run.
+    heurStatsSuspended = true;
+
+    const bool parallelLockRestore = mipdata_->parallelLockActive();
+    // Behave like the parallel phase of the baseline: parallelLockActive()
+    // makes the search/heuristics/cliquetable paths take their
+    // worker-local buffering branches (see HighsSearch::addIncumbent,
+    // HighsSearch::checkLimits, ...).
+    setParallelLock(true);
+
+    // ---------------- shared coordination state ----------------
+    // Guards every mutating access to mipdata_->nodequeue and the epoch
+    // machinery while async mode is running.
+    std::mutex nodefetch_mutex;
+    std::condition_variable nodefetch_cv;
+    bool epochRunning = false;      // an epoch is being executed
+    uint64_t epochSerial = 0;       // bumped after each epoch
+    uint64_t workGeneration = 0;    // bumped when nodes enter an empty queue
+    bool terminateAll = false;      // leave async mode entirely
+    HighsInt workersProcessing = 0; // workers currently inside a pipeline
+    HighsInt bodiesStarted = 1;     // persistent tasks launched so far
+    HighsInt workersInFlight =
+        num_workers; // logical workers participating (grows with spawns)
+    std::atomic<bool> stopRequested{false};
+    std::vector<char> dirtySinceSync(max_num_workers + 1, 0);
+    std::vector<HighsInt> stallNodesAsync(max_num_workers + 1, 0);
+    int64_t numStallNodesAsync = 0;
+    std::vector<HighsInt> epochIndices;
+    epochIndices.reserve(static_cast<size_t>(max_num_workers) + 1);
+
+    // Periodic synchronization: heavy plunging keeps children flowing into
+    // the shared queue continuously, so the natural all-idle condition can
+    // stay unreached for very long stretches. Every epochFetchBudget node
+    // fetches worldwide, workers voluntarily go idle once more and the
+    // resulting epoch refreshes pseudo-costs, pools, domains, bounds and
+    // logging - comparable in spirit to the per-round sync of the barriered
+    // baseline (which synchronizes every ~2 nodes per worker).
+    constexpr int64_t kAsyncEpochFetchBudget = 200;
+    int64_t epochFetchBudgetRemaining = kAsyncEpochFetchBudget;
+    auto epochDueLocked = [&]() {
+      if (stopRequested.load(std::memory_order_relaxed)) return false;
+      return epochFetchBudgetRemaining <= 0;
+    };
+
+    // Global stop broadcast: any worker observing a limit (local limits
+    // include the wall-clock time limit and the early-termination signal)
+    // flips this so that all workers stop fetching and drain into the next
+    // synchronization epoch, which performs the authoritative global
+    // checkLimits() and resolves the final model status. Without this,
+    // workers would keep cycling through a still-large shared queue one
+    // bail-out node at a time (each plunge chain may publish many children)
+    // and the all-idle condition for an epoch might never be reached.
+    auto requestStopAll = [&]() {
+      stopRequested.store(true, std::memory_order_relaxed);
+    };
+    auto stopPoll = [&]() -> bool {
+      return stopRequested.load(std::memory_order_relaxed);
+    };
+
+    // Move whatever open children the worker currently has buffered into
+    // the shared nodequeue. MUST be called with nodefetch_mutex held.
+    auto flushProcessedToSharedQueueLocked = [&](HighsInt wi) {
+      HighsMipWorker& worker = mipdata_->workers[wi];
+      if (worker.processedNodes.empty()) return;
+      profiling_->start(kMipClockOpenNodesToQueue0);
+      for (auto& node_treeweight_pair : worker.processedNodes) {
+        HighsNodeQueue::OpenNode& node = node_treeweight_pair.first;
+        double tmpTreeWeight = mipdata_->nodequeue.emplaceNode(
+            std::move(node.domchgstack), std::move(node.branchings),
+            node.lower_bound, node.estimate, node.depth);
+        if (node_treeweight_pair.second)
+          worker.search_ptr_->treeweight += tmpTreeWeight;
+      }
+      worker.processedNodes.clear();
+      profiling_->stop(kMipClockOpenNodesToQueue0);
+    };
+
+    // Opportunistic flush outside the locked sections of the pipeline.
+    // Bumps workGeneration (and wakes parked co-workers) whenever open
+    // children entered a previously empty shared queue.
+    auto flushProcessedToSharedQueue = [&](HighsInt wi) -> void {
+      std::lock_guard<std::mutex> lk(nodefetch_mutex);
+      const bool wasEmpty = mipdata_->nodequeue.empty();
+      flushProcessedToSharedQueueLocked(wi);
+      if (wasEmpty && !mipdata_->nodequeue.empty()) {
+        ++workGeneration;
+        nodefetch_cv.notify_all();
+      }
+    };
+
+    // ---------------- the per-node pipeline ----------------
+    // Mirror of the processNode lambda body of processNodes() for a single
+    // fetched node, with:
+    //  * the restart vote accounting removed (disabled in async mode),
+    //  * immediate publishing of open children into the shared queue,
+    //  * termination driven by global limits/callback interrupts surfaced
+    //    as stopRequested (callbacks cannot fire inside workers because
+    //    parallelLockActive() == true, they are evaluated once per epoch).
+    auto processFetchedNode = [&](HighsInt wi) {
+      HighsMipWorker& worker = mipdata_->workers[wi];
+      worker.prepNodeIdx = 0;
+      bool considerHeuristics = true;
+      while (worker.prepNodeIdx != worker.preparedNodes.size()) {
+        int64_t nodes_explored = 0;
+        int64_t lastLocalNodeCount = worker.search_ptr_->getLocalNodes();
+        worker.search_ptr_->installNode(
+            std::move(worker.preparedNodes[worker.prepNodeIdx]));
+        ++worker.prepNodeIdx;
+        if (worker.search_ptr_->getCurrentEstimate() >= worker.upper_limit)
+          ++stallNodesAsync[wi];
+        {
+          bool stop = false;
+          evaluateNode(wi);
+          assignEarlyTermination(worker);
+          if (pruneNode(wi, stop)) {
+            flushProcessedToSharedQueue(wi);
+            if (worker.early_termination) {
+              requestStopAll();
+              break;
+            }
+            if (stop || stopRequested.load(std::memory_order_relaxed)) break;
+            continue;
+          }
+          if (stop || worker.search_ptr_->checkLimits() ||
+              stopRequested.load(std::memory_order_relaxed)) {
+            // Local limits include wall-clock time and early termination;
+            // make every co-worker aware so they stop fetching.
+            requestStopAll();
+            break;
+          }
+          if (!mipdata_->parallelLockActive()) mipdata_->printDisplayLine();
+          separateAndStoreBasis(wi, stop);
+          if (stop) {
+            flushProcessedToSharedQueue(wi);
+            break;
+          }
+        }
+        worker.getConflictPool().performAging();
+        HighsInt iterlimit = 10 * std::max(mipdata_->getLp().getAvgSolveIters(),
+                                           mipdata_->avgrootlpiters);
+        iterlimit = std::max({HighsInt{10000}, iterlimit,
+                              HighsInt((3 * mipdata_->firstrootlpiters) / 2)});
+        worker.getLpRelaxation().setIterationLimit(iterlimit);
+        while (true) {
+          if (considerHeuristics && worker.getAllowHeuristics() &&
+              mipdata_->moreHeuristicsAllowed()) {
+            bool stop = false;
+            if (runHeuristics(wi, stop)) break;
+            if (stop || stopRequested.load(std::memory_order_relaxed)) break;
+          }
+          considerHeuristics = false;
+          if (worker.getGlobalDomain().infeasible()) break;
+          if (dive(wi, maxNodesPerWorkerLim)) break;
+          if (worker.search_ptr_->checkLimits(
+                  worker.search_ptr_->getLocalNodes())) {
+            requestStopAll();
+            break;
+          }
+          if (stopRequested.load(std::memory_order_relaxed)) break;
+
+          nodes_explored +=
+              worker.search_ptr_->getLocalNodes() - lastLocalNodeCount;
+          lastLocalNodeCount = worker.search_ptr_->getLocalNodes();
+          if (nodes_explored >= 100) break;
+          if (backtrackPlunge(wi)) break;
+          if (!mipdata_->parallelLockActive()) {
+            worker.search_ptr_->flushStatistics(*this);
+            mipdata_->printDisplayLine();
+            lastLocalNodeCount = 0;
+          }
+        }
+        nodes_explored +=
+            worker.search_ptr_->getLocalNodes() - lastLocalNodeCount;
+        assignEarlyTermination(worker);
+        // Publish the open children of this plunge chain immediately - the
+        // documented nondeterministic divergence from the baseline which
+        // buffers them locally until the end of the round.
+        flushProcessedToSharedQueue(wi);
+        worker.search_ptr_->stashOpenNodes();
+        flushProcessedToSharedQueue(wi);
+        if (stopRequested.load(std::memory_order_relaxed))
+          break;
+        if (worker.early_termination) {
+          // Another worker signalled global early termination - relay it.
+          requestStopAll();
+          break;
+        }
+      }
+      if (worker.search_ptr_->hasNode()) {
+        worker.search_ptr_->stashOpenNodes();
+      }
+      // Any remaining leftovers go straight to the shared queue as well.
+      flushProcessedToSharedQueue(wi);
+    };
+
+    // ---------------- one full synchronization epoch ----------------
+    // Executed by the last-going-idle worker with nodefetch_mutex HELD, so
+    // no other worker touches shared solver state. Verbatim port of the
+    // serial tail of the barriered loop (early-termination resolution,
+    // per-worker flushing, incumbent merge, pseudo-cost / pool / domain
+    // sync, propagation, pruning, bound updates, logging, limit checks,
+    // worker spawning) with restart voting removed.
+    auto runSyncEpochLocked = [&]() {
+      // Workers whose pipelines contributed since the last epoch.
+      epochIndices.clear();
+      for (HighsInt i = 0; i < workersInFlight; ++i)
+        if (dirtySinceSync[i]) epochIndices.push_back(i);
+
+      const bool dbg = getenv("HIGHS_ASYNC_DEBUG") != nullptr;
+      auto dbgPrint = [&](const char* tag) {
+        if (!dbg) return;
+        fprintf(stderr,
+                "[async %s] t=%.1f q=%lld active=%lld proc=%d part=%d "
+                "wif=%d lb=%.6g ub=%.6g\n",
+                tag, timer_.read(), (long long)mipdata_->nodequeue.numNodes(),
+                (long long)mipdata_->nodequeue.numActiveNodes(),
+                (int)workersProcessing, (int)epochIndices.size(),
+                (int)workersInFlight, mipdata_->lower_bound,
+                mipdata_->upper_bound);
+      };
+      dbgPrint("enter");
+
+      // Sync global pseudo-cost with worker information and hand the
+      // global observations to all workers (superset of the baseline
+      // resetWorkerPseudoCosts, which only covered assigned workers).
+      syncGlobalPseudoCost();
+      for (HighsMipWorker& worker : mipdata_->workers)
+        mipdata_->getPseudoCost().syncPseudoCost(worker.getPseudocost());
+
+      // Early termination resolution (port of the baseline block).
+      const int64_t early_termination_lp_iterations =
+          mipdata_->worker_lp_iterations_stop.load(std::memory_order_relaxed);
+      HighsInt early_terminated_worker = -1;
+      if (early_termination_lp_iterations !=
+          std::numeric_limits<int64_t>::max()) {
+        for (const HighsInt i : epochIndices) {
+          if (mipdata_->workers[i].early_termination &&
+              mipdata_->workers[i].search_ptr_->lpiterations ==
+                  early_termination_lp_iterations) {
+            early_terminated_worker = i;
+            break;
+          }
+        }
+        if (early_terminated_worker != -1) {
+          // Clear all buffered solve information from workers that are not
+          // the earliest to terminate
+          for (HighsInt i = 0; i < workersInFlight; ++i) {
+            if (i == early_terminated_worker) continue;
+            HighsMipWorker& worker = mipdata_->workers[i];
+            worker.processedNodes.clear();
+            worker.search_ptr_->resetStatistics();
+            worker.resetHeurStats();
+            worker.resetSepaStats();
+            worker.solutions_.clear();
+            dirtySinceSync[i] = 0;
+          }
+          epochIndices.clear();
+          epochIndices.push_back(early_terminated_worker);
+        } else {
+          mipdata_->worker_lp_iterations_stop.store(
+              std::numeric_limits<int64_t>::max(), std::memory_order_relaxed);
+          for (HighsInt i = 0; i < workersInFlight; ++i)
+            mipdata_->workers[i].early_termination = false;
+        }
+      }
+
+      // Flush statistics and straggling open nodes of participating
+      // workers (port of the baseline OpenNodesToQueue0 block).
+      bool infeasible = false;
+      for (const HighsInt i : epochIndices) {
+        HighsMipWorker& worker = mipdata_->workers[i];
+        if (worker.getGlobalDomain().infeasible()) infeasible = true;
+        flushProcessedToSharedQueueLocked(i);
+        worker.search_ptr_->flushStatistics(*this);
+        syncSepaStats(worker);
+        mipdata_->heuristics.flushStatistics(*this, worker);
+        dirtySinceSync[i] = 0;
+      }
+
+      if (infeasible) {
+        mipdata_->nodequeue.clear();
+        mipdata_->pruned_treeweight = 1.0;
+        mipdata_->updateLowerBound(std::min(kHighsInf, mipdata_->upper_bound));
+        mipdata_->printDisplayLine();
+        terminateAll = true;
+        stopRequested.store(true, std::memory_order_relaxed);
+        return;
+      }
+
+      // Merge solutions found by the workers into the global incumbent.
+      // Momentarily drop the parallel lock so addIncumbent's assertion and
+      // its global side effects run exactly like in the baseline serial
+      // tail; this is safe because every other worker is blocked on
+      // nodefetch_mutex during the whole epoch.
+      {
+        setParallelLock(false);
+        syncSolutions();
+        setParallelLock(true);
+      }
+
+      if (early_terminated_worker == -1) {
+        mipdata_->updateLowerBound(std::min(
+            mipdata_->upper_bound, mipdata_->nodequeue.getBestLowerBound()));
+      }
+
+      // Stall-node accounting (port).
+      for (HighsInt i = 0; i < workersInFlight; ++i) {
+        if (stallNodesAsync[i] == 0) {
+          numStallNodesAsync = 0;
+        } else {
+          numStallNodesAsync += stallNodesAsync[i];
+        }
+        stallNodesAsync[i] = 0;
+        if (options_mip_->mip_max_stall_nodes != kHighsIInf &&
+            numStallNodesAsync >=
+                std::max(HighsInt{1}, options_mip_->mip_max_stall_nodes)) {
+          modelstatus_ = HighsModelStatus::kSolutionLimit;
+          mipdata_->printDisplayLine();
+          terminateAll = true;
+          stopRequested.store(true, std::memory_order_relaxed);
+          return;
+        }
+      }
+
+      // Global limit check: includes callback interrupts and wall-clock
+      // time limit; a triggered limit sets modelstatus_ internally.
+      if (mipdata_->checkLimits()) {
+        dbgPrint("limits");
+        mipdata_->printDisplayLine();
+        terminateAll = true;
+        stopRequested.store(true, std::memory_order_relaxed);
+        return;
+      }
+
+      // Sync global information (port).
+      profiling_->start(kMipClockDomainPropgate);
+      syncPools(epochIndices);
+      syncGlobalDomain(epochIndices);
+      mipdata_->getDomain().propagate();
+      profiling_->stop(kMipClockDomainPropgate);
+
+      profiling_->start(kMipClockPruneInfeasibleNodes);
+      mipdata_->pruned_treeweight += mipdata_->nodequeue.pruneInfeasibleNodes(
+          mipdata_->getDomain(), mipdata_->feastol);
+      profiling_->stop(kMipClockPruneInfeasibleNodes);
+
+      if (mipdata_->getDomain().infeasible()) {
+        mipdata_->nodequeue.clear();
+        mipdata_->pruned_treeweight = 1.0;
+        mipdata_->updateLowerBound(std::min(kHighsInf, mipdata_->upper_bound));
+        mipdata_->printDisplayLine();
+        terminateAll = true;
+        stopRequested.store(true, std::memory_order_relaxed);
+        return;
+      }
+
+      mipdata_->updateLowerBound(std::min(
+          mipdata_->upper_bound, mipdata_->nodequeue.getBestLowerBound()));
+      mipdata_->printDisplayLine();
+
+      if (mipdata_->nodequeue.empty()) {
+        // Search tree exhausted: leave async mode cleanly. The caller of
+        // run() performs the final syncSolutions/cleanup.
+        dbgPrint("queue-empty-exit");
+        terminateAll = true;
+        stopRequested.store(true, std::memory_order_relaxed);
+        return;
+      }
+
+      // Reset global domain and sync worker's global domains. Possible
+      // additional workers are created here while every other worker is
+      // blocked, so the mipdata container vectors never grow concurrently
+      // with live pipelines.
+      bool spawn_more_workers =
+          workersInFlight < max_num_workers &&
+          mipdata_->nodequeue.numNodes() > workersInFlight;
+      resetGlobalDomain(spawn_more_workers, mipdata_->hasMultipleWorkers());
+
+      if (spawn_more_workers) {
+        HighsInt new_max_num_workers =
+            std::min(static_cast<HighsInt>(mipdata_->nodequeue.numNodes()),
+                     max_num_workers);
+        mipdata_->getPseudoCost().removeChanged();
+        if (workersInFlight == 1) constructAdditionalWorkerData(master_worker);
+        createNewWorkers(new_max_num_workers - workersInFlight);
+        workersInFlight = new_max_num_workers;
+        // Snapshot the fresh bounds/limits onto all workers.
+        for (HighsMipWorker& worker : mipdata_->workers) {
+          worker.upper_bound = mipdata_->upper_bound;
+          worker.upper_limit = mipdata_->upper_limit;
+          worker.optimality_limit = mipdata_->optimality_limit;
+        }
+      }
+
+      // Publish refreshed bounds/limits to all workers each epoch, mirroring
+      // the state the baseline guarantees at round start.
+      for (HighsMipWorker& worker : mipdata_->workers) {
+        worker.upper_bound = mipdata_->upper_bound;
+        worker.upper_limit = mipdata_->upper_limit;
+        worker.optimality_limit = mipdata_->optimality_limit;
+      }
+    };
+
+    // ---------------- persistent worker body ----------------
+    // Declared as std::function so that deferred task spawning for workers
+    // created during an epoch can reference it from its own body.
+    std::function<void(HighsInt)> workerBody = [&](HighsInt wi) {
+      int64_t numQueueLeavesLocal = 0; // best-effort bookkeeping only
+      // Baseline enables primal heuristics for every worker that receives
+      // nodes in a round; async mode leaves them enabled for the session.
+      mipdata_->workers[wi].setAllowHeuristics(true);
+      while (true) {
+        bool fetched = false;
+        {
+          std::unique_lock<std::mutex> lk(nodefetch_mutex);
+
+          // Wait out a running epoch (the epoch runner never blocks here).
+          if (epochRunning) {
+            const uint64_t mySerial = epochSerial;
+            nodefetch_cv.wait(lk, [&] {
+              return epochSerial != mySerial || terminateAll ||
+                     stopRequested.load(std::memory_order_relaxed);
+            });
+          }
+
+          // Only an explicit session termination releases us. A mere
+          // stopRequest drains into a final synchronization epoch instead,
+          // which resolves limits/model status authoritatively.
+          if (terminateAll) return;
+          if (stopRequested.load(std::memory_order_relaxed)) {
+            // No fetching while stopping - fall through to idle handling.
+          }
+
+          // Deferred launch of persistent tasks for workers created during
+          // an epoch. Only performed by the task owning worker 0 because
+          // TaskGroup spawning must originate from its owner thread.
+          if (wi == 0) {
+            while (bodiesStarted < workersInFlight) {
+              const HighsInt idx = bodiesStarted++;
+              tg.spawn([&workerBody, idx] { workerBody(idx); });
+            }
+          }
+
+          // Fetch a node, mirroring prepareNodes minus the alternation:
+          // async mode always takes the best-bound node. Once a stop has
+          // been requested behave as idle so the workers drain into a
+          // synchronization epoch that terminates cleanly; likewise go
+          // idle when the periodic synchronization budget is exhausted.
+          if (!stopPoll() && !epochDueLocked() &&
+              !mipdata_->nodequeue.empty()) {
+            --epochFetchBudgetRemaining;
+            mipdata_->workers[wi].preparedNodes.push_back(
+                std::move(mipdata_->nodequeue.popBestBoundNode()));
+            ++numQueueLeavesLocal; // best-effort bookkeeping only
+            dirtySinceSync[wi] = 1;
+            ++workersProcessing;
+            fetched = true;
+          }
+
+          if (!fetched) {
+            // Nothing to do. If somebody is still working, wait for work or
+            // the next epoch; if this is the last idle worker, run one.
+            if (workersProcessing > 0) {
+              const uint64_t mySerial = epochSerial;
+              const uint64_t myWorkGen = workGeneration;
+              nodefetch_cv.wait(lk, [&] {
+                return epochSerial != mySerial || workGeneration != myWorkGen ||
+                       terminateAll ||
+                       stopRequested.load(std::memory_order_relaxed);
+              });
+              if (terminateAll) return;
+              // woken for work, after an epoch or due to a stop request -
+              // retry (the fetch gate / idle handling re-evaluates)
+            } else {
+              epochRunning = true;
+              runSyncEpochLocked();
+              epochRunning = false;
+              ++epochSerial;
+              if (terminateAll ||
+                  stopRequested.load(std::memory_order_relaxed)) {
+                nodefetch_cv.notify_all();
+                return;
+              }
+              // Early-termination votes were resolved inside the epoch;
+              // release the stop so normal fetching resumes, and refill the
+              // periodic synchronization budget.
+              stopRequested.store(false, std::memory_order_relaxed);
+              epochFetchBudgetRemaining = kAsyncEpochFetchBudget;
+              nodefetch_cv.notify_all();
+              // retry fetching after the epoch
+            }
+          }
+        }
+
+        if (!fetched) continue;
+
+        // Process completely outside the nodefetch_mutex.
+        processFetchedNode(wi);
+
+        std::unique_lock<std::mutex> lk(nodefetch_mutex);
+        --workersProcessing;
+        // A requested stop behaves like an empty queue: every worker drains
+        // towards the next synchronization epoch. The epoch performs the
+        // authoritative global checkLimits(), which sets the final model
+        // status, and flushes all pending per-worker statistics - without
+        // it, exits would carry stale bounds/counts.
+        const bool drained =
+            mipdata_->nodequeue.empty() || terminateAll || stopPoll();
+        if (!drained) continue;
+
+        workGeneration++; // wake parked waiters so they re-check
+        nodefetch_cv.notify_all();
+        if (workersProcessing > 0) {
+          const uint64_t mySerial = epochSerial;
+          const uint64_t myWorkGen = workGeneration;
+          nodefetch_cv.wait(lk, [&] {
+            return epochSerial != mySerial || workGeneration != myWorkGen ||
+                   terminateAll || stopRequested.load(std::memory_order_relaxed);
+          });
+          // Only terminateAll releases us; a stopRequest keeps draining into
+          // the final epoch.
+          if (terminateAll) return;
+          continue;
+        }
+
+        epochRunning = true;
+        runSyncEpochLocked();
+        epochRunning = false;
+        ++epochSerial;
+        const bool leave = terminateAll ||
+                           stopRequested.load(std::memory_order_relaxed);
+        if (!leave) {
+          // Early-termination votes were resolved inside the epoch; release
+          // the stop so normal fetching resumes, and refill the periodic
+          // synchronization budget.
+          stopRequested.store(false, std::memory_order_relaxed);
+          epochFetchBudgetRemaining = kAsyncEpochFetchBudget;
+        }
+        nodefetch_cv.notify_all();
+        if (leave) return;
+        // else: fresh children may exist after bounding/pruning - retry
+      }
+    };
+
+    // Launch: worker 0 runs on the calling thread (which owns tg), all
+    // others become spawned tasks of the surrounding TaskGroup.
+    for (HighsInt i = 1; i < num_workers; ++i) {
+      tg.spawn([&workerBody, i] { workerBody(i); });
+      ++bodiesStarted;
+    }
+    workerBody(0);
+    tg.taskWait();
+
+    setParallelLock(parallelLockRestore);
+    heurStatsSuspended = false;
+  };
+
   // Main solve loop
   std::vector<HighsInt> search_indices(1, 0);
   search_indices.reserve(max_num_workers);
@@ -1039,6 +1649,17 @@ restart:
   bool root_node = true;  // Don't separate the root node again
   HighsInt nodeLim = max_num_workers > 1 ? 1 : maxNodesPerWorkerLim;  // ramp-up
   while (!mipdata_->nodequeue.empty()) {
+    // Optional nondeterministic asynchronous node-fetching mode: once the
+    // ramp-up finished, hand over to persistent worker tasks. The code
+    // below this point is only reached when the option is disabled or
+    // fewer than two workers exist (behaviour then identical to before).
+    if (options_mip_->mip_async_node_fetch &&
+        mipdata_->hasMultipleWorkers() && max_num_workers > 1 &&
+        nodeLim == maxNodesPerWorkerLim) {
+      asyncRunNodeFetch();
+      break;
+    }
+
     // Possibly query existence of an external solution
     if (!submip)
       mipdata_->queryExternalSolution(
