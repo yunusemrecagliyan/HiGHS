@@ -1038,6 +1038,32 @@ restart:
   std::vector<HighsInt> stallNodesPerWorker(getMaxNumWorkers());
   bool root_node = true;  // Don't separate the root node again
   HighsInt nodeLim = max_num_workers > 1 ? 1 : maxNodesPerWorkerLim;  // ramp-up
+  // Fast worker ramp-up for small models: the doubling ramp (1 -> 2 -> 4
+  // ... nodes per round) plus gradual worker spawning means tiny models
+  // never reach full parallelism before they are solved. Detect models
+  // small enough that the whole search is cheap and give them all workers
+  // immediately.
+  const bool quickRamp =
+      options_mip_->parallel == kHighsOnString && max_num_workers > 1 &&
+      static_cast<double>(numCol()) * numRow() < 2000000 &&
+      mipdata_->maxTreeSizeLog2 < 40;
+  if (quickRamp) {
+    nodeLim = maxNodesPerWorkerLim;
+    if (mipdata_->nodequeue.numNodes() > max_num_workers)
+      createNewWorkers(max_num_workers - num_workers);
+    else {
+      HighsInt nw = std::min(
+          static_cast<HighsInt>(mipdata_->nodequeue.numNodes()),
+          max_num_workers);
+      if (nw > num_workers) {
+        if (num_workers == 1) constructAdditionalWorkerData(master_worker);
+        createNewWorkers(nw - num_workers);
+        num_workers = nw;
+      }
+    }
+    search_indices.resize(num_workers);
+    std::iota(search_indices.begin(), search_indices.end(), 0);
+  }
   while (!mipdata_->nodequeue.empty()) {
     // Possibly query existence of an external solution
     if (!submip)
