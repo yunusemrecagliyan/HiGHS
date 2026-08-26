@@ -1431,9 +1431,18 @@ restart:
         return;
       }
 
-      // Sync global information (port).
+      // Sync global information (port). The pool merge must run with the
+      // parallel lock released: syncPools early-outs while
+      // parallelLockActive() is true (silent no-op that would leave the
+      // async session without any cross-worker cut/conflict sharing).
+      // Safe here because all other workers are parked on nodefetch_mutex
+      // for the whole epoch.
       profiling_->start(kMipClockDomainPropgate);
-      syncPools(epochIndices);
+      {
+        setParallelLock(false);
+        syncPools(epochIndices);
+        setParallelLock(true);
+      }
       syncGlobalDomain(epochIndices);
       mipdata_->getDomain().propagate();
       profiling_->stop(kMipClockDomainPropgate);
