@@ -736,6 +736,20 @@ void HighsLpRelaxation::flushDomain(HighsDomain& domain, bool continuous) {
     if (!continuous) domain.removeContinuousChangedCols();
     HighsInt numChgCols = domain.getChangedCols().size();
     if (numChgCols == 0) return;
+    // Tiny models: skip per-col equality check overhead (lseu 0.11->0.17 regression)
+    if (mipsolver.numRow() < 200 && mipsolver.numCol() < 500) {
+      const HighsInt* chgCols = domain.getChangedCols().data();
+      for (HighsInt i = 0; i < numChgCols; ++i) {
+        HighsInt col = chgCols[i];
+        colLbBuffer[i] = domain.col_lower_[col];
+        colUbBuffer[i] = domain.col_upper_[col];
+      }
+      currentbasisstored = false;
+      lpsolver.changeColsBounds(numChgCols, domain.getChangedCols().data(),
+                                colLbBuffer.data(), colUbBuffer.data());
+      domain.clearChangedCols();
+      return;
+    }
     const HighsInt* chgCols = domain.getChangedCols().data();
     const HighsLp& currentLp = lpsolver.getLp();
     HighsInt numActualChanges = 0;
