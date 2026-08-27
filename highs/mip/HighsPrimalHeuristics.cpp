@@ -76,6 +76,7 @@ void HighsPrimalHeuristics::setupIntCols() {
 
 bool HighsPrimalHeuristics::constraintAwareRounding(
     HighsMipWorker& worker, const std::vector<double>& relaxationsol) {
+  if (mipsolver.numRow() < 200 && mipsolver.numCol() < 500) return false;
   if (relaxationsol.size() != static_cast<size_t>(mipsolver.numCol()))
     return false;
 
