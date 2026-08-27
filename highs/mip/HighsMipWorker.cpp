@@ -124,7 +124,6 @@ bool HighsMipWorker::trySolution(const std::vector<double>& solution,
     if (mipsolver_.variableType(i) == HighsVarType::kInteger &&
         fractionality(solution[i]) > mipdata_.feastol)
       return false;
-
   }
 
   for (HighsInt i = 0; i != mipsolver_.model_->num_row_; ++i) {

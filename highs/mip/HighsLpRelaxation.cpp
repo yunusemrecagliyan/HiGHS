@@ -271,15 +271,14 @@ void HighsLpRelaxation::resetToGlobalDomain(const HighsDomain& globaldom) {
 HighsCDouble HighsLpRelaxation::computeOriginalObjective(
     const std::vector<double>& solution) const {
   HighsCDouble objectiveValue = 0.0;
-  if (objectiveNonzeroCols.size() ==
-      static_cast<size_t>(mipsolver.numCol())) {
+  if (objectiveNonzeroCols.size() == static_cast<size_t>(mipsolver.numCol())) {
     for (HighsInt col = 0; col != mipsolver.numCol(); ++col)
-      objectiveValue += static_cast<HighsCDouble>(solution[col]) *
-                        mipsolver.colCost(col);
+      objectiveValue +=
+          static_cast<HighsCDouble>(solution[col]) * mipsolver.colCost(col);
   } else {
     for (HighsInt col : objectiveNonzeroCols)
-      objectiveValue += static_cast<HighsCDouble>(solution[col]) *
-                        mipsolver.colCost(col);
+      objectiveValue +=
+          static_cast<HighsCDouble>(solution[col]) * mipsolver.colCost(col);
   }
   return objectiveValue;
 }

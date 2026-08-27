@@ -772,10 +772,9 @@ restart:
         if (!getenv("HEUR_STATS")) return;
         FILE* f = fopen("heur_stats.txt", "w");
         if (!f) return;
-        const double tot =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                          hstatsT0)
-                .count();
+        const double tot = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - hstatsT0)
+                               .count();
         fprintf(f, "total=%.2fs\n", tot);
         for (int t = 0; t < 6; ++t)
           fprintf(f, "%5s calls=%lld ms=%.0f improvements=%lld\n", hnames[t],
@@ -785,19 +784,19 @@ restart:
       });
       return true;
     }();
-#define HEUR_RUN(IDX, STMT)                                                   \
-  do {                                                                        \
-    const double heurUlBefore = mipdata_->upper_limit;                        \
-    const auto heurT0 = std::chrono::steady_clock::now();                     \
-    STMT;                                                                     \
-    if (!heurStatsSuspended) {                                                \
-      hstats[IDX].calls++;                                                    \
-      hstats[IDX].ms += std::chrono::duration<double, std::milli>(            \
-                            std::chrono::steady_clock::now() - heurT0)        \
-                            .count();                                         \
-      if (mipdata_->upper_limit < heurUlBefore - 1e-9)                        \
-        hstats[IDX].improvements++;                                           \
-    }                                                                         \
+#define HEUR_RUN(IDX, STMT)                                            \
+  do {                                                                 \
+    const double heurUlBefore = mipdata_->upper_limit;                 \
+    const auto heurT0 = std::chrono::steady_clock::now();              \
+    STMT;                                                              \
+    if (!heurStatsSuspended) {                                         \
+      hstats[IDX].calls++;                                             \
+      hstats[IDX].ms += std::chrono::duration<double, std::milli>(     \
+                            std::chrono::steady_clock::now() - heurT0) \
+                            .count();                                  \
+      if (mipdata_->upper_limit < heurUlBefore - 1e-9)                 \
+        hstats[IDX].improvements++;                                    \
+    }                                                                  \
   } while (0)
 
     // The node was fully evaluated just before separation. When separation
@@ -811,7 +810,8 @@ restart:
       const char* m = getenv("HIGHS_DEDUP_SCOPE");
       return m ? atoi(m) : 3;
     }();
-    if (!((heurDedupScope & 1) && worker.search_ptr_->currentNodeEvalCurrent())) {
+    if (!((heurDedupScope & 1) &&
+          worker.search_ptr_->currentNodeEvalCurrent())) {
       if (!mipdata_->parallelLockActive())
         profiling_->start(kMipClockDiveEvaluateNode);
       const HighsSearch::NodeResult evaluate_node_result =
@@ -1081,9 +1081,9 @@ restart:
   // restart were required, the mode would fall back by ending cleanly into
   // the normal exit path of run().
   // ------------------------------------------------------------------
-  bool asyncRequestsRestart = false;       // restart vote fired in async
-  bool restartRequestedAfterAsync = false; // performRestart was applied and
-                                           // the barriered loop may resume
+  bool asyncRequestsRestart = false;        // restart vote fired in async
+  bool restartRequestedAfterAsync = false;  // performRestart was applied and
+                                            // the barriered loop may resume
   auto asyncRunNodeFetch = [&]() {
     // The static HEUR_STATS accumulators inside runHeuristics are not
     // thread-safe - suspend the instrumentation while async workers run.
@@ -1113,14 +1113,14 @@ restart:
     // machinery while async mode is running.
     std::mutex nodefetch_mutex;
     std::condition_variable nodefetch_cv;
-    bool epochRunning = false;      // an epoch is being executed
-    uint64_t epochSerial = 0;       // bumped after each epoch
-    uint64_t workGeneration = 0;    // bumped when nodes enter an empty queue
-    bool terminateAll = false;      // leave async mode entirely
-    HighsInt workersProcessing = 0; // workers currently inside a pipeline
-    HighsInt bodiesStarted = 1;     // persistent tasks launched so far
+    bool epochRunning = false;       // an epoch is being executed
+    uint64_t epochSerial = 0;        // bumped after each epoch
+    uint64_t workGeneration = 0;     // bumped when nodes enter an empty queue
+    bool terminateAll = false;       // leave async mode entirely
+    HighsInt workersProcessing = 0;  // workers currently inside a pipeline
+    HighsInt bodiesStarted = 1;      // persistent tasks launched so far
     HighsInt workersInFlight =
-        num_workers; // logical workers participating (grows with spawns)
+        num_workers;  // logical workers participating (grows with spawns)
     std::atomic<bool> stopRequested{false};
     std::vector<char> dirtySinceSync(max_num_workers + 1, 0);
     std::vector<HighsInt> stallNodesAsync(max_num_workers + 1, 0);
@@ -1277,8 +1277,7 @@ restart:
         flushProcessedToSharedQueue(wi);
         worker.search_ptr_->stashOpenNodes();
         flushProcessedToSharedQueue(wi);
-        if (stopRequested.load(std::memory_order_relaxed))
-          break;
+        if (stopRequested.load(std::memory_order_relaxed)) break;
         if (worker.early_termination) {
           // Another worker signalled global early termination - relay it.
           requestStopAll();
@@ -1540,7 +1539,7 @@ restart:
     // Declared as std::function so that deferred task spawning for workers
     // created during an epoch can reference it from its own body.
     std::function<void(HighsInt)> workerBody = [&](HighsInt wi) {
-      int64_t numQueueLeavesLocal = 0; // best-effort bookkeeping only
+      int64_t numQueueLeavesLocal = 0;  // best-effort bookkeeping only
       // Baseline enables primal heuristics for every worker that receives
       // nodes in a round; async mode leaves them enabled for the session.
       mipdata_->workers[wi].setAllowHeuristics(true);
@@ -1586,7 +1585,7 @@ restart:
             --epochFetchBudgetRemaining;
             mipdata_->workers[wi].preparedNodes.push_back(
                 std::move(mipdata_->nodequeue.popBestBoundNode()));
-            ++numQueueLeavesLocal; // best-effort bookkeeping only
+            ++numQueueLeavesLocal;  // best-effort bookkeeping only
             dirtySinceSync[wi] = 1;
             ++workersProcessing;
             fetched = true;
@@ -1643,14 +1642,15 @@ restart:
             mipdata_->nodequeue.empty() || terminateAll || stopPoll();
         if (!drained) continue;
 
-        workGeneration++; // wake parked waiters so they re-check
+        workGeneration++;  // wake parked waiters so they re-check
         nodefetch_cv.notify_all();
         if (workersProcessing > 0) {
           const uint64_t mySerial = epochSerial;
           const uint64_t myWorkGen = workGeneration;
           nodefetch_cv.wait(lk, [&] {
             return epochSerial != mySerial || workGeneration != myWorkGen ||
-                   terminateAll || stopRequested.load(std::memory_order_relaxed);
+                   terminateAll ||
+                   stopRequested.load(std::memory_order_relaxed);
           });
           // Only terminateAll releases us; a stopRequest keeps draining into
           // the final epoch.
@@ -1662,8 +1662,8 @@ restart:
         runSyncEpochLocked();
         epochRunning = false;
         ++epochSerial;
-        const bool leave = terminateAll ||
-                           stopRequested.load(std::memory_order_relaxed);
+        const bool leave =
+            terminateAll || stopRequested.load(std::memory_order_relaxed);
         if (!leave) {
           // Early-termination votes were resolved inside the epoch; release
           // the stop so normal fetching resumes, and refill the periodic
@@ -1719,18 +1719,18 @@ restart:
   // never reach full parallelism before they are solved. Detect models
   // small enough that the whole search is cheap and give them all workers
   // immediately.
-  const bool quickRamp =
-      options_mip_->parallel == kHighsOnString && max_num_workers > 1 &&
-      static_cast<double>(numCol()) * numRow() < 2000000 &&
-      mipdata_->maxTreeSizeLog2 < 40;
+  const bool quickRamp = options_mip_->parallel == kHighsOnString &&
+                         max_num_workers > 1 &&
+                         static_cast<double>(numCol()) * numRow() < 2000000 &&
+                         mipdata_->maxTreeSizeLog2 < 40;
   if (quickRamp) {
     nodeLim = maxNodesPerWorkerLim;
     if (mipdata_->nodequeue.numNodes() > max_num_workers)
       createNewWorkers(max_num_workers - num_workers);
     else {
-      HighsInt nw = std::min(
-          static_cast<HighsInt>(mipdata_->nodequeue.numNodes()),
-          max_num_workers);
+      HighsInt nw =
+          std::min(static_cast<HighsInt>(mipdata_->nodequeue.numNodes()),
+                   max_num_workers);
       if (nw > num_workers) {
         if (num_workers == 1) constructAdditionalWorkerData(master_worker);
         createNewWorkers(nw - num_workers);
@@ -1745,9 +1745,8 @@ restart:
     // ramp-up finished, hand over to persistent worker tasks. The code
     // below this point is only reached when the option is disabled or
     // fewer than two workers exist (behaviour then identical to before).
-    if (options_mip_->mip_async_node_fetch &&
-        mipdata_->hasMultipleWorkers() && max_num_workers > 1 &&
-        nodeLim == maxNodesPerWorkerLim) {
+    if (options_mip_->mip_async_node_fetch && mipdata_->hasMultipleWorkers() &&
+        max_num_workers > 1 && nodeLim == maxNodesPerWorkerLim) {
       asyncRunNodeFetch();
       // A sync-epoch restart vote inside async mode applied
       // performRestart(); the barriered loop resumes on the tightened

@@ -32,10 +32,10 @@ namespace {
 template <bool kDense, bool kStoreSquared, bool kCheckExcessive>
 inline HighsInt updatePrimalRows(const HighsInt count,
                                  const HighsInt* variable_index,
-                                 const double* column_array,
-                                 const double theta, const double* base_lower,
-                                 const double* base_upper, const double tolerance,
-                                 double* base_value,
+                                 const double* column_array, const double theta,
+                                 const double* base_lower,
+                                 const double* base_upper,
+                                 const double tolerance, double* base_value,
                                  double* work_infeasibility) {
   HighsInt num_excessive_primal = 0;
   for (HighsInt i = 0; i < count; ++i) {
@@ -51,16 +51,14 @@ inline HighsInt updatePrimalRows(const HighsInt count,
     }
 
     if (kStoreSquared)
-      work_infeasibility[i_row] =
-          primal_infeasibility * primal_infeasibility;
+      work_infeasibility[i_row] = primal_infeasibility * primal_infeasibility;
     else
       work_infeasibility[i_row] = primal_infeasibility;
 
     if (kCheckExcessive) {
-      num_excessive_primal += value <= -kExcessivePrimalValue ||
-                              value >= kExcessivePrimalValue;
+      num_excessive_primal +=
+          value <= -kExcessivePrimalValue || value >= kExcessivePrimalValue;
     }
-
   }
   return num_excessive_primal;
 }
@@ -70,8 +68,7 @@ inline HighsInt dispatchPrimalUpdate(
     const bool dense, const bool store_squared, const HighsInt count,
     const HighsInt* variable_index, const double* column_array,
     const double theta, const double* base_lower, const double* base_upper,
-    const double tolerance, double* base_value,
-    double* work_infeasibility) {
+    const double tolerance, double* base_value, double* work_infeasibility) {
   if (dense) {
     if (store_squared)
       return updatePrimalRows<true, true, kCheckExcessive>(
@@ -431,10 +428,10 @@ void HEkkDualRHS::updatePrimalStart(HVector* column, double theta,
   const bool updatePrimal_inDense =
       columnCount < 0 || columnCount > 0.4 * numRow;
   const HighsInt to_entry = updatePrimal_inDense ? numRow : columnCount;
-  dispatchPrimalUpdate<false>(
-      updatePrimal_inDense, store_squared, to_entry, variable_index,
-      columnArray, theta, baseLower, baseUpper, Tp, baseValue,
-      work_infeasibility.data());
+  dispatchPrimalUpdate<false>(updatePrimal_inDense, store_squared, to_entry,
+                              variable_index, columnArray, theta, baseLower,
+                              baseUpper, Tp, baseValue,
+                              work_infeasibility.data());
   if (skip_infeas_list || workCount < 0) return;
   // The infeasibility list insertion mirrors updateInfeasList: it walks
   // the column entries (and does nothing when the column is dense)

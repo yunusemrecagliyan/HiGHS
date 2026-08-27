@@ -1262,10 +1262,10 @@ class HighsOptions : public HighsOptionsStruct {
                              advanced, &mip_heuristic_run_rins, true);
     records.push_back(record_bool);
 
-    record_bool = new OptionRecordBool(
-        "mip_heuristic_run_local_branching",
-        "Use the local branching heuristic", advanced,
-        &mip_heuristic_run_local_branching, false);
+    record_bool =
+        new OptionRecordBool("mip_heuristic_run_local_branching",
+                             "Use the local branching heuristic", advanced,
+                             &mip_heuristic_run_local_branching, false);
     records.push_back(record_bool);
 
     record_bool =
@@ -1273,12 +1273,10 @@ class HighsOptions : public HighsOptionsStruct {
                              advanced, &mip_heuristic_run_rens, true);
     records.push_back(record_bool);
 
-    record_bool =
-        new OptionRecordBool("mip_heuristic_run_diving",
-                             "Use the diving heuristic", advanced,
-                             &mip_heuristic_run_diving, true);
+    record_bool = new OptionRecordBool("mip_heuristic_run_diving",
+                                       "Use the diving heuristic", advanced,
+                                       &mip_heuristic_run_diving, true);
     records.push_back(record_bool);
-
 
     record_bool =
         new OptionRecordBool("mip_heuristic_run_root_reduced_cost",

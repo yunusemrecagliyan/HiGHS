@@ -224,7 +224,6 @@ bool HighsMipSolverData::trySolution(const std::vector<double>& solution,
     if (solution[i] > mipsolver.model_->col_upper_[i] + feastol) return false;
     if (mipsolver.isColInteger(i) && fractionality(solution[i]) > feastol)
       return false;
-
   }
 
   for (HighsInt i = 0; i != mipsolver.numRow(); ++i) {
@@ -2120,8 +2119,7 @@ restart:
 
   if (mipsolver.options_mip_->mip_heuristic_run_zi_round)
     heuristics.ziRound(worker, firstlpsol);
-  if (incumbent.empty())
-    heuristics.constraintAwareRounding(worker, firstlpsol);
+  if (incumbent.empty()) heuristics.constraintAwareRounding(worker, firstlpsol);
   profiling->start(kMipClockRandomizedRounding);
   heuristics.randomizedRounding(worker, firstlpsol);
   profiling->stop(kMipClockRandomizedRounding);
@@ -2141,9 +2139,8 @@ restart:
   if (mipsolver.options_mip_->mip_allow_restart &&
       mipsolver.options_mip_->presolve != kHighsOffString) {
     double fixingRate = percentageInactiveIntegers();
-    if (fixingRate >= 10.0 &&
-        (lastRestartInactive < 0 ||
-         10 * fixingRate < 9.5 * lastRestartInactive)) {
+    if (fixingRate >= 10.0 && (lastRestartInactive < 0 ||
+                               10 * fixingRate < 9.5 * lastRestartInactive)) {
       lastRestartInactive = fixingRate;
       tg.cancel();
       highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,

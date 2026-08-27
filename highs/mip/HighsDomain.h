@@ -525,8 +525,8 @@ class HighsDomain {
   // them. This is intended for callers that construct a batch of independent
   // heuristic fixings and call propagate() once after the complete batch.
   // Binary implications are still processed immediately by changeBound().
-  void fixColWithoutPropagation(
-      HighsInt col, double val, Reason reason = Reason::unspecified()) {
+  void fixColWithoutPropagation(HighsInt col, double val,
+                                Reason reason = Reason::unspecified()) {
     if (kAllowDeveloperAssert) assert(infeasible_ == 0);
     if (col_lower_[col] < val)
       changeBound({val, col, HighsBoundType::kLower}, reason);

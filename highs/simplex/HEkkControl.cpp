@@ -123,10 +123,9 @@ bool HEkk::switchToDevex() {
   if (local_iteration_count_window >= kCostlyDseWindowMinIterations) {
     const HighsInt window_count =
         std::min(local_iteration_count_window, kCostlyDseWindowSize);
-    switch_to_devex =
-        info_.allow_dual_steepest_edge_to_devex_switch &&
-        info_.costly_dse_in_window_ >
-            kCostlyDseWindowCostlyFraction * window_count;
+    switch_to_devex = info_.allow_dual_steepest_edge_to_devex_switch &&
+                      info_.costly_dse_in_window_ >
+                          kCostlyDseWindowCostlyFraction * window_count;
     if (switch_to_devex) {
       highsLogDev(options_->log_options, HighsLogType::kInfo,
                   "Switch from DSE to Devex after %" HIGHSINT_FORMAT

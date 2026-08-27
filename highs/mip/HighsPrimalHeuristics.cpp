@@ -60,13 +60,12 @@ void HighsPrimalHeuristics::setupIntCols() {
          mipsolver.mipdata_->cliquetable.getNumImplications(col, 1)) *
         (mipsolver.mipdata_->feastol +
          mipsolver.mipdata_->cliquetable.getNumImplications(col, 0));
-    order.push_back({lockScore, cliqueScore,
-                     HighsHashHelpers::hash(uint64_t(col)), col});
+    order.push_back(
+        {lockScore, cliqueScore, HighsHashHelpers::hash(uint64_t(col)), col});
   }
 
   pdqsort(order.begin(), order.end(),
-          [](const IntegerColumnOrder& lhs,
-             const IntegerColumnOrder& rhs) {
+          [](const IntegerColumnOrder& lhs, const IntegerColumnOrder& rhs) {
             return std::make_tuple(lhs.lockScore, lhs.cliqueScore, lhs.hash,
                                    lhs.col) >
                    std::make_tuple(rhs.lockScore, rhs.cliqueScore, rhs.hash,
@@ -104,8 +103,7 @@ bool HighsPrimalHeuristics::constraintAwareRounding(
     }
   }
 
-  auto scaledRowViolation = [&](HighsInt row,
-                                const HighsCDouble& activity) {
+  auto scaledRowViolation = [&](HighsInt row, const HighsCDouble& activity) {
     double violation = 0.0;
     if (activity < model.row_lower_[row] - feastol)
       violation = model.row_lower_[row] - static_cast<double>(activity);
@@ -122,9 +120,8 @@ bool HighsPrimalHeuristics::constraintAwareRounding(
          el != model.a_matrix_.start_[col + 1]; ++el) {
       const HighsInt row = model.a_matrix_.index_[el];
       violation += scaledRowViolation(
-          row, rowActivity[row] +
-                   static_cast<HighsCDouble>(delta) *
-                       model.a_matrix_.value_[el]);
+          row, rowActivity[row] + static_cast<HighsCDouble>(delta) *
+                                      model.a_matrix_.value_[el]);
     }
     return violation;
   };
@@ -160,8 +157,7 @@ bool HighsPrimalHeuristics::constraintAwareRounding(
       } else {
         const double boundedDown = std::max(domain.col_lower_[col], down);
         const double boundedUp = std::min(domain.col_upper_[col], up);
-        const HighsCDouble downViolation =
-            directionViolation(col, boundedDown);
+        const HighsCDouble downViolation = directionViolation(col, boundedDown);
         const HighsCDouble upViolation = directionViolation(col, boundedUp);
         const double upcost = pseudocost.getPseudocostUp(col, value);
         const double downcost = pseudocost.getPseudocostDown(col, value);
@@ -170,21 +166,18 @@ bool HighsPrimalHeuristics::constraintAwareRounding(
         else if (downViolation < upViolation)
           rounded = down;
         else
-          rounded = upcost < downcost
-                        ? up
-                        : downcost < upcost ? down
-                                            : std::floor(value + 0.5);
+          rounded = upcost < downcost   ? up
+                    : downcost < upcost ? down
+                                        : std::floor(value + 0.5);
       }
     }
 
-    rounded =
-        std::max(domain.col_lower_[col],
-                 std::min(domain.col_upper_[col], rounded));
+    rounded = std::max(domain.col_lower_[col],
+                       std::min(domain.col_upper_[col], rounded));
     if (fractional) {
       const double other = rounded == down ? up : down;
-      const double alternative =
-          std::max(domain.col_lower_[col],
-                   std::min(domain.col_upper_[col], other));
+      const double alternative = std::max(
+          domain.col_lower_[col], std::min(domain.col_upper_[col], other));
       if (alternative != rounded) alternatives.emplace_back(col, alternative);
     }
     applyMove(col, rounded);
@@ -243,8 +236,8 @@ bool HighsPrimalHeuristics::constraintAwareRounding(
 
   HighsCDouble objective = 0.0;
   for (HighsInt col = 0; col != model.num_col_; ++col)
-    objective += static_cast<HighsCDouble>(mipsolver.colCost(col)) *
-                 roundedsol[col];
+    objective +=
+        static_cast<HighsCDouble>(mipsolver.colCost(col)) * roundedsol[col];
   return addIncumbent(roundedsol, static_cast<double>(objective),
                       kSolutionSourceHeuristic, worker);
 }
@@ -560,8 +553,7 @@ void HighsPrimalHeuristics::diving(HighsMipWorker& worker) {
                             : std::floor(val + 0.5);
         fixingCols.push_back(i);
         fixingVals.push_back(std::max(
-            localdom.col_lower_[i],
-            std::min(localdom.col_upper_[i], fixval)));
+            localdom.col_lower_[i], std::min(localdom.col_upper_[i], fixval)));
         continue;
       }
 
@@ -607,8 +599,8 @@ void HighsPrimalHeuristics::diving(HighsMipWorker& worker) {
   }
 }
 
-void HighsPrimalHeuristics::localBranching(
-    HighsMipWorker& worker, const std::vector<double>& lpsol) {
+void HighsPrimalHeuristics::localBranching(HighsMipWorker& worker,
+                                           const std::vector<double>& lpsol) {
   // Local branching (Fischetti & Lodi): explore a small neighbourhood
   // around the incumbent. Binary variables in which the LP relaxation
   // disagrees with the incumbent are candidates for a flip; all but the
@@ -663,9 +655,9 @@ void HighsPrimalHeuristics::localBranching(
   heurlp.loadModel();
   heurlp.setIterationLimit(
       std::max(int64_t{10000}, 2 * mipsolver.mipdata_->firstrootlpiters));
-  heurlp.getLpSolver().changeColsBounds(
-      0, mipsolver.numCol() - 1, localdom.col_lower_.data(),
-      localdom.col_upper_.data());
+  heurlp.getLpSolver().changeColsBounds(0, mipsolver.numCol() - 1,
+                                        localdom.col_lower_.data(),
+                                        localdom.col_upper_.data());
   heurlp.getLpSolver().setBasis(mipsolver.mipdata_->firstrootbasis,
                                 "HighsPrimalHeuristics::localBranching");
   heurlp.removeObsoleteRows(false);
@@ -675,11 +667,10 @@ void HighsPrimalHeuristics::localBranching(
                 HighsInt{1},
                 static_cast<HighsInt>(mipsolver.mipdata_->workers.size()) / 4)
           : 1;
-  solveSubMip(worker, heurlp.getLp(), heurlp.getLpSolver().getBasis(),
-              fixingrate, localdom.col_lower_, localdom.col_upper_, 500,
-              200 + mipsolver.mipdata_->num_nodes /
-                        (node_reduction_factor * 20),
-              12);
+  solveSubMip(
+      worker, heurlp.getLp(), heurlp.getLpSolver().getBasis(), fixingrate,
+      localdom.col_lower_, localdom.col_upper_, 500,
+      200 + mipsolver.mipdata_->num_nodes / (node_reduction_factor * 20), 12);
 }
 
 void HighsPrimalHeuristics::rootReducedCost(HighsMipWorker& worker) {
@@ -1373,8 +1364,7 @@ bool HighsPrimalHeuristics::tryRoundedPoint(HighsMipWorker& worker,
   localdom.propagate();
   if (localdom.infeasible()) {
     localdom.conflictAnalysis(worker.getConflictPool(),
-                              worker.getGlobalDomain(),
-                              worker.getPseudocost());
+                              worker.getGlobalDomain(), worker.getPseudocost());
     return false;
   }
 
@@ -1518,8 +1508,7 @@ void HighsPrimalHeuristics::randomizedRounding(
   localdom.propagate();
   if (localdom.infeasible()) {
     localdom.conflictAnalysis(worker.getConflictPool(),
-                              worker.getGlobalDomain(),
-                              worker.getPseudocost());
+                              worker.getGlobalDomain(), worker.getPseudocost());
     return;
   }
 
@@ -1598,8 +1587,7 @@ void HighsPrimalHeuristics::shifting(HighsMipWorker& worker,
   HighsInt numFractional =
       static_cast<HighsInt>(current_fractional_integers.size());
 
-  std::vector<HighsCDouble> rowActivity(currentLp.num_row_,
-                                        HighsCDouble{0.0});
+  std::vector<HighsCDouble> rowActivity(currentLp.num_row_, HighsCDouble{0.0});
   for (HighsInt col = 0; col != currentLp.num_col_; ++col) {
     for (HighsInt el = currentLp.a_matrix_.start_[col];
          el != currentLp.a_matrix_.start_[col + 1]; ++el)
@@ -1608,18 +1596,16 @@ void HighsPrimalHeuristics::shifting(HighsMipWorker& worker,
           currentLp.a_matrix_.value_[el];
   }
 
-  std::vector<std::tuple<HighsInt, HighsInt, double>>
-      current_infeasible_rows;
+  std::vector<std::tuple<HighsInt, HighsInt, double>> current_infeasible_rows;
   auto refreshInfeasibleRows = [&]() {
     current_infeasible_rows.clear();
     for (HighsInt row = 0; row != currentLp.num_row_; ++row) {
       const double activity = static_cast<double>(rowActivity[row]);
-      if (activity > currentLp.row_upper_[row] +
-                         mipsolver.mipdata_->feastol) {
+      if (activity > currentLp.row_upper_[row] + mipsolver.mipdata_->feastol) {
         current_infeasible_rows.emplace_back(
             row, HighsInt{1}, std::abs(activity - currentLp.row_upper_[row]));
-      } else if (activity < currentLp.row_lower_[row] -
-                                mipsolver.mipdata_->feastol) {
+      } else if (activity <
+                 currentLp.row_lower_[row] - mipsolver.mipdata_->feastol) {
         current_infeasible_rows.emplace_back(
             row, HighsInt{-1}, std::abs(currentLp.row_lower_[row] - activity));
       }
@@ -1817,9 +1803,9 @@ void HighsPrimalHeuristics::shifting(HighsMipWorker& worker,
         assert(col < mipsolver.numCol());
 
         auto isBetter = [&currentLp, &it, &xi_max, &delta_c_min, &j_min,
-                         &x_j_min, &sigma](double col, double xi,
-                                           double roundedval,
-                                           HighsInt direction) {
+                         &x_j_min,
+                         &sigma](double col, double xi, double roundedval,
+                                 HighsInt direction) {
           double c_min = currentLp.col_cost_[col] * (roundedval - it.second);
           if (xi > xi_max || (xi == xi_max && c_min < delta_c_min)) {
             xi_max = xi;

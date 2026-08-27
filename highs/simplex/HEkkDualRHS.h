@@ -11,8 +11,8 @@
 #ifndef SIMPLEX_HEKKDUALRHS_H_
 #define SIMPLEX_HEKKDUALRHS_H_
 
-#include <vector>
 #include <utility>
+#include <vector>
 
 #include "simplex/HEkk.h"
 #include "util/HVector.h"
@@ -88,8 +88,8 @@ class HEkkDualRHS {
    * Exactly equivalent to updatePrimal followed by updateInfeasList
    */
   void updatePrimalStart(
-      HVector* column,  //!< Column to add into primal values
-      double theta,     //!< Multiple of column to add into primal values
+      HVector* column,       //!< Column to add into primal values
+      double theta,          //!< Multiple of column to add into primal values
       bool skip_infeas_list  //!< Whether to skip the infeasibility list update
   );
 
@@ -101,8 +101,8 @@ class HEkkDualRHS {
    * updateInfeasList
    */
   bool updatePrimalFinish(
-      HVector* column,  //!< Column to add into primal values
-      double theta,     //!< Multiple of column to add into primal values
+      HVector* column,       //!< Column to add into primal values
+      double theta,          //!< Multiple of column to add into primal values
       bool skip_infeas_list  //!< Whether to skip the infeasibility list update
   );
 

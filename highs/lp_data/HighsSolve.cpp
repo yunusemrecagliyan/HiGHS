@@ -47,7 +47,8 @@ HighsStatus solveLp(HighsLpSolverObject& solver_object, const string message) {
   // even without a boxed structure (qap15 and supportcase10 solve in
   // seconds with IPM where simplex cannot solve them within the limit)
   if (!use_only_ipm && !solver_object.basis_.valid &&
-      (options.solver == kSimplexString || options.solver == kHighsChooseString)) {
+      (options.solver == kSimplexString ||
+       options.solver == kHighsChooseString)) {
     const HighsLp& lp = solver_object.lp_;
     const bool large_rows = lp.num_row_ >= 3000 && lp.num_row_ <= 200000;
     if (large_rows) {

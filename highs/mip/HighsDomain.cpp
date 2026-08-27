@@ -1418,8 +1418,7 @@ HighsInt HighsDomain::propagateRowUpper(const HighsInt* Rindex,
   assert(std::isfinite(static_cast<double>(minactivity)));
   if (ninfmin > 1) return 0;
   HighsInt numchgs = 0;
-  auto tryUpperPropagation = [&](HighsInt i,
-                                 const HighsCDouble& minresact) {
+  auto tryUpperPropagation = [&](HighsInt i, const HighsCDouble& minresact) {
     HighsCDouble boundVal = (Rupper - minresact) / Rvalue[i];
     if (abs(boundVal) * kHighsTiny > feastol()) return;
 
@@ -1471,8 +1470,7 @@ HighsInt HighsDomain::propagateRowLower(const HighsInt* Rindex,
   assert(std::isfinite(static_cast<double>(maxactivity)));
   if (ninfmax > 1) return 0;
   HighsInt numchgs = 0;
-  auto tryLowerPropagation = [&](HighsInt i,
-                                 const HighsCDouble& maxresact) {
+  auto tryLowerPropagation = [&](HighsInt i, const HighsCDouble& maxresact) {
     HighsCDouble boundVal = (Rlower - maxresact) / Rvalue[i];
     if (abs(boundVal) * kHighsTiny > feastol()) return;
 
@@ -2462,10 +2460,10 @@ bool HighsDomain::propagate() {
             // mipsolver->ARvalue_.data(), activitymininf_[i],
             //           activitymin_[i]);
             activitymin_[i].renormalize();
-            propRowNumChangedBounds_[k].first = propagateRowUpper(
-                Rindex, Rvalue, Rlen, mipsolver->rowUpper(i), activitymin_[i],
-                activitymininf_[i],
-                changedbounds.data() + changedboundsStart[k]);
+            propRowNumChangedBounds_[k].first =
+                propagateRowUpper(Rindex, Rvalue, Rlen, mipsolver->rowUpper(i),
+                                  activitymin_[i], activitymininf_[i],
+                                  changedbounds.data() + changedboundsStart[k]);
 
             recomputeCapThreshold = true;
           }
@@ -2477,11 +2475,11 @@ bool HighsDomain::propagate() {
             // mipsolver->ARvalue_.data(), activitymaxinf_[i],
             //           activitymax_[i]);
             activitymax_[i].renormalize();
-            propRowNumChangedBounds_[k].second = propagateRowLower(
-                Rindex, Rvalue, Rlen, mipsolver->rowLower(i), activitymax_[i],
-                activitymaxinf_[i],
-                changedbounds.data() + changedboundsStart[k] +
-                    propRowNumChangedBounds_[k].first);
+            propRowNumChangedBounds_[k].second =
+                propagateRowLower(Rindex, Rvalue, Rlen, mipsolver->rowLower(i),
+                                  activitymax_[i], activitymaxinf_[i],
+                                  changedbounds.data() + changedboundsStart[k] +
+                                      propRowNumChangedBounds_[k].first);
 
             recomputeCapThreshold = true;
           }
@@ -2505,8 +2503,8 @@ bool HighsDomain::propagate() {
             if (infeasible_) break;
           }
           if (propRowNumChangedBounds_[k].second != 0) {
-            size_t start = changedboundsStart[k] +
-                           propRowNumChangedBounds_[k].first;
+            size_t start =
+                changedboundsStart[k] + propRowNumChangedBounds_[k].first;
             size_t end = start + propRowNumChangedBounds_[k].second;
             for (size_t j = start; j != end && !infeasible_; ++j)
               changeBound(changedbounds[j], Reason::modelRowLower(i));
