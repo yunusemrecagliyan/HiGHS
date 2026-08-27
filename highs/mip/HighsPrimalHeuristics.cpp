@@ -495,6 +495,7 @@ class HeuristicNeighbourhood {
 };
 
 void HighsPrimalHeuristics::diving(HighsMipWorker& worker) {
+  if (mipsolver.numRow() < 200 && mipsolver.numCol() < 500) return;
   // Lock/pseudocost-guided diving. Structurally safe zero-lock roundings are
   // fixed as a batch. If none exist, one branching-relevant variable is fixed
   // in its cheaper pseudocost direction.
