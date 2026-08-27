@@ -150,10 +150,13 @@ class HighsLpRelaxation {
         lp->flushDomain(localdom);
         lp->getLpSolver().getIterate();
       } else {
-        assert(lp->getLpSolver().getInfo().valid);
-        lp->getLpSolver().putIterate();
-        lp->flushDomain(localdom);
-        iterateStored = true;
+        if (lp->getLpSolver().getInfo().valid) {
+          lp->getLpSolver().putIterate();
+          lp->flushDomain(localdom);
+          iterateStored = true;
+        } else {
+          lp->flushDomain(localdom);
+        }
       }
 
       return lp->run(false);
