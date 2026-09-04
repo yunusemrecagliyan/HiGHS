@@ -892,6 +892,21 @@ restart:
         if (!mipdata_->parallelLockActive())
           profiling_->stop(kMipClockDiveRins);
       }
+      // LP-anchored neighbourhood search alongside incumbent-anchored RINS:
+      // RENS fixes variables at LP values regardless of the incumbent, so
+      // it can reach basins RINS (anchored at the incumbent) cannot. Runs
+      // under the usual heuristic budget via the call-site gate.
+      if (options_mip_->mip_heuristic_run_rens) {
+        if (!mipdata_->parallelLockActive())
+          profiling_->start(kMipClockDiveRins);
+        HEUR_RUN(3, {
+          mipdata_->heuristics.RENS(
+              worker,
+              worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+        });
+        if (!mipdata_->parallelLockActive())
+          profiling_->stop(kMipClockDiveRins);
+      }
       if (options_mip_->mip_heuristic_run_local_branching) {
         if (!mipdata_->parallelLockActive())
           profiling_->start(kMipClockDiveRins);
