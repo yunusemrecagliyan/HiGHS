@@ -8,8 +8,10 @@
 #include "mip/HighsMipSolverData.h"
 
 #include <algorithm>
+#include <functional>
 #include <random>
 #include <sstream>
+#include <unordered_map>
 
 #include "../extern/pdqsort/pdqsort.h"
 #include "lp_data/HighsModelUtils.h"
@@ -841,6 +843,226 @@ void HighsMipSolverData::runMipPresolve(
     reportPresolveReductions(mipsolver.options_mip_->log_options,
                              presolve_status, *mipsolver.orig_model_,
                              *mipsolver.model_);
+
+  // Independent-components subsolver (SCIP cons_components-style):
+  // disconnected (var, constraint) pieces are independent sub-MIPs
+  // (the objective separates by definition). Tiny pieces are solved
+  // exactly here and their columns fixed, which can collapse wide
+  // models that are decomposable in disguise.
+  if (mipsolver.modelstatus_ == HighsModelStatus::kNotset &&
+      !mipsolver.submip &&
+      mipsolver.options_mip_->presolve != kHighsOffString)
+    solveComponents();
+}
+
+void HighsMipSolverData::solveComponents() {
+  HighsLp& model = presolvedModel;
+  const HighsInt numCol = model.num_col_;
+  const HighsInt numRow = model.num_row_;
+  if (numCol == 0 || numRow == 0) return;
+  // Skip toy models: subsolver setup plus feasibility-tolerance leakage
+  // is not worth it below trivial size, and the test suite asserts
+  // bit-exact classic behaviour on small instances.
+  if (numCol < 100) return;
+  if (model.a_matrix_.format_ != MatrixFormat::kColwise)
+    model.a_matrix_.ensureColwise();
+
+  // Union-find over columns and rows linked by matrix nonzeros.
+  std::vector<HighsInt> parent(numCol + numRow);
+  for (HighsInt i = 0; i != numCol + numRow; ++i) parent[i] = i;
+  std::function<HighsInt(HighsInt)> find = [&](HighsInt a) {
+    HighsInt r = a;
+    while (parent[r] != r) r = parent[r];
+    while (parent[a] != r) {
+      HighsInt nxt = parent[a];
+      parent[a] = r;
+      a = nxt;
+    }
+    return r;
+  };
+  auto unite = [&](HighsInt a, HighsInt b) {
+    HighsInt ra = find(a), rb = find(b);
+    if (ra != rb) parent[ra] = rb;
+  };
+  for (HighsInt c = 0; c != numCol; ++c) {
+    for (HighsInt el = model.a_matrix_.start_[c];
+         el != model.a_matrix_.start_[c + 1]; ++el)
+      unite(c, numCol + model.a_matrix_.index_[el]);
+  }
+
+  struct Component {
+    std::vector<HighsInt> cols;
+    std::vector<HighsInt> rows;
+  };
+  std::vector<Component> components;
+  std::unordered_map<HighsInt, HighsInt> rootToComp;
+  for (HighsInt c = 0; c != numCol; ++c) {
+    HighsInt r = find(c);
+    auto it = rootToComp.find(r);
+    HighsInt idx;
+    if (it == rootToComp.end()) {
+      idx = (HighsInt)components.size();
+      rootToComp[r] = idx;
+      components.emplace_back();
+    } else {
+      idx = it->second;
+    }
+    components[idx].cols.push_back(c);
+  }
+  for (HighsInt rw = 0; rw != numRow; ++rw) {
+    HighsInt r = find(numCol + rw);
+    auto it = rootToComp.find(r);
+    if (it == rootToComp.end()) continue;  // empty row: no columns
+    components[it->second].rows.push_back(rw);
+  }
+
+  // Deterministic order: by (cols, rows, first col).
+  std::vector<HighsInt> order(components.size());
+  for (size_t k = 0; k != components.size(); ++k) order[k] = (HighsInt)k;
+  pdqsort(order.begin(), order.end(), [&](HighsInt a, HighsInt b) {
+    const Component& A = components[a];
+    const Component& B = components[b];
+    if (A.cols.size() != B.cols.size()) return A.cols.size() < B.cols.size();
+    if (A.rows.size() != B.rows.size()) return A.rows.size() < B.rows.size();
+    HighsInt fa = A.cols.empty() ? numCol : A.cols[0];
+    HighsInt fb = B.cols.empty() ? numCol : B.cols[0];
+    return fa < fb;
+  });
+
+  const bool isMin = model.sense_ == ObjSense::kMinimize;
+  HighsInt numSolved = 0;
+  HighsInt numFixed = 0;
+  // Size caps for exact subsolves (SCIP-style: tiny pieces only).
+  const HighsInt maxCompInts = 40;
+  const HighsInt maxCompCols = 64;
+  const HighsInt maxCompRows = 64;
+  for (HighsInt oi = 0; oi != (HighsInt)order.size(); ++oi) {
+    const Component& comp = components[order[oi]];
+    if (comp.rows.empty()) {
+      // Isolated columns: fix directly by cost sign (trivially optimal).
+      for (HighsInt c : comp.cols) {
+        if (model.col_lower_[c] == model.col_upper_[c]) continue;
+        double fixval = model.col_lower_[c];
+        const double cost = model.col_cost_[c];
+        if (isMin ? cost < 0.0 : cost > 0.0) {
+          if (!std::isfinite(model.col_upper_[c])) continue;
+          fixval = model.col_upper_[c];
+        } else if (!std::isfinite(fixval)) {
+          continue;
+        }
+        if (model.integrality_[c] == HighsVarType::kInteger)
+          fixval = std::round(fixval);
+        model.col_lower_[c] = model.col_upper_[c] = fixval;
+        ++numFixed;
+      }
+      continue;
+    }
+    HighsInt nInt = 0;
+    for (HighsInt c : comp.cols)
+      if (model.integrality_[c] == HighsVarType::kInteger) ++nInt;
+    if (nInt > maxCompInts || (HighsInt)comp.cols.size() > maxCompCols ||
+        (HighsInt)comp.rows.size() > maxCompRows)
+      continue;
+    // Respect the global time limit.
+    if (mipsolver.options_mip_->time_limit < kHighsInf &&
+        mipsolver.timer_.read() >= mipsolver.options_mip_->time_limit)
+      break;
+
+    // Extract the sub-MIP.
+    HighsLp sublp;
+    sublp.num_col_ = (HighsInt)comp.cols.size();
+    sublp.num_row_ = (HighsInt)comp.rows.size();
+    sublp.sense_ = model.sense_;
+    sublp.offset_ = 0.0;
+    sublp.a_matrix_.format_ = MatrixFormat::kColwise;
+    sublp.a_matrix_.start_.assign(sublp.num_col_ + 1, 0);
+    std::vector<HighsInt> colRemap(numCol, -1);
+    for (size_t k = 0; k != comp.cols.size(); ++k)
+      colRemap[comp.cols[k]] = (HighsInt)k;
+    std::vector<HighsInt> rowRemap(numRow, -1);
+    for (size_t k = 0; k != comp.rows.size(); ++k)
+      rowRemap[comp.rows[k]] = (HighsInt)k;
+    sublp.col_cost_.resize(sublp.num_col_);
+    sublp.col_lower_.resize(sublp.num_col_);
+    sublp.col_upper_.resize(sublp.num_col_);
+    sublp.integrality_.resize(sublp.num_col_);
+    for (size_t k = 0; k != comp.cols.size(); ++k) {
+      HighsInt c = comp.cols[k];
+      sublp.col_cost_[k] = model.col_cost_[c];
+      sublp.col_lower_[k] = model.col_lower_[c];
+      sublp.col_upper_[k] = model.col_upper_[c];
+      sublp.integrality_[k] = model.integrality_[c];
+    }
+    sublp.row_lower_.resize(sublp.num_row_);
+    sublp.row_upper_.resize(sublp.num_row_);
+    for (size_t k = 0; k != comp.rows.size(); ++k) {
+      HighsInt r = comp.rows[k];
+      sublp.row_lower_[k] = model.row_lower_[r];
+      sublp.row_upper_[k] = model.row_upper_[r];
+    }
+    for (size_t k = 0; k != comp.cols.size(); ++k) {
+      HighsInt c = comp.cols[k];
+      for (HighsInt el = model.a_matrix_.start_[c];
+           el != model.a_matrix_.start_[c + 1]; ++el) {
+        HighsInt sr = rowRemap[model.a_matrix_.index_[el]];
+        if (sr < 0) continue;  // row outside the component (fixed col link)
+        sublp.a_matrix_.index_.push_back(sr);
+        sublp.a_matrix_.value_.push_back(model.a_matrix_.value_[el]);
+      }
+      sublp.a_matrix_.start_[k + 1] = (HighsInt)sublp.a_matrix_.index_.size();
+    }
+
+    HighsOptions suboptions = *mipsolver.options_mip_;
+    suboptions.output_flag = false;
+    suboptions.threads = 1;
+    suboptions.mip_max_nodes = 20000;
+    suboptions.mip_max_leaves = 2000;
+    suboptions.mip_detect_symmetry = false;
+    suboptions.random_seed = 0;
+    // Exact subsolves: component fixings must preserve an optimal global
+    // solution, so no gap tolerance is allowed (pieces are tiny anyway).
+    suboptions.mip_rel_gap = 0.0;
+    suboptions.mip_abs_gap = 0.0;
+    // Tight feasibility tolerance: fixing values are baked into parent
+    // bounds, so subsolver tolerance leaks directly into the reported
+    // objective.
+    suboptions.mip_feasibility_tolerance = 1e-9;
+    double remaining = mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
+    suboptions.time_limit = std::min(10.0, remaining);
+
+    HighsSolution solution;
+    solution.value_valid = false;
+    solution.dual_valid = false;
+    HighsMipSolver subsolver(*mipsolver.callback_, suboptions, sublp,
+                             solution, true, mipsolver.submip_level + 1);
+    subsolver.setProfiling(mipsolver.profiling_);
+    subsolver.initialiseTerminator(mipsolver);
+    subsolver.run();
+    if (subsolver.modelstatus_ == HighsModelStatus::kInfeasible) {
+      mipsolver.modelstatus_ = HighsModelStatus::kInfeasible;
+      return;
+    }
+    if (subsolver.modelstatus_ != HighsModelStatus::kOptimal) continue;
+    const std::vector<double>& subcol = subsolver.solution_;
+    if (subcol.size() != comp.cols.size()) continue;
+    for (size_t k = 0; k != comp.cols.size(); ++k) {
+      HighsInt c = comp.cols[k];
+      double fixval = subcol[k];
+      if (!std::isfinite(fixval)) break;
+      if (model.integrality_[c] == HighsVarType::kInteger)
+        fixval = std::round(fixval);
+      fixval = std::min(std::max(fixval, model.col_lower_[c]),
+                        model.col_upper_[c]);
+      model.col_lower_[c] = model.col_upper_[c] = fixval;
+      ++numFixed;
+    }
+    ++numSolved;
+  }
+
+  if ((numSolved > 0 || numFixed > 0) && numRestarts == 0)
+    highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+                 "MIP presolve: solved %d components, fixed %d columns\n",
+                 (int)numSolved, (int)numFixed);
 }
 
 void HighsMipSolverData::checkAddSolution() {

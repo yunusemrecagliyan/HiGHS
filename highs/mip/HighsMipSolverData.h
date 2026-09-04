@@ -221,6 +221,13 @@ struct HighsMipSolverData {
   void basisTransfer();
   void checkObjIntegrality();
   void runMipPresolve(const HighsInt presolve_reduction_limit);
+
+  // Independent-components subsolver (SCIP cons_components-style, clean
+  // room): solve tiny disconnected (var, constraint) pieces exactly and
+  // fix their columns. Called once after MIP presolve on the presolved
+  // model; model dimensions are preserved (only bounds tighten) so the
+  // postsolve stack stays consistent.
+  void solveComponents();
   void setupDomainPropagation();
   void saveReportMipSolution(const double new_upper_limit = -kHighsInf);
   void checkAddSolution();
