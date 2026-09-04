@@ -95,11 +95,18 @@ void HighsTableauSeparator::separateLpSolution(HighsLpRelaxation& lpRelaxation,
 
   maxTries -= numTries;
 
+  // At the root, try substantially more tableau rows: root cuts pay off
+  // across the whole tree, while worker-node separation is capped to keep
+  // async throughput high.
+  bool is_root = (mip.mipdata_ && mip.mipdata_->num_nodes == 0);
+  int64_t rootBonus = is_root ? 1000 : 0;
+
   maxTries = std::min(
       {maxTries,
-       200 + int64_t(0.1 *
-                     std::min(numRow,
-                              (HighsInt)mip.mipdata_->integral_cols.size()))});
+       200 + rootBonus +
+           int64_t((is_root ? 0.4 : 0.1) *
+                   std::min(numRow,
+                            (HighsInt)mip.mipdata_->integral_cols.size()))});
 
   if ((HighsInt)fractionalBasisvars.size() > maxTries) {
     const double* edgeWt = lpRelaxation.getLpSolver().getDualEdgeWeights();

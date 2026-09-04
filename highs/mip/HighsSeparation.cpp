@@ -185,9 +185,17 @@ void HighsSeparation::separate(HighsDomain& propdomain) {
   if (lp->scaledOptimal(status) && !lp->getFractionalIntegers().empty()) {
     // double firstobj = lp->getObjective();
     double firstobj = mipsolver.mipdata_->rootlpsolobj;
+    // The root earns more rounds (cuts pay off tree-wide); worker nodes keep
+    // upstream's uncapped rule - capping them measurably degrades search
+    // (problem.mps 4t: 1.44M -> 1.57M; neos-1396125: 28s -> 48s to a good
+    // solution), including in barriered parallel mode.
+    const bool is_root = (&propdomain == &mipsolver.mipdata_->getDomain());
+    int round_count = 0;
 
-    while (lp->getObjective() < mipworker_.optimality_limit) {
+    while (lp->getObjective() < mipworker_.optimality_limit &&
+           (!is_root || round_count < 15)) {
       double lastobj = lp->getObjective();
+      round_count++;
 
       int64_t nlpiters = -lp->getNumLpIterations();
       HighsInt ncuts = separationRound(propdomain, status);
@@ -211,10 +219,16 @@ void HighsSeparation::separate(HighsDomain& propdomain) {
           lp->getFractionalIntegers().empty())
         break;
 
-      // if the objective improved considerably we continue
-      if ((lp->getObjective() - firstobj) <=
-          std::max((lastobj - firstobj), mipsolver.mipdata_->feastol) * 1.01)
-        break;
+      if (is_root) {
+        // At root node, continue as long as cuts produce any improvement above feasibility tolerance
+        if (lp->getObjective() <= lastobj + mipsolver.mipdata_->feastol)
+          break;
+      } else {
+        // if the objective improved considerably we continue
+        if ((lp->getObjective() - firstobj) <=
+            std::max((lastobj - firstobj), mipsolver.mipdata_->feastol) * 1.01)
+          break;
+      }
     }
 
     // printf("done separating\n");
