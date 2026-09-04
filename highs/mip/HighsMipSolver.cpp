@@ -184,6 +184,7 @@ void HighsMipSolver::run() {
       *this, &mipdata_->getLp(), &mipdata_->getDomain(),
       &mipdata_->getCutPool(), &mipdata_->getConflictPool(),
       &mipdata_->getPseudoCost());
+  mipdata_->workers.back().workerId = 0;
 
   HighsMipWorker& master_worker = mipdata_->workers[0];
 
@@ -316,6 +317,8 @@ restart:
       mipdata_->lps.back().notifyCutPoolsLpCopied(1);
       mipdata_->workers.back().randgen.initialise(options_mip_->random_seed +
                                                   mipdata_->workers.size() - 1);
+      mipdata_->workers.back().workerId =
+          static_cast<HighsInt>(mipdata_->workers.size()) - 1;
       mipdata_->debugSolution.registerDomain(
           mipdata_->workers.back().search_ptr_->getLocalDomain());
     }

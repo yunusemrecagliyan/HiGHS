@@ -83,6 +83,10 @@ class HighsMipWorker {
 
   HighsRandom randgen;
 
+  // Stable worker identity for search diversification (set at construction;
+  // -1 if unset). Used only to break exact ties differently per worker.
+  HighsInt workerId = -1;
+
   const HighsMipSolver& getMipSolver() const;
 
   HighsMipWorker(const HighsMipSolver& mipsolver, HighsLpRelaxation* lp,

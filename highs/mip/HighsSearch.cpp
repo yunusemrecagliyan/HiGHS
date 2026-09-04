@@ -347,9 +347,17 @@ HighsInt HighsSearch::selectBranchingCandidate(int64_t maxSbIters,
   // usually stopped by the first candidate whose child LP decides the
   // node, so the evaluation order determines how much strong branching
   // work is done at the node. Order by descending pseudocost score.
+  // Break exact ties differently per worker (rotation by worker identity):
+  // with degenerate (all-zero) scores every worker would otherwise
+  // evaluate in identical index order and plunge in lockstep. Worker 0
+  // keeps the classic index order, so serial runs are bit-identical.
+  const HighsInt tieRotate =
+      mipworker.workerId >= 0
+          ? mipworker.workerId % std::max<HighsInt>(1, numfrac)
+          : 0;
   pdqsort(evalqueue.begin(), evalqueue.end(), [&](HighsInt a, HighsInt b) {
     if (priority[a] != priority[b]) return priority[a] > priority[b];
-    return a < b;
+    return (a + tieRotate) % numfrac < (b + tieRotate) % numfrac;
   });
 
   double minScore = getFeasTol();
