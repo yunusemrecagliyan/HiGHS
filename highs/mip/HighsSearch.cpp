@@ -1990,14 +1990,21 @@ bool HighsSearch::backtrackPlunge() {
     currnode.opensubtrees = 0;
     bool fallbackbranch =
         currnode.branchingdecision.boundval == currnode.branching_point;
+    double nodeScore;
     if (currnode.branchingdecision.boundtype == HighsBoundType::kLower) {
       currnode.branchingdecision.boundtype = HighsBoundType::kUpper;
       currnode.branchingdecision.boundval =
           std::floor(currnode.branchingdecision.boundval - 0.5);
+      nodeScore = pseudocost.getScoreDown(
+          currnode.branchingdecision.column,
+          fallbackbranch ? 0.5 : currnode.branching_point);
     } else {
       currnode.branchingdecision.boundtype = HighsBoundType::kLower;
       currnode.branchingdecision.boundval =
           std::ceil(currnode.branchingdecision.boundval + 0.5);
+      nodeScore = pseudocost.getScoreUp(
+          currnode.branchingdecision.column,
+          fallbackbranch ? 0.5 : currnode.branching_point);
     }
 
     if (fallbackbranch)
@@ -2033,14 +2040,42 @@ bool HighsSearch::backtrackPlunge() {
     }
 
     nodelb = std::max(nodelb, localdom.getObjectiveLowerBound());
-    // On tiny models the aggressive plunge of the redesigned search
-    // explores too much (neos-911970: 3809 nodes vs 557 with the classic
-    // queue-driven search), so every open node goes to the queue there,
-    // restoring the classic behaviour. Larger models keep the plunge
-    // (neos-1396125: plunge solves in 17.5s vs 21s with the classic
-    // search; traininstance2 benefits from the plunge as well)
+    // Postpone the plunge when an ancestor's open sibling promises a higher
+    // additive branch score than the node just taken: queue this node so
+    // co-workers can pick the sibling up instead of everybody plunging the
+    // same region (upstream rule, adapted to worker-local processedNodes).
+    // Tiny models always queue (classic queue-driven search).
     bool nodeToQueue = nodelb > mipworker.getOptimalityLimit() ||
                        mipworker.getMipSolver().numRow() < 1000;
+    if (!nodeToQueue) {
+      for (HighsInt i = nodestack.size() - 2; i >= 0; --i) {
+        if (nodestack[i].opensubtrees == 0) continue;
+
+        bool ancestorFallbackbranch =
+            nodestack[i].branchingdecision.boundval ==
+            nodestack[i].branching_point;
+        double ancestorBranchpoint =
+            ancestorFallbackbranch ? 0.5 : nodestack[i].branching_point;
+        double ancestorScoreActive;
+        double ancestorScoreInactive;
+        if (nodestack[i].branchingdecision.boundtype ==
+            HighsBoundType::kLower) {
+          ancestorScoreInactive = pseudocost.getScoreDown(
+              nodestack[i].branchingdecision.column, ancestorBranchpoint);
+          ancestorScoreActive = pseudocost.getScoreUp(
+              nodestack[i].branchingdecision.column, ancestorBranchpoint);
+        } else {
+          ancestorScoreActive = pseudocost.getScoreDown(
+              nodestack[i].branchingdecision.column, ancestorBranchpoint);
+          ancestorScoreInactive = pseudocost.getScoreUp(
+              nodestack[i].branchingdecision.column, ancestorBranchpoint);
+        }
+
+        nodeToQueue = ancestorScoreInactive - ancestorScoreActive >
+                      nodeScore + getFeasTol();
+        break;
+      }
+    }
 
     if (nodeToQueue) {
       // if (!mipsolver.submip) printf("node goes to queue\n");
