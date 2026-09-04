@@ -495,26 +495,22 @@ class HeuristicNeighbourhood {
 };
 
 void HighsPrimalHeuristics::diving(HighsMipWorker& worker) {
-  if (mipsolver.numRow() < 200 && mipsolver.numCol() < 500) return;
-  // Lock/pseudocost-guided diving. Structurally safe zero-lock roundings are
-  // fixed as a batch. If none exist, one branching-relevant variable is fixed
-  // in its cheaper pseudocost direction.
+  // Guided fractional diving: repeatedly solve the LP relaxation, fix the
+  // most fractional integer variable to its nearest integer and re-solve,
+  // until an integer feasible solution is found or the LP is infeasible.
+  // This classical primal heuristic (used by commercial solvers) finds
+  // feasible solutions quickly by constructing a shallow search path.
   HighsDomain localdom = worker.getGlobalDomain();
 
   HighsLpRelaxation lprelax(mipsolver);
   lprelax.setMipWorker(worker);
   lprelax.setProfiling(mipsolver.profiling_);
   lprelax.loadModel();
-  const int64_t lpIters0 = lprelax.getNumLpIterations();
-  auto bookDiveLpIters = [&]() {
-    worker.getHeurLpIterations() += lprelax.getNumLpIterations() - lpIters0;
-  };
   lprelax.setIterationLimit(
       std::max(int64_t{10000}, 2 * mipsolver.mipdata_->firstrootlpiters));
   lprelax.getLpSolver().changeColsBounds(0, mipsolver.numCol() - 1,
                                          localdom.col_lower_.data(),
                                          localdom.col_upper_.data());
-  localdom.clearChangedCols();
   if (mipsolver.options_mip_->mip_root_presolve_only)
     lprelax.getLpSolver().setOptionValue("presolve", kHighsOffString);
   else if ((5 * intcols.size()) / mipsolver.numCol() >= 1)
@@ -522,82 +518,37 @@ void HighsPrimalHeuristics::diving(HighsMipWorker& worker) {
   else
     lprelax.getLpSolver().setOptionValue("presolve", kHighsOffString);
 
+  // Dive: solve the LP, fix the most fractional integer variable to its
+  // nearest integer, re-solve, until the LP solution is integral or the
+  // LP becomes infeasible. The dive is bounded by the relaxation's
+  // iteration limit
   const double feastol = mipsolver.mipdata_->feastol;
-  const HighsPseudocost& pseudocost = worker.getPseudocost();
-  std::vector<HighsInt> fixingCols;
-  std::vector<double> fixingVals;
-  fixingCols.reserve(intcols.size());
-  fixingVals.reserve(intcols.size());
   while (true) {
     const HighsLpRelaxation::Status status = lprelax.run();
-    if (status != HighsLpRelaxation::Status::kOptimal) {
-      bookDiveLpIters();
-      return;
-    }
+    if (status != HighsLpRelaxation::Status::kOptimal) return;
     const std::vector<double>& sol =
         lprelax.getLpSolver().getSolution().col_value;
-    fixingCols.clear();
-    fixingVals.clear();
+    double best_frac = feastol;
     HighsInt best_col = -1;
-    double best_val = 0.0;
-    double best_priority = -1.0;
     for (HighsInt i : intcols) {
       if (localdom.col_lower_[i] == localdom.col_upper_[i]) continue;
       const double val = sol[i];
       const double frac = std::abs(val - std::floor(val + 0.5));
-      if (frac <= feastol) continue;
-
-      const bool lockFreeUp = mipsolver.mipdata_->uplocks[i] == 0;
-      const bool lockFreeDown = mipsolver.mipdata_->downlocks[i] == 0;
-      if (lockFreeUp || lockFreeDown) {
-        double fixval = lockFreeUp != lockFreeDown
-                            ? lockFreeUp ? std::ceil(val) : std::floor(val)
-                            : std::floor(val + 0.5);
-        fixingCols.push_back(i);
-        fixingVals.push_back(std::max(
-            localdom.col_lower_[i], std::min(localdom.col_upper_[i], fixval)));
-        continue;
-      }
-
-      const double priority = pseudocost.getScore(i, val);
-      if (priority > best_priority ||
-          (priority == best_priority && (best_col == -1 || i < best_col))) {
-        const double upcost = pseudocost.getPseudocostUp(i, val);
-        const double downcost = pseudocost.getPseudocostDown(i, val);
-        double fixval = upcost < downcost ? std::ceil(val) : std::floor(val);
-        if (upcost == downcost) fixval = std::floor(val + 0.5);
-        best_priority = priority;
+      if (frac > best_frac) {
+        best_frac = frac;
         best_col = i;
-        best_val = std::max(localdom.col_lower_[i],
-                            std::min(localdom.col_upper_[i], fixval));
       }
     }
-    if (fixingCols.empty() && best_col == -1) {
+    if (best_col == -1) {
       // All integer variables are integral: try the resulting solution
       trySolution(sol, kSolutionSourceHeuristic, worker);
-      bookDiveLpIters();
       return;
     }
-
-    if (fixingCols.empty()) {
-      fixingCols.push_back(best_col);
-      fixingVals.push_back(best_val);
-    }
-
-    for (size_t k = 0; k != fixingCols.size(); ++k) {
-      localdom.fixColWithoutPropagation(fixingCols[k], fixingVals[k],
-                                        HighsDomain::Reason::branching());
-      if (localdom.infeasible()) break;
-    }
-    if (!localdom.infeasible()) localdom.propagate();
-    if (localdom.infeasible()) {
-      localdom.conflictAnalysis(worker.getConflictPool(),
-                                worker.getGlobalDomain(),
-                                worker.getPseudocost());
-      bookDiveLpIters();
-      return;
-    }
-    lprelax.flushDomain(localdom, true);
+    const double fixval = std::floor(sol[best_col] + 0.5);
+    localdom.fixCol(best_col, fixval, HighsDomain::Reason::branching());
+    if (localdom.infeasible()) return;
+    lprelax.getLpSolver().changeColsBounds(best_col, best_col, &fixval,
+                                           &fixval);
   }
 }
 
