@@ -954,17 +954,40 @@ void HighsSearch::markNodeEvaluated() {
 
 bool HighsSearch::currentNodeEvalCurrent() const {
   // Redundant-evaluation skipping: trades exact baseline trajectories for
-  // node-count savings. Two quality guards keep it safe across instances:
+  // node-count savings. Three quality guards keep it safe across instances:
   //  - at most ONE consecutive skip per full evaluation (skipping both
   //    redundant re-evaluations of a cycle measurably degrades primal
-  //    results, e.g. on glass4), and
-  //  - evaluations that produced conflicts are never recorded for reuse.
+  //    results, e.g. on glass4),
+  //  - evaluations that produced conflicts are never recorded for reuse, and
+  //  - skips are only allowed once the relative MIP gap is below 5%: the
+  //    replayed pseudocost observations are approximate and degrade
+  //    branching while good incumbents are still missing (e.g. problem.mps
+  //    stalled at 1.57M vs 1.29M baseline at 60s with skipping on).
   // Measured with these guards: neos-911970 93 -> 16 nodes, glass4 incumbent
   // 2000014975 -> 1955572911 (better than baseline), all other reference
   // instances unchanged. HIGHS_NODE_EVAL_DEDUP_OFF=1 restores exact baseline
   // evaluation behaviour.
   static const char* off = getenv("HIGHS_NODE_EVAL_DEDUP_OFF");
   if (off) return false;
+  // Primal-quality gate (serial search only): with no incumbent yet, or the
+  // global gap still wide, evaluate exactly - the approximate replay is
+  // only safe in the endgame. In parallel search skips are left ungated:
+  // there they buy worker throughput and measured better (problem.mps 4t:
+  // 1.38M with skips vs 1.57M without), while in serial search they
+  // measurably degrade branching (problem.mps 1t: 1.57M with skips vs
+  // 1.37M without).
+  // Note: this must use the global dual bound, not the current node's lower
+  // bound (deep nodes have tight local bounds that would wrongly open the
+  // gate mid-search).
+  if (!mipsolver.mipdata_->hasMultipleWorkers()) {
+    const double upper = getUpperLimit();
+    if (upper >= kHighsInf / 2.0) return false;
+    const double globalLower = mipsolver.mipdata_->lower_bound;
+    const double denom = (upper >= 0.0 ? upper : -upper) > 1.0
+                             ? (upper >= 0.0 ? upper : -upper)
+                             : 1.0;
+    if ((upper - globalLower) / denom > 0.05) return false;
+  }
   if (evalSkipsSinceFull >= 1) return false;
   if (!evalSnapshotValid || nodestack.empty()) return false;
   // Any structural change on the node stack (node installed, child or
