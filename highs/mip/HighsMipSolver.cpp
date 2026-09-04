@@ -778,8 +778,9 @@ restart:
       double ms = 0.0;
       int64_t improvements = 0;
     };
-    static HeurStats hstats[6];
-    static const char* hnames[6] = {"CAR", "RR", "DIV", "RENS", "RINS", "LB"};
+    static HeurStats hstats[7];
+    static const char* hnames[7] = {"CAR", "RR",  "DIV", "RENS",
+                                    "RINS", "LB", "SHF"};
     static std::chrono::steady_clock::time_point hstatsT0 =
         std::chrono::steady_clock::now();
     static bool hstatsReg = [] {
@@ -791,7 +792,7 @@ restart:
                                std::chrono::steady_clock::now() - hstatsT0)
                                .count();
         fprintf(f, "total=%.2fs\n", tot);
-        for (int t = 0; t < 6; ++t)
+        for (int t = 0; t < 7; ++t)
           fprintf(f, "%5s calls=%lld ms=%.0f improvements=%lld\n", hnames[t],
                   (long long)hstats[t].calls, hstats[t].ms,
                   (long long)hstats[t].improvements);
@@ -865,6 +866,17 @@ restart:
       });
       if (!mipdata_->parallelLockActive())
         profiling_->stop(kMipClockDiveRandomizedRounding);
+    } else {
+      // Post-incumbent shifting: SCIP's shifting heuristic is the top
+      // primal workhorse on wide models (repair loop, no LP solves).
+      // Gated on its usual option (default false).
+      if (options_mip_->mip_heuristic_run_shifting) {
+        HEUR_RUN(6, {
+          mipdata_->heuristics.shifting(
+              worker,
+              worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+        });
+      }
     }
     if (mipdata_->incumbent.empty()) {
       if (options_mip_->mip_heuristic_run_diving) {
@@ -873,6 +885,14 @@ restart:
         HEUR_RUN(2, { mipdata_->heuristics.diving(worker); });
         if (!mipdata_->parallelLockActive())
           profiling_->stop(kMipClockDiveRandomizedRounding);
+      }
+      // Pre-incumbent shifting as well (same option gate).
+      if (options_mip_->mip_heuristic_run_shifting) {
+        HEUR_RUN(6, {
+          mipdata_->heuristics.shifting(
+              worker,
+              worker.getLpRelaxation().getLpSolver().getSolution().col_value);
+        });
       }
     }
     if (mipdata_->incumbent.empty()) {
