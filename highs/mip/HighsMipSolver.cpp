@@ -83,6 +83,13 @@ void HighsMipSolver::runTask(F&& f, highs::parallel::TaskGroup& tg,
                              bool parallel_lock, bool force_serial,
                              const std::vector<HighsInt>& indices) {
   if (indices.empty()) return;
+  // Restore (not release) the previous state on exit: runTask is also used
+  // from the async epoch (resetGlobalDomain), where the parallel lock is
+  // held for the whole session and must survive nested serial sections.
+  // Unconditionally releasing here left async pipelines observing a cleared
+  // lock, sending them down serial-only paths (e.g. probing) concurrently
+  // and corrupting global MIP structures.
+  const bool restore_lock = mipdata_->parallelLockActive();
   setParallelLock(parallel_lock);
   const bool spawn_tasks = !force_serial && indices.size() > 1 &&
                            !options_mip_->mip_search_simulate_concurrency;
@@ -96,7 +103,7 @@ void HighsMipSolver::runTask(F&& f, highs::parallel::TaskGroup& tg,
   if (spawn_tasks) {
     tg.taskWait();
   }
-  setParallelLock(false);
+  setParallelLock(restore_lock);
 }
 
 void HighsMipSolver::run() {
