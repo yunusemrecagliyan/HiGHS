@@ -5,6 +5,8 @@
 /*    Available as open-source under the MIT License                     */
 /*                                                                       */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+#include <mutex>
+
 #include "mip/HighsMipWorker.h"
 
 #include "mip/HighsMipSolverData.h"
@@ -28,6 +30,7 @@ HighsMipWorker::HighsMipWorker(const HighsMipSolver& mipsolver,
   optimality_limit = mipdata_.optimality_limit;
   heuristics_allowed = true;
   early_termination = false;
+  prepNodeIdx = 0;
   search_ptr_ =
       std::unique_ptr<HighsSearch>(new HighsSearch(*this, getPseudocost()));
   sepa_ptr_ = std::unique_ptr<HighsSeparation>(new HighsSeparation(*this));
@@ -71,6 +74,21 @@ bool HighsMipWorker::addIncumbent(const std::vector<double>& sol, double solobj,
     }
     // Can't repair solutions locally, so also buffer infeasible ones
     solutions_.emplace_back(sol, solobj, solution_source);
+  }
+  // Async fast-path: if async mode is live and this worker just improved on
+  // the merged global bound, force an early sync epoch so co-workers learn
+  // the bound without waiting for the periodic epoch budget to drain. The
+  // epoch performs the authoritative merge. try_lock: never block the
+  // search - if an epoch holds the lock it merges everything anyway.
+  if (mipdata_.asyncEpochBudget_ != nullptr &&
+      mipdata_.asyncNodefetchMutex_ != nullptr &&
+      mipdata_.asyncNodefetchCv_ != nullptr &&
+      upper_bound < mipdata_.upper_bound &&
+      mipdata_.asyncNodefetchMutex_->try_lock()) {
+    std::unique_lock<std::mutex> lk(*mipdata_.asyncNodefetchMutex_,
+                                    std::adopt_lock);
+    mipdata_.asyncEpochBudget_->store(0, std::memory_order_relaxed);
+    mipdata_.asyncNodefetchCv_->notify_all();
   }
   return true;
 }

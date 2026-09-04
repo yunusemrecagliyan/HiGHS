@@ -1134,11 +1134,27 @@ restart:
     // resulting epoch refreshes pseudo-costs, pools, domains, bounds and
     // logging - comparable in spirit to the per-round sync of the barriered
     // baseline (which synchronizes every ~2 nodes per worker).
-    constexpr int64_t kAsyncEpochFetchBudget = 200;
-    int64_t epochFetchBudgetRemaining = kAsyncEpochFetchBudget;
+    constexpr int64_t kAsyncEpochFetchBudget = 12;
+    std::atomic<int64_t> epochFetchBudgetRemaining{kAsyncEpochFetchBudget};
+
+    // Wire up pointers so workers can broadcast incumbent improvements
+    // immediately without waiting for the epoch.
+    mipdata_->asyncEpochBudget_ = &epochFetchBudgetRemaining;
+    mipdata_->asyncNodefetchCv_ = &nodefetch_cv;
+    mipdata_->asyncNodefetchMutex_ = &nodefetch_mutex;
+    // RAII cleanup: null the pointers when leaving async mode.
+    struct AsyncPtrGuard {
+      HighsMipSolverData* d;
+      ~AsyncPtrGuard() {
+        d->asyncEpochBudget_ = nullptr;
+        d->asyncNodefetchCv_ = nullptr;
+        d->asyncNodefetchMutex_ = nullptr;
+      }
+    } asyncPtrGuard{mipdata_.get()};
+
     auto epochDueLocked = [&]() {
       if (stopRequested.load(std::memory_order_relaxed)) return false;
-      return epochFetchBudgetRemaining <= 0;
+      return epochFetchBudgetRemaining.load(std::memory_order_relaxed) <= 0;
     };
 
     // Global stop broadcast: any worker observing a limit (local limits
@@ -1164,6 +1180,7 @@ restart:
       profiling_->start(kMipClockOpenNodesToQueue0);
       for (auto& node_treeweight_pair : worker.processedNodes) {
         HighsNodeQueue::OpenNode& node = node_treeweight_pair.first;
+        if (node.lower_bound >= worker.upper_limit) continue;
         double tmpTreeWeight = mipdata_->nodequeue.emplaceNode(
             std::move(node.domchgstack), std::move(node.branchings),
             node.lower_bound, node.estimate, node.depth);
@@ -1177,11 +1194,35 @@ restart:
     // Opportunistic flush outside the locked sections of the pipeline.
     // Bumps workGeneration (and wakes parked co-workers) whenever open
     // children entered a previously empty shared queue.
+    // Also instantly broadcasts any new incumbent solution to all workers.
     auto flushProcessedToSharedQueue = [&](HighsInt wi) -> void {
       std::lock_guard<std::mutex> lk(nodefetch_mutex);
       const bool wasEmpty = mipdata_->nodequeue.empty();
       flushProcessedToSharedQueueLocked(wi);
-      if (wasEmpty && !mipdata_->nodequeue.empty()) {
+
+      HighsMipWorker& worker = mipdata_->workers[wi];
+      if (!worker.solutions_.empty()) {
+        double best_sol_obj = kHighsInf;
+        for (auto& s : worker.solutions_) {
+          if (std::get<1>(s) < best_sol_obj) best_sol_obj = std::get<1>(s);
+        }
+        if (best_sol_obj < mipdata_->upper_bound) {
+          double new_limit =
+              mipdata_->computeNewUpperLimit(best_sol_obj, 0.0, 0.0);
+          double new_opt_limit = mipdata_->computeNewUpperLimit(
+              best_sol_obj, options_mip_->mip_abs_gap,
+              options_mip_->mip_rel_gap);
+          for (HighsInt j = 0; j < workersInFlight; ++j) {
+            mipdata_->workers[j].upper_limit = new_limit;
+            mipdata_->workers[j].optimality_limit = new_opt_limit;
+          }
+          mipdata_->nodequeue.setOptimalityLimit(new_opt_limit);
+        }
+        // Force an immediate sync epoch to merge solutions cleanly into global incumbent
+        epochFetchBudgetRemaining.store(0, std::memory_order_relaxed);
+        ++workGeneration;
+        nodefetch_cv.notify_all();
+      } else if (wasEmpty && !mipdata_->nodequeue.empty()) {
         ++workGeneration;
         nodefetch_cv.notify_all();
       }
@@ -1249,6 +1290,11 @@ restart:
           }
           considerHeuristics = false;
           if (worker.getGlobalDomain().infeasible()) break;
+          if (worker.search_ptr_->hasNode() &&
+              worker.search_ptr_->getCurrentLowerBound() >= worker.upper_limit)
+            break;
+          if (epochFetchBudgetRemaining.load(std::memory_order_relaxed) <= 0)
+            break;
           if (dive(wi, maxNodesPerWorkerLim)) break;
           if (worker.search_ptr_->checkLimits(
                   worker.search_ptr_->getLocalNodes())) {
@@ -1256,11 +1302,13 @@ restart:
             break;
           }
           if (stopRequested.load(std::memory_order_relaxed)) break;
+          if (epochFetchBudgetRemaining.load(std::memory_order_relaxed) <= 0)
+            break;
 
           nodes_explored +=
               worker.search_ptr_->getLocalNodes() - lastLocalNodeCount;
           lastLocalNodeCount = worker.search_ptr_->getLocalNodes();
-          if (nodes_explored >= 100) break;
+          if (nodes_explored >= 40) break;
           if (backtrackPlunge(wi)) break;
           if (!mipdata_->parallelLockActive()) {
             worker.search_ptr_->flushStatistics(*this);
@@ -1522,15 +1570,36 @@ restart:
       // restart leaves async mode with a special flag; the caller then
       // performs performRestart() itself and re-enters the barriered loop.
       if (!submip && options_mip_->mip_allow_restart) {
-        const RestartVote vote =
-            checkRestart(master_worker, workersInFlight / 2,
-                         master_worker.search_ptr_->treeweight);
-        if (vote == RestartVote::kWouldRestart) {
+        HighsInt numRestartVotes = 0;
+        HighsInt numHugeTreeVotes = 0;
+        HighsInt numVoters = 0;
+        for (HighsInt i = 0; i < workersInFlight; ++i) {
+          const RestartVote v = checkRestart(mipdata_->workers[i], 1, 0.0);
+          if (v != RestartVote::kNoCheck) {
+            ++numVoters;
+            if (v == RestartVote::kWouldRestart) ++numRestartVotes;
+            else if (v == RestartVote::kHugeTree) ++numHugeTreeVotes;
+          }
+        }
+        bool forcedRestart = (numVoters >= 2 &&
+            numRestartVotes / static_cast<double>(numVoters) >= 0.25);
+        const RestartVote vote = checkRestart(
+            master_worker, (numRestartVotes + numHugeTreeVotes + 2) / 2, 0.0);
+        if (forcedRestart || vote == RestartVote::kWouldRestart) {
           dbgPrint("restart-vote");
           asyncRequestsRestart = true;
           terminateAll = true;
           stopRequested.store(true, std::memory_order_relaxed);
           return;
+        } else if (vote == RestartVote::kHugeTree) {
+          nextCheck = mipdata_->num_nodes + 100;
+          numHugeTreeEstim += (numRestartVotes + numHugeTreeVotes + 2) / 2;
+        } else if (vote == RestartVote::kNoHugeTree) {
+          numHugeTreeEstim = 0;
+          treeweightLastCheck = static_cast<double>(mipdata_->pruned_treeweight);
+          numNodesLastCheck = mipdata_->num_nodes;
+          upperLimLastCheck = mipdata_->upper_limit;
+          lowerBoundLastCheck = mipdata_->lower_bound;
         }
       }
     };
@@ -1582,9 +1651,30 @@ restart:
           // idle when the periodic synchronization budget is exhausted.
           if (!stopPoll() && !epochDueLocked() &&
               !mipdata_->nodequeue.empty()) {
-            --epochFetchBudgetRemaining;
-            mipdata_->workers[wi].preparedNodes.push_back(
-                std::move(mipdata_->nodequeue.popBestBoundNode()));
+            epochFetchBudgetRemaining.fetch_sub(1, std::memory_order_relaxed);
+            bool fetchBestBound = false;
+            if (workersInFlight == 1) {
+              fetchBestBound = (numQueueLeavesLocal % 4 == 0);
+            } else {
+              // Diversified worker roles:
+              // Worker 0: dedicated to BestBound advancement (proves optimality)
+              // Worker 1: 50/50 BestBound and BestEstimate (hybrid)
+              // Worker 2+: 25% BestBound, 75% BestEstimate (primal search)
+              if (wi == 0) {
+                fetchBestBound = true;
+              } else if (wi == 1) {
+                fetchBestBound = (numQueueLeavesLocal % 2 == 0);
+              } else {
+                fetchBestBound = (numQueueLeavesLocal % 4 == 0);
+              }
+            }
+            if (fetchBestBound) {
+              mipdata_->workers[wi].preparedNodes.push_back(
+                  std::move(mipdata_->nodequeue.popBestBoundNode()));
+            } else {
+              mipdata_->workers[wi].preparedNodes.push_back(
+                  std::move(mipdata_->nodequeue.popBestNode()));
+            }
             ++numQueueLeavesLocal;  // best-effort bookkeeping only
             dirtySinceSync[wi] = 1;
             ++workersProcessing;
@@ -1610,16 +1700,16 @@ restart:
               runSyncEpochLocked();
               epochRunning = false;
               ++epochSerial;
-              if (terminateAll ||
-                  stopRequested.load(std::memory_order_relaxed)) {
+              if (terminateAll) {
                 nodefetch_cv.notify_all();
                 return;
               }
-              // Early-termination votes were resolved inside the epoch;
+              // Limits and early-termination were resolved inside the epoch;
               // release the stop so normal fetching resumes, and refill the
               // periodic synchronization budget.
               stopRequested.store(false, std::memory_order_relaxed);
-              epochFetchBudgetRemaining = kAsyncEpochFetchBudget;
+              epochFetchBudgetRemaining.store(kAsyncEpochFetchBudget,
+                                              std::memory_order_relaxed);
               nodefetch_cv.notify_all();
               // retry fetching after the epoch
             }
@@ -1662,17 +1752,17 @@ restart:
         runSyncEpochLocked();
         epochRunning = false;
         ++epochSerial;
-        const bool leave =
-            terminateAll || stopRequested.load(std::memory_order_relaxed);
-        if (!leave) {
-          // Early-termination votes were resolved inside the epoch; release
-          // the stop so normal fetching resumes, and refill the periodic
-          // synchronization budget.
-          stopRequested.store(false, std::memory_order_relaxed);
-          epochFetchBudgetRemaining = kAsyncEpochFetchBudget;
+        if (terminateAll) {
+          nodefetch_cv.notify_all();
+          return;
         }
+        // Limits and early-termination were resolved inside the epoch; release
+        // the stop so normal fetching resumes, and refill the periodic
+        // synchronization budget.
+        stopRequested.store(false, std::memory_order_relaxed);
+        epochFetchBudgetRemaining.store(kAsyncEpochFetchBudget,
+                                        std::memory_order_relaxed);
         nodefetch_cv.notify_all();
-        if (leave) return;
         // else: fresh children may exist after bounding/pruning - retry
       }
     };
@@ -1753,7 +1843,7 @@ restart:
       // model instead of terminating the search.
       if (restartRequestedAfterAsync) {
         restartRequestedAfterAsync = false;
-        if (!mipdata_->nodequeue.empty() && !terminate()) {
+        if (!terminate() && modelstatus_ == HighsModelStatus::kNotset) {
           goto restart;
         }
       }

@@ -10,7 +10,11 @@
 #define HIGHS_MIP_SOLVER_DATA_H_
 
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <vector>
+
+#include "lp_data/HConst.h"
 
 #include "mip/HighsCliqueTable.h"
 #include "mip/HighsConflictPool.h"
@@ -164,6 +168,15 @@ struct HighsMipSolverData {
   std::vector<double> incumbent;
 
   HighsNodeQueue nodequeue;
+
+  // Live hooks for async node-fetch mode (HighsMipSolver::asyncRunNodeFetch).
+  // Null unless async mode is running. They let any worker force an early
+  // sync epoch when it finds a bound better than the merged global bound,
+  // instead of waiting for the periodic epoch budget to drain. The epoch
+  // itself (running under the mutex) performs the authoritative merge.
+  std::atomic<int64_t>* asyncEpochBudget_ = nullptr;
+  std::mutex* asyncNodefetchMutex_ = nullptr;
+  std::condition_variable* asyncNodefetchCv_ = nullptr;
 
   HighsPrimaDualIntegral primal_dual_integral;
 
