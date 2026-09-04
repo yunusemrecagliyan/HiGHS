@@ -629,8 +629,13 @@ restart:
             : 1;
     for (HighsInt j = 0; j != numNodesPerWorker; j++) {
       for (const HighsInt i : indices) {
+        // Serial rounds keep the classic policy (best-bound every 10th
+        // leaf). In multi-worker rounds bound and estimate duty is split
+        // evenly (checkerboard over worker/node indices): giving only
+        // worker 0 best-bound nodes starves bound proof while estimate
+        // workers multiply, stalling optimality proof on wide models.
         if ((indices.size() == 1 && numQueueLeaves - lastLbLeave >= 10) ||
-            (indices.size() > 1 && i == 0 && j == 0)) {
+            (indices.size() > 1 && (i + j) % 2 == 0)) {
           mipdata_->workers[i].preparedNodes.push_back(
               std::move(mipdata_->nodequeue.popBestBoundNode()));
           lastLbLeave = numQueueLeaves;
