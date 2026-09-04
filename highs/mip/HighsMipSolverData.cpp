@@ -7,6 +7,7 @@
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 #include "mip/HighsMipSolverData.h"
 
+#include <algorithm>
 #include <random>
 #include <sstream>
 
@@ -679,15 +680,23 @@ bool HighsMipSolverData::moreHeuristicsAllowed() const {
   // exploring the tree based on the weight of the already pruned nodes, the
   // estimated effort the is not expected to be a good prediction in the
   // beginning.
+  // The heuristic LP budget is shared across workers, so each worker only
+  // sees a fraction of it: scale the allowed effort by the live worker
+  // count to preserve per-worker parity (serial and sub-MIP runs keep a
+  // factor of 1, i.e. byte-identical behaviour there).
+  const double eff =
+      heuristic_effort *
+      (mipsolver.submip
+           ? 1.0
+           : static_cast<double>(std::max<size_t>(1, workers.size())));
   if (mipsolver.submip) {
-    return heuristic_lp_iterations < total_lp_iterations * heuristic_effort;
+    return heuristic_lp_iterations < total_lp_iterations * eff;
   } else if (pruned_treeweight < 1e-3 &&
              num_leaves - num_leaves_before_run < 10 &&
              num_nodes - num_nodes_before_run < 1000) {
     // in the main MIP solver allow an initial offset of 10000 heuristic LP
     // iterations
-    if (heuristic_lp_iterations <
-        total_lp_iterations * heuristic_effort + 10000)
+    if (heuristic_lp_iterations < total_lp_iterations * eff + 10000)
       return true;
   } else if (heuristic_lp_iterations <
              100000 + ((total_lp_iterations - heuristic_lp_iterations -
@@ -721,7 +730,7 @@ bool HighsMipSolverData::moreHeuristicsAllowed() const {
     // adequate when we want to spent all available time in the first 80%.
     if (total_heuristic_effort_estim <
         std::max(0.3 / 0.8, std::min(double(pruned_treeweight), 0.8) / 0.8) *
-            heuristic_effort) {
+            eff) {
       // printf(
       //     "heuristic lp iterations: %ld, total_lp_iterations: %ld, "
       //     "total_heur_effort_estim = %.3f%%\n",
