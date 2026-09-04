@@ -518,24 +518,48 @@ void HighsPrimalHeuristics::diving(HighsMipWorker& worker) {
   else
     lprelax.getLpSolver().setOptionValue("presolve", kHighsOffString);
 
-  // Dive: solve the LP, fix the most fractional integer variable to its
-  // nearest integer, re-solve, until the LP solution is integral or the
-  // LP becomes infeasible. The dive is bounded by the relaxation's
-  // iteration limit
+  // Dive: solve the LP, fix one integer variable and re-solve, until the
+  // LP solution is integral or the LP becomes infeasible. The dive is
+  // bounded by the relaxation's iteration limit.
+  // Candidate selection is pseudocost-scored (SCIP objpscostdiving-style):
+  // prefer variables whose fixing is both reliable (branching-style
+  // pseudocost score) and cheap in objective impact, instead of blindly
+  // taking the most fractional variable. Falls back to fractionality
+  // when scores are unavailable. Deterministic: no RNG draws.
   const double feastol = mipsolver.mipdata_->feastol;
+  const HighsPseudocost& pscost = worker.getPseudocost();
+  double maxfixcost = 0.0;
+  for (HighsInt i : intcols) {
+    if (localdom.col_lower_[i] == localdom.col_upper_[i]) continue;
+    maxfixcost = std::max(maxfixcost, std::abs(mipsolver.colCost(i)));
+  }
   while (true) {
     const HighsLpRelaxation::Status status = lprelax.run();
     if (status != HighsLpRelaxation::Status::kOptimal) return;
     const std::vector<double>& sol =
         lprelax.getLpSolver().getSolution().col_value;
-    double best_frac = feastol;
+    double bestscore = -1.0;
+    double bestfrac = feastol;
     HighsInt best_col = -1;
     for (HighsInt i : intcols) {
       if (localdom.col_lower_[i] == localdom.col_upper_[i]) continue;
       const double val = sol[i];
       const double frac = std::abs(val - std::floor(val + 0.5));
-      if (frac > best_frac) {
-        best_frac = frac;
+      if (frac <= feastol) continue;
+      double score = pscost.getScore(i, frac);
+      if (!std::isfinite(score) || score <= 0.0) {
+        score = frac;
+      } else if (maxfixcost > 0.0) {
+        // Objective blend: discount variables whose rounding is
+        // expensive relative to the costliest integer column.
+        const double fixcost =
+            std::abs(mipsolver.colCost(i)) * std::min(frac, 1.0 - frac);
+        score /= 1.0 + fixcost / maxfixcost;
+      }
+      if (score > bestscore ||
+          (score == bestscore && frac > bestfrac)) {
+        bestscore = score;
+        bestfrac = frac;
         best_col = i;
       }
     }
