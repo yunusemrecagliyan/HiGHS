@@ -548,6 +548,7 @@ struct HighsOptionsStruct {
   double mip_benders_branch_priority;
   double mip_benders_max_time;
   bool mip_benders_cut_hygiene;
+  bool mip_benders_dual_bound;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -743,7 +744,8 @@ struct HighsOptionsStruct {
         mip_benders_max_cuts(kHighsIInf),
         mip_benders_branch_priority(0.0),
         mip_benders_max_time(30.0),
-        mip_benders_cut_hygiene(false) {};
+        mip_benders_cut_hygiene(false),
+        mip_benders_dual_bound(false) {};
   // clang-format on
 };
 
@@ -1493,6 +1495,14 @@ class HighsOptions : public HighsOptionsStruct {
         "duplicates suppressed (master-LP hygiene; off by default for "
         "bit-identical loop dynamics)",
         advanced, &mip_benders_cut_hygiene, false);
+    records.push_back(record_bool);
+
+    record_bool = new OptionRecordBool(
+        "mip_benders_dual_bound",
+        "Whether the Benders master lower bound is injected as the "
+        "global dual bound (minimize-only, eps-shrunk, skipped above "
+        "the incumbent; off by default)",
+        advanced, &mip_benders_dual_bound, false);
     records.push_back(record_bool);
 
     record_bool = new OptionRecordBool(

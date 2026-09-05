@@ -2181,6 +2181,56 @@ TEST_CASE("MIP-benders-branchpriority", "[highs_test_mip_solver]") {
   }
 }
 
+TEST_CASE("MIP-benders-dualbound", "[highs_test_mip_solver]") {
+  // Injected master lower bounds must never change the proven optimum:
+  // dual-bound on/off and Benders off agree exactly (minimize).
+  std::string filename =
+      std::string(HIGHS_DIR) + "/check/instances/benders-lshaped.lp";
+  double reference = kHighsInf;
+  for (HighsInt cfg = 0; cfg != 3; ++cfg) {
+    Highs highs;
+    highs.setOptionValue("output_flag", dev_run);
+    highs.setOptionValue("mip_rel_gap", 0);
+    highs.setOptionValue("mip_abs_gap", 0);
+    highs.setOptionValue("mip_benders", cfg != 2);
+    highs.setOptionValue("mip_benders_dual_bound", cfg == 0);
+    highs.setOptionValue("presolve_rule_off", (HighsInt)1048512);
+    highs.readModel(filename);
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+    double objective = highs.getInfo().objective_function_value;
+    REQUIRE(std::isfinite(objective));
+    if (cfg == 0)
+      reference = objective;
+    else
+      REQUIRE(objective == reference);
+    highs.resetGlobalScheduler(true);
+  }
+}
+
+TEST_CASE("MIP-benders-dualbound-max", "[highs_test_mip_solver]") {
+  // Maximize sense: the bound sits on the upper side and must be
+  // ignored safely (on/off agreement at the mirrored optimum).
+  double reference = kHighsInf;
+  for (HighsInt cfg = 0; cfg != 2; ++cfg) {
+    Highs highs;
+    highs.setOptionValue("output_flag", dev_run);
+    highs.setOptionValue("mip_rel_gap", 0);
+    highs.setOptionValue("mip_abs_gap", 0);
+    highs.setOptionValue("mip_benders_dual_bound", cfg == 0);
+    highs.passModel(bendersArrowhead(true));
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+    double objective = highs.getInfo().objective_function_value;
+    REQUIRE(std::isfinite(objective));
+    if (cfg == 0)
+      reference = objective;
+    else
+      REQUIRE(objective == reference);
+    highs.resetGlobalScheduler(true);
+  }
+}
+
 TEST_CASE("MIP-decomposition-zero-objective", "[highs_test_mip_solver]") {
   // Zero objective: every feasible point is optimal; decomposition must
   // still agree with the fallback path (objective 0).

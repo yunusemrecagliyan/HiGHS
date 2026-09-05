@@ -14,6 +14,13 @@
 // and feasible compositions are injected as MIP-start incumbents through
 // the native channel. Nothing is ever fixed; the parent MIP always
 // produces its own proof. Any anomaly falls back silently.
+//
+// Dual-bound note (measured + proven, do NOT inject this bound into
+// B&B): with LP-relaxed blocks the Lagrangian dual D(lam) sits below
+// the root LP bound for every multiplier (block-feasible set contains
+// the root-feasible set; the root LP point prices out non-positive),
+// so presolve-time injection can at best tie the root LP and never
+// prune. Only integer-subproblem duals (Benders side) can beat it.
 
 #include "mip/HighsMipSolverData.h"
 
@@ -775,6 +782,12 @@ bool HighsMipSolverData::runLagrangian() {
                    (int)numIter, parentLB);
     return true;
   }
+  // Parent-space dual bound on every path with a finite bound (validity
+  // harness + optional B&B injection read this line).
+  if (logLag && std::isfinite(parentLB))
+    highsLogUser(logOptions, HighsLogType::kInfo,
+                 "[Lag] best dual bound %.6g (%d iters)\n", parentLB,
+                 (int)numIter);
   if (!converged) {
     // Gap open: the incumbent below may still improve the parent search,
     // but only a converged loop proves anything; inject solely as a

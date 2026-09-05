@@ -2134,6 +2134,35 @@ bool HighsMipSolverData::runBenders() {
     if (!anyCut) break;  // nothing learned: gap decides fix vs fallback
   }
 
+  // Dual-bound injection (Benders master LB). Unlike the Lagrangian dual
+  // (provably at-or-below the root LP, see HighsLagrangian.cpp), the
+  // integer-cut-strengthened master bound can exceed it, so it is worth
+  // publishing: pre-runSetup in parent space (runSetup strips the
+  // offset), minimize-only (for maximize this bound sits on the upper
+  // side), eps-shrunk for simplex noise, skipped when above the
+  // incumbent (negative-gap tripwire), direct assignment (no P-D
+  // integral disturbance; the first search update picks it up as prev).
+  if (numIter > 0 && std::isfinite(bestLB) &&
+      model.sense_ == ObjSense::kMinimize) {
+    const double parentBendersLB = sign * bestLB + model.offset_;
+    if (logBend && std::isfinite(parentBendersLB))
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[Benders] best dual bound %.6g (%d iters)\n",
+                   parentBendersLB, (int)numIter);
+    if (mipsolver.options_mip_->mip_benders_dual_bound) {
+      const double boundEps =
+          1e-7 * std::max(1.0, std::fabs(parentBendersLB));
+      const double injectLB = parentBendersLB - boundEps;
+      if (std::isfinite(injectLB) && injectLB <= upper_bound &&
+          injectLB > lower_bound) {
+        lower_bound = injectLB;
+        if (logBend)
+          highsLogUser(logOptions, HighsLogType::kInfo,
+                       "[Benders] injected dual bound %.6g\n", injectLB);
+      }
+    }
+  }
+
   // Compose the full presolved-space solution whenever the loop produced
   // a feasible composition. A verified composition is injected as a
   // native MIP-start incumbent even on fallback (rescue: the loop's UB
