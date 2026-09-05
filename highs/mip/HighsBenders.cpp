@@ -28,7 +28,9 @@
 //   rows) is solved and a feasibility cut is built from its optimal
 //   duals instead; auxiliary failure also falls back silently;
 // - the final composed solution is verified against the full presolved
-//   model before any coupling column is fixed;
+//   model before any coupling column is fixed; a verified composition
+//   is also injected as a native MIP-start incumbent when the loop does
+//   not converge (rescue), so fallback never discards a feasible UB;
 // - fixing is via bounds (dimensions preserved, postsolve consistent),
 //   after which the parent MIP continues and produces its own proof.
 
@@ -763,6 +765,46 @@ bool HighsMipSolverData::runBenders() {
   const HighsInt maxIter = std::max<HighsInt>(
       1, mipsolver.options_mip_->mip_benders_max_iterations);
   const double feastol = mipsolver.options_mip_->mip_feasibility_tolerance;
+  // Rescue channel: publish a verified presolved-space composition as a
+  // native MIP-start incumbent (mirrors the Lagrangian injection tail:
+  // postsolve on the production path, re-check against the original
+  // model, publish only if feasible there; checkAddSolution picks it up
+  // in runSetup; infeasible candidates are silently dropped).
+  auto injectBendersIncumbent = [&](const std::vector<double>& sol) -> void {
+    if (!mipsolver.options_mip_->mip_benders_incumbent) return;
+    HighsSolution injsol;
+    injsol.col_value = sol;
+    injsol.value_valid = true;
+    injsol.dual_valid = false;
+    HighsBasis injbasis;
+    injbasis.valid = false;
+    // NOTE: thread_safe=false is the production path (used at every
+    // solve end). Calling it mid-presolve is safe: it resets its cursor
+    // and only reads the stacks, so the final postsolve re-walks
+    // identically. Full ctest (exact solution checks) guards this claim.
+    postSolveStack.undo(*mipsolver.options_mip_, injsol, injbasis, -1,
+                        false);
+    double boundViol = kHighsInf, rowViol = kHighsInf, intViol = kHighsInf;
+    HighsCDouble injObj = 0.0;
+    mipsolver.solutionFeasible(mipsolver.orig_model_, injsol.col_value,
+                               nullptr, boundViol, rowViol, intViol, injObj);
+    if (boundViol <= feastol && rowViol <= feastol && intViol <= feastol) {
+      mipsolver.solution_ = injsol.col_value;
+      mipsolver.solution_objective_ = double(injObj);
+      mipsolver.bound_violation_ = boundViol;
+      mipsolver.row_violation_ = rowViol;
+      mipsolver.integrality_violation_ = intViol;
+      if (logBend)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[Benders] injected incumbent (obj %.6g)\n",
+                     double(injObj));
+    } else if (logBend) {
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[Benders] postsolved incumbent infeasible (%.2g, %.2g, "
+                   "%.2g) -> dropped\n",
+                   boundViol, rowViol, intViol);
+    }
+  };
 
   double UB = kHighsInf;  // internal space
   std::vector<double> bestY;
@@ -1650,51 +1692,76 @@ bool HighsMipSolverData::runBenders() {
     if (!anyCut) break;  // nothing learned: gap decides fix vs fallback
   }
 
-  if (!converged || !hasBest) {
-    if (logBend)
-      highsLogUser(logOptions, HighsLogType::kInfo,
-                   "[Benders] not converged (%d iters) -> normal MIP\n",
-                   (int)numIter);
-    return true;
+  // Compose the full presolved-space solution whenever the loop produced
+  // a feasible composition. A verified composition is injected as a
+  // native MIP-start incumbent even on fallback (rescue: the loop's UB
+  // would otherwise be discarded); on convergence it is additionally
+  // fixed as before.
+  //
+  // Branch-and-check note: node-level Benders cut enforcement is
+  // deliberately NOT implemented. In a full-model B&B every LP point
+  // restricts to a feasible block-LP witness (it satisfies all model
+  // rows within global bounds), so LP-feasibility separation at nodes
+  // is provably vacuous; true branch-and-check needs a master-as-model
+  // search, which is out of scope. The primal half (this rescue) is
+  // what transfers.
+  if (hasBest) {
+    std::vector<double> fullSol(numCol, 0.0);
+    for (HighsInt c = 0; c != numCol; ++c)
+      fullSol[c] = model.col_lower_[c];  // fixed cols (lb == ub) included
+    for (HighsInt i = 0; i != nY; ++i) {
+      HighsInt c = cand.couplingCols[i];
+      double v = bestY[i];
+      if (model.integrality_[c] == HighsVarType::kInteger) v = std::round(v);
+      fullSol[c] = v;
+    }
+    for (HighsInt k = 0; k != nB; ++k) {
+      for (size_t j = 0; j != blocks[k].cols.size(); ++j)
+        fullSol[blocks[k].cols[j]] = bestBlockSol[k][j];
+    }
+    if (verifyBendersSolution(model, fullSol)) {
+      if (converged) {
+        HighsInt numFixed = 0;
+        for (HighsInt i = 0; i != nY; ++i) {
+          HighsInt c = cand.couplingCols[i];
+          if (model.col_lower_[c] == model.col_upper_[c]) continue;
+          double fixval = fullSol[c];
+          if (model.integrality_[c] == HighsVarType::kInteger)
+            fixval = std::round(fixval);
+          fixval = std::min(std::max(fixval, model.col_lower_[c]),
+                            model.col_upper_[c]);
+          model.col_lower_[c] = model.col_upper_[c] = fixval;
+          ++numFixed;
+        }
+        const double parentUB = sign * UB + model.offset_;
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[Benders] fixed %d coupling columns (%d blocks, %d "
+                     "iters, verified obj %.6g)\n",
+                     (int)numFixed, (int)nB, (int)numIter, parentUB);
+        return true;
+      }
+      // Fallback rescue only: the converged path fixes (no trajectory
+      // change from an extra incumbent); here the loop's feasible UB
+      // would otherwise be discarded, so offer it as MIP start.
+      injectBendersIncumbent(fullSol);
+      if (logBend)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[Benders] gap open after %d iters; incumbent offered "
+                     "-> normal MIP\n",
+                     (int)numIter);
+    } else {
+      // Fail-closed: an unverified composition fixes nothing and proves
+      // nothing; behave exactly as a non-converged loop.
+      converged = false;
+      if (logBend)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[Benders] composed solution failed verification -> "
+                     "normal MIP\n");
+    }
   }
-  // Compose the full presolved-space solution and verify it strictly
-  // before fixing anything.
-  std::vector<double> fullSol(numCol, 0.0);
-  for (HighsInt c = 0; c != numCol; ++c)
-    fullSol[c] = model.col_lower_[c];  // fixed cols (lb == ub) included
-  for (HighsInt i = 0; i != nY; ++i) {
-    HighsInt c = cand.couplingCols[i];
-    double v = bestY[i];
-    if (model.integrality_[c] == HighsVarType::kInteger) v = std::round(v);
-    fullSol[c] = v;
-  }
-  for (HighsInt k = 0; k != nB; ++k) {
-    for (size_t j = 0; j != blocks[k].cols.size(); ++j)
-      fullSol[blocks[k].cols[j]] = bestBlockSol[k][j];
-  }
-  if (!verifyBendersSolution(model, fullSol)) {
-    if (logBend)
-      highsLogUser(logOptions, HighsLogType::kInfo,
-                   "[Benders] composed solution failed verification -> "
-                   "normal MIP\n");
-    return true;
-  }
-  HighsInt numFixed = 0;
-  for (HighsInt i = 0; i != nY; ++i) {
-    HighsInt c = cand.couplingCols[i];
-    if (model.col_lower_[c] == model.col_upper_[c]) continue;
-    double fixval = fullSol[c];
-    if (model.integrality_[c] == HighsVarType::kInteger)
-      fixval = std::round(fixval);
-    fixval = std::min(std::max(fixval, model.col_lower_[c]),
-                      model.col_upper_[c]);
-    model.col_lower_[c] = model.col_upper_[c] = fixval;
-    ++numFixed;
-  }
-  const double parentUB = sign * UB + model.offset_;
-  highsLogUser(logOptions, HighsLogType::kInfo,
-               "[Benders] fixed %d coupling columns (%d blocks, %d iters, "
-               "verified obj %.6g)\n",
-               (int)numFixed, (int)nB, (int)numIter, parentUB);
+  if (!converged && logBend)
+    highsLogUser(logOptions, HighsLogType::kInfo,
+                 "[Benders] not converged (%d iters) -> normal MIP\n",
+                 (int)numIter);
   return true;
 }

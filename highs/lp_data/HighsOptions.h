@@ -542,6 +542,7 @@ struct HighsOptionsStruct {
   bool mip_benders_feas_aux;
   bool mip_benders_lshaped;
   HighsInt mip_benders_stall_limit;
+  bool mip_benders_incumbent;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -731,7 +732,8 @@ struct HighsOptionsStruct {
         mip_benders_min_block_cols(10),
         mip_benders_feas_aux(true),
         mip_benders_lshaped(true),
-        mip_benders_stall_limit(10) {};
+        mip_benders_stall_limit(10),
+        mip_benders_incumbent(true) {};
   // clang-format on
 };
 
@@ -1433,6 +1435,14 @@ class HighsOptions : public HighsOptionsStruct {
         "(only stops earlier than mip_benders_max_iterations)",
         advanced, &mip_benders_stall_limit, 1, 10, kHighsIInf);
     records.push_back(record_int);
+
+    record_bool = new OptionRecordBool(
+        "mip_benders_incumbent",
+        "Whether a verified Benders composition is injected as a native "
+        "MIP-start incumbent when the loop does not converge-and-fix "
+        "(verified in original space; dropped on any doubt)",
+        advanced, &mip_benders_incumbent, true);
+    records.push_back(record_bool);
 
     record_bool = new OptionRecordBool(
         "mip_lagrangian",
