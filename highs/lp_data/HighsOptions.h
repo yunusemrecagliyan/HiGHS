@@ -545,6 +545,7 @@ struct HighsOptionsStruct {
   bool mip_benders_incumbent;
   std::string mip_benders_dec_file;
   HighsInt mip_benders_max_cuts;
+  double mip_benders_branch_priority;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -737,7 +738,8 @@ struct HighsOptionsStruct {
         mip_benders_stall_limit(10),
         mip_benders_incumbent(true),
         mip_benders_dec_file(kHighsFilenameDefault),
-        mip_benders_max_cuts(kHighsIInf) {};
+        mip_benders_max_cuts(kHighsIInf),
+        mip_benders_branch_priority(0.0) {};
   // clang-format on
 };
 
@@ -1464,6 +1466,14 @@ class HighsOptions : public HighsOptionsStruct {
         "unlimited by default",
         advanced, &mip_benders_max_cuts, 1, kHighsIInf, kHighsIInf);
     records.push_back(record_int);
+
+    record_double = new OptionRecordDouble(
+        "mip_benders_branch_priority",
+        "Pseudocost-score bonus for Benders coupling columns when "
+        "selecting branching candidates (branch-on-bridges-first); 0 "
+        "disables (bit-identical search)",
+        advanced, &mip_benders_branch_priority, 0.0, 0.0, kHighsInf);
+    records.push_back(record_double);
 
     record_bool = new OptionRecordBool(
         "mip_lagrangian",

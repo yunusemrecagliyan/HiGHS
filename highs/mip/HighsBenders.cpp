@@ -787,6 +787,7 @@ bool HighsMipSolverData::verifyBendersSolution(
 }
 
 bool HighsMipSolverData::runBenders() {
+  bendersCoupling.clear();
   HighsLp& model = presolvedModel;
   const HighsInt numCol = model.num_col_;
   const HighsInt numRow = model.num_row_;
@@ -816,6 +817,10 @@ bool HighsMipSolverData::runBenders() {
                    cand.reason.c_str());
     return true;
   }
+  // Publish the coupling set for structure-aware branching (cleared on
+  // convergence-and-fix below, when S is fixed away).
+  bendersCoupling.assign(numCol, 0);
+  for (HighsInt c : cand.couplingCols) bendersCoupling[c] = 1;
   // Internal minimization: negate costs for maximization parents so all
   // dual reasoning below uses a single convention.
   const double sign =
@@ -2128,6 +2133,7 @@ bool HighsMipSolverData::runBenders() {
                      "[Benders] fixed %d coupling columns (%d blocks, %d "
                      "iters, verified obj %.6g)\n",
                      (int)numFixed, (int)nB, (int)numIter, parentUB);
+        bendersCoupling.clear();  // S fixed away: nothing to prioritize
         return true;
       }
       // Fallback rescue only: the converged path fixes (no trajectory

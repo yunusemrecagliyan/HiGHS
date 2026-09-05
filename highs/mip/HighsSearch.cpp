@@ -289,6 +289,16 @@ HighsInt HighsSearch::selectBranchingCandidate(int64_t maxSbIters,
     HighsInt col = fracints[k].first;
     double fracval = fracints[k].second;
     priority[k] = pseudocost.getScore(col, fracval);
+    // Structure-aware branching (branch-on-bridges-first): Benders
+    // coupling columns disconnect the model once fixed, so prefer them
+    // as branching candidates. Exactly 0.0 by default (bit-identical).
+    const double couplingBonus =
+        mipsolver.options_mip_->mip_benders_branch_priority;
+    if (couplingBonus != 0.0 && mipsolver.mipdata_ != nullptr) {
+      const std::vector<char>& coupling = mipsolver.mipdata_->bendersCoupling;
+      if (col >= 0 && col < (HighsInt)coupling.size() && coupling[col])
+        priority[k] += couplingBonus;
+    }
     upnodes[k] = getNodeQueue().numNodesUp(col);
     downnodes[k] = getNodeQueue().numNodesDown(col);
 

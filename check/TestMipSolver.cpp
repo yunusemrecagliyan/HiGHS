@@ -2152,6 +2152,35 @@ TEST_CASE("MIP-benders-maxcuts", "[highs_test_mip_solver]") {
   }
 }
 
+TEST_CASE("MIP-benders-branchpriority", "[highs_test_mip_solver]") {
+  // Branch-on-bridges bonus must never change the proven optimum: with
+  // a stored (unfixed) coupling set, bonus on/off and Benders off agree
+  // exactly. (Default 0.0 is bit-identical by construction.)
+  std::string filename =
+      std::string(HIGHS_DIR) + "/check/instances/benders-lshaped.lp";
+  double reference = kHighsInf;
+  for (HighsInt cfg = 0; cfg != 3; ++cfg) {
+    Highs highs;
+    highs.setOptionValue("output_flag", dev_run);
+    highs.setOptionValue("mip_rel_gap", 0);
+    highs.setOptionValue("mip_abs_gap", 0);
+    highs.setOptionValue("mip_benders", cfg != 2);
+    highs.setOptionValue("mip_benders_max_iterations", 1);
+    highs.setOptionValue("mip_benders_branch_priority", cfg == 0 ? 1e6 : 0.0);
+    highs.setOptionValue("presolve_rule_off", (HighsInt)1048512);
+    highs.readModel(filename);
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+    double objective = highs.getInfo().objective_function_value;
+    REQUIRE(std::isfinite(objective));
+    if (cfg == 0)
+      reference = objective;
+    else
+      REQUIRE(objective == reference);
+    highs.resetGlobalScheduler(true);
+  }
+}
+
 TEST_CASE("MIP-decomposition-zero-objective", "[highs_test_mip_solver]") {
   // Zero objective: every feasible point is optimal; decomposition must
   // still agree with the fallback path (objective 0).

@@ -296,6 +296,12 @@ struct HighsMipSolverData {
   };
   bool findBendersSeparator(const HighsLp& model,
                             HighsBendersCandidate& cand) const;
+  // Benders coupling columns for structure-aware branching
+  // (branch-on-bridges): fixing them disconnects the model, so the
+  // search branches them first when mip_benders_branch_priority != 0.
+  // Set from the candidate (fallback case); cleared at entry (restart
+  // safety) and on convergence-and-fix (S fixed away).
+  std::vector<char> bendersCoupling;
   // User annotation override (mip_benders_dec_file): COUPLING/BLOCK lines
   // by original-model index or name, mapped to presolved space via the
   // postsolve stack. Validated strictly (span-check); any failure falls
