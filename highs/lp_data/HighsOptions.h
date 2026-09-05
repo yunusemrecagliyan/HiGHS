@@ -547,6 +547,7 @@ struct HighsOptionsStruct {
   HighsInt mip_benders_max_cuts;
   double mip_benders_branch_priority;
   double mip_benders_max_time;
+  bool mip_benders_cut_hygiene;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -741,7 +742,8 @@ struct HighsOptionsStruct {
         mip_benders_dec_file(kHighsFilenameDefault),
         mip_benders_max_cuts(kHighsIInf),
         mip_benders_branch_priority(0.0),
-        mip_benders_max_time(30.0) {};
+        mip_benders_max_time(30.0),
+        mip_benders_cut_hygiene(false) {};
   // clang-format on
 };
 
@@ -1484,6 +1486,14 @@ class HighsOptions : public HighsOptionsStruct {
         "rescued incumbent)",
         advanced, &mip_benders_max_time, 0.0, 30.0, kHighsInf);
     records.push_back(record_double);
+
+    record_bool = new OptionRecordBool(
+        "mip_benders_cut_hygiene",
+        "Whether Benders cuts are power-of-two normalized and exact "
+        "duplicates suppressed (master-LP hygiene; off by default for "
+        "bit-identical loop dynamics)",
+        advanced, &mip_benders_cut_hygiene, false);
+    records.push_back(record_bool);
 
     record_bool = new OptionRecordBool(
         "mip_lagrangian",

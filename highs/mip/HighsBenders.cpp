@@ -1116,6 +1116,8 @@ bool HighsMipSolverData::runBenders() {
   // only master-LP numerics improve. Returns the scale, or 0.0 when the
   // cut must be dropped (non-finite coefficients or scaling overflow).
   auto normalizeCut = [&](BendCut& cut) -> double {
+    // Opt-in hygiene (default off = pre-hygiene dynamics bit-exact).
+    if (!mipsolver.options_mip_->mip_benders_cut_hygiene) return 1.0;
     double mx = 0.0;
     for (HighsInt i = 0; i != nY; ++i)
       mx = std::max(mx, std::fabs(cut.ay[i]));
@@ -2046,7 +2048,9 @@ bool HighsMipSolverData::runBenders() {
     }
     // Priority merge of this iteration's cuts (SCIP cut-management
     // order: aux > feas > opt > nogood > lshaped). Unlimited cap
-    // (default): deduped append in generation order. Capped: keep the
+    // (default): append in generation order, with exact-duplicate
+    // suppression only when cut hygiene is on (default off, preserving
+    // pre-hygiene loop dynamics bit-exactly). Capped: keep the
     // most-violated cuts first. Dropping valid cuts only slows
     // convergence; the stall limit and fallback cover non-convergence.
     {
@@ -2065,9 +2069,11 @@ bool HighsMipSolverData::runBenders() {
       }
       HighsInt dropped = 0;
       const HighsInt before = (HighsInt)cuts.size();
+      const bool hygiene =
+          mipsolver.options_mip_->mip_benders_cut_hygiene;
       for (size_t idx : order) {
         BendCut& nc = newCuts[idx];
-        if (isDuplicateCut(nc)) {
+        if (hygiene && isDuplicateCut(nc)) {
           ++dropped;
           continue;
         }
