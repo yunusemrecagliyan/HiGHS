@@ -1708,3 +1708,181 @@ TEST_CASE("MIP-decomposition-logging", "[highs_test_mip_solver]") {
 
   highs.resetGlobalScheduler(true);
 }
+
+// Classical Benders decomposition: arrowhead models with continuous
+// blocks and binary coupling columns. The optimum is not known in closed
+// form, so each test requires optimality plus on/off agreement between
+// the Benders path and the fallback path (mip_benders=false).
+static HighsLp bendersArrowhead(bool maximize) {
+  // 3 blocks x 40 continuous cols + y1, y2 binary couplers.
+  const HighsInt nb = 40;
+  HighsLp lp;
+  lp.num_col_ = 3 * nb + 2;
+  lp.num_row_ = 3 * 4 + 3;
+  lp.sense_ = maximize ? ObjSense::kMaximize : ObjSense::kMinimize;
+  const double s = maximize ? -1.0 : 1.0;
+  lp.col_cost_.resize(lp.num_col_);
+  lp.col_lower_.assign(lp.num_col_, 0.0);
+  lp.col_upper_.assign(lp.num_col_, 10.0);
+  lp.integrality_.assign(lp.num_col_, HighsVarType::kContinuous);
+  const HighsInt y1 = 3 * nb;
+  const HighsInt y2 = 3 * nb + 1;
+  lp.col_upper_[y1] = 1.0;
+  lp.col_upper_[y2] = 1.0;
+  lp.integrality_[y1] = HighsVarType::kInteger;
+  lp.integrality_[y2] = HighsVarType::kInteger;
+  lp.col_cost_[y1] = s * 500.0;
+  lp.col_cost_[y2] = s * 700.0;
+  lp.row_lower_.resize(lp.num_row_);
+  lp.row_upper_.resize(lp.num_row_);
+  for (HighsInt b = 0; b < 3; ++b) {
+    lp.row_lower_[4 * b + 0] = -kHighsInf;  // knapsack
+    lp.row_upper_[4 * b + 0] = 300.0;
+    lp.row_lower_[4 * b + 1] = 400.0;  // covering
+    lp.row_upper_[4 * b + 1] = kHighsInf;
+    lp.row_lower_[4 * b + 2] = 0.0;  // alternating equality
+    lp.row_upper_[4 * b + 2] = 0.0;
+    lp.row_lower_[4 * b + 3] = -kHighsInf;  // difference cap
+    lp.row_upper_[4 * b + 3] = 50.0;
+  }
+  for (HighsInt t = 0; t < 3; ++t) {
+    lp.row_lower_[12 + t] = -kHighsInf;  // coupling rows
+    lp.row_upper_[12 + t] = 0.0;
+  }
+  lp.a_matrix_.format_ = MatrixFormat::kColwise;
+  lp.a_matrix_.start_.resize(lp.num_col_ + 1);
+  for (HighsInt b = 0; b < 3; ++b) {
+    for (HighsInt i = 0; i < nb; ++i) {
+      HighsInt c = b * nb + i;
+      lp.col_cost_[c] = s * double((i % 7) - 3);
+      lp.a_matrix_.start_[c + 1] = (HighsInt)lp.a_matrix_.index_.size() + 5;
+      lp.a_matrix_.index_.push_back(4 * b + 0);
+      lp.a_matrix_.value_.push_back(1.0);
+      lp.a_matrix_.index_.push_back(4 * b + 1);
+      lp.a_matrix_.value_.push_back(double((i % 5) + 1));
+      lp.a_matrix_.index_.push_back(4 * b + 2);
+      lp.a_matrix_.value_.push_back(i % 2 ? -1.0 : 1.0);
+      lp.a_matrix_.index_.push_back(4 * b + 3);
+      lp.a_matrix_.value_.push_back(i < nb / 2 ? 1.0 : -1.0);
+      if (b == 0 && i < 3) {
+        lp.a_matrix_.index_.push_back(12);
+        lp.a_matrix_.value_.push_back(1.0);
+      } else if (b == 1 && i >= 3 && i < 6) {
+        lp.a_matrix_.index_.push_back(13);
+        lp.a_matrix_.value_.push_back(1.0);
+      } else if (b == 2 && i == 0) {
+        lp.a_matrix_.index_.push_back(14);
+        lp.a_matrix_.value_.push_back(1.0);
+      } else {
+        lp.a_matrix_.start_[c + 1]--;
+      }
+    }
+  }
+  lp.a_matrix_.start_[y1 + 1] =
+      (HighsInt)lp.a_matrix_.index_.size() + 2;
+  lp.a_matrix_.index_.push_back(12);
+  lp.a_matrix_.value_.push_back(-30.0);
+  lp.a_matrix_.index_.push_back(14);
+  lp.a_matrix_.value_.push_back(-10.0);
+  lp.a_matrix_.start_[y2 + 1] =
+      (HighsInt)lp.a_matrix_.index_.size() + 2;
+  lp.a_matrix_.index_.push_back(13);
+  lp.a_matrix_.value_.push_back(-30.0);
+  lp.a_matrix_.index_.push_back(14);
+  lp.a_matrix_.value_.push_back(-10.0);
+  return lp;
+}
+
+static double runBendersOnOff(HighsLp lp, bool decomposition_logging = false,
+                              bool small_blocks = false) {
+  // Returns the Benders-path objective after requiring optimality and
+  // exact agreement with the fallback path.
+  double objective_on = kHighsInf;
+  for (bool benders : {true, false}) {
+    Highs highs;
+    highs.setOptionValue("output_flag", dev_run);
+    highs.setOptionValue("mip_rel_gap", 0);
+    highs.setOptionValue("mip_abs_gap", 0);
+    highs.setOptionValue("mip_benders", benders);
+    highs.setOptionValue("mip_decomposition_logging", decomposition_logging);
+    if (small_blocks) {
+      highs.setOptionValue("mip_decomposition_max_comp_cols", 5);
+      highs.setOptionValue("mip_decomposition_max_comp_rows", 5);
+      highs.setOptionValue("mip_benders_min_block_cols", 4);
+    }
+    highs.passModel(lp);
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+    double objective = highs.getInfo().objective_function_value;
+    REQUIRE(std::isfinite(objective));
+    if (benders)
+      objective_on = objective;
+    else
+      REQUIRE(objective == objective_on);
+    highs.resetGlobalScheduler(true);
+  }
+  return objective_on;
+}
+
+TEST_CASE("MIP-benders-arrowhead", "[highs_test_mip_solver]") {
+  runBendersOnOff(bendersArrowhead(false));
+}
+
+TEST_CASE("MIP-benders-max", "[highs_test_mip_solver]") {
+  runBendersOnOff(bendersArrowhead(true));
+}
+
+TEST_CASE("MIP-benders-farkas", "[highs_test_mip_solver]") {
+  // y1=1 renders the A/B blocks LP-infeasible (needs fractional Farkas
+  // multipliers, invisible to presolve/probing), so the master must learn
+  // feasibility cuts. Small-block options isolate the ray path.
+  HighsLp lp;
+  lp.num_col_ = 30 + 30 + 60 + 1;
+  lp.num_row_ = 3 + 3 + 4;
+  lp.sense_ = ObjSense::kMinimize;
+  lp.col_cost_.assign(lp.num_col_, 0.0);
+  lp.col_lower_.assign(lp.num_col_, 0.0);
+  lp.col_upper_.assign(lp.num_col_, 10.0);
+  lp.integrality_.assign(lp.num_col_, HighsVarType::kContinuous);
+  const HighsInt y1 = lp.num_col_ - 1;
+  lp.col_upper_[y1] = 1.0;
+  lp.integrality_[y1] = HighsVarType::kInteger;
+  lp.col_cost_[y1] = -500.0;
+  lp.a_matrix_.format_ = MatrixFormat::kColwise;
+  lp.a_matrix_.start_.resize(lp.num_col_ + 1);
+  auto addEntry = [&](HighsInt c, HighsInt r, double v) {
+    lp.a_matrix_.index_.push_back(r);
+    lp.a_matrix_.value_.push_back(v);
+    for (HighsInt cc = c + 1; cc <= lp.num_col_; ++cc)
+      lp.a_matrix_.start_[cc]++;
+  };
+  // A/B blocks (cols 0..29, 30..59): r1/r2/c2 rows (0..2, 3..5).
+  for (HighsInt t = 0; t < 2; ++t) {
+    for (HighsInt i = 0; i < 30; ++i) {
+      HighsInt c = t * 30 + i;
+      lp.col_cost_[c] = double((i % 3) - 1);
+      const bool even = (i % 2 == 0);
+      addEntry(c, 3 * t + 0, even ? 1.0 : -1.0);
+      addEntry(c, 3 * t + 1, even ? -3.0 : 2.0);
+      addEntry(c, 3 * t + 2, 1.0);
+    }
+  }
+  addEntry(y1, 1, -450.0);
+  addEntry(y1, 2, 50.0);
+  addEntry(y1, 4, -450.0);
+  addEntry(y1, 5, 50.0);
+  // Padding block (cols 60..119): knapsack/covering/equality/diffcap.
+  for (HighsInt i = 0; i < 60; ++i) {
+    HighsInt c = 60 + i;
+    lp.col_cost_[c] = double((i % 7) - 3);
+    addEntry(c, 6, 1.0);
+    addEntry(c, 7, double((i % 5) + 1));
+    addEntry(c, 8, i % 2 ? -1.0 : 1.0);
+    addEntry(c, 9, i < 30 ? 1.0 : -1.0);
+  }
+  lp.row_lower_ = {40.0, -480.0, -kHighsInf, 40.0, -480.0,
+                   -kHighsInf, -kHighsInf, 400.0, 0.0, -kHighsInf};
+  lp.row_upper_ = {kHighsInf, kHighsInf, 350.0, kHighsInf, kHighsInf,
+                   350.0, 300.0, kHighsInf, 0.0, 50.0};
+  runBendersOnOff(lp, false, true);
+}

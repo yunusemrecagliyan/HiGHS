@@ -853,6 +853,14 @@ void HighsMipSolverData::runMipPresolve(
       !mipsolver.submip &&
       mipsolver.options_mip_->presolve != kHighsOffString)
     solveComponents();
+
+  // Classical Benders on weakly-coupled (arrowhead) structure: fixes
+  // proven-optimal coupling columns, if any, and otherwise leaves the
+  // model untouched for the normal MIP path.
+  if (mipsolver.modelstatus_ == HighsModelStatus::kNotset &&
+      !mipsolver.submip &&
+      mipsolver.options_mip_->presolve != kHighsOffString)
+    runBenders();
 }
 
 void HighsMipSolverData::solveComponents() {
@@ -1479,15 +1487,60 @@ void HighsMipSolverData::analyzeWeakCoupling(
     const bool discreteMaster = vt == HighsVarType::kInteger ||
                                 vt == HighsVarType::kSemiInteger ||
                                 vt == HighsVarType::kImplicitInteger;
+    // A column cut is only a valid separator if no row still spans the
+    // resulting pieces (a spanning row would keep coupling the blocks
+    // even with the column fixed). Verify explicitly.
+    bool rowSpansPieces = false;
+    {
+      std::vector<HighsInt> vparent(numCol + numRow);
+      for (HighsInt i = 0; i != numCol + numRow; ++i) vparent[i] = i;
+      std::function<HighsInt(HighsInt)> vfind = [&](HighsInt a) {
+        while (vparent[a] != a) {
+          vparent[a] = vparent[vparent[a]];
+          a = vparent[a];
+        }
+        return a;
+      };
+      for (HighsInt c = 0; c != numCol; ++c) {
+        if (c == bestCol) continue;
+        if (model.col_lower_[c] == model.col_upper_[c]) continue;
+        for (HighsInt el = model.a_matrix_.start_[c];
+             el != model.a_matrix_.start_[c + 1]; ++el) {
+          HighsInt a = vfind(c), b = vfind(numCol + model.a_matrix_.index_[el]);
+          if (a != b) vparent[a] = b;
+        }
+      }
+      std::vector<HighsInt> seenRoots;
+      seenRoots.reserve(8);
+      for (HighsInt r = 0; r != numRow && !rowSpansPieces; ++r) {
+        seenRoots.clear();
+        for (HighsInt e = rowStart[r]; e != rowStart[r + 1]; ++e) {
+          HighsInt c = rowCols[e];
+          if (c == bestCol) continue;
+          HighsInt root = vfind(c);
+          if (std::find(seenRoots.begin(), seenRoots.end(), root) ==
+              seenRoots.end()) {
+            seenRoots.push_back(root);
+            if (seenRoots.size() > 1) {
+              rowSpansPieces = true;
+              break;
+            }
+          }
+        }
+      }
+    }
     highsLogUser(logOptions, HighsLogType::kInfo,
                  "[Decomp] weak coupling: removing column %d (degree %d, "
                  "coupling ratio %.4g) splits the block into %d pieces; "
                  "master type %s -> %s\n",
                  (int)bestCol, (int)deg, ratio, (int)bestColPieces,
                  discreteMaster ? "discrete" : "continuous",
-                 ratio < couplingTol && discreteMaster
-                     ? "possible Benders candidate (not attempted)"
-                     : "not a Benders candidate, normal MIP");
+                 ratio < couplingTol && discreteMaster && !rowSpansPieces
+                     ? "possible Benders candidate (see [Benders] lines)"
+                     : (rowSpansPieces
+                            ? "rows still couple the pieces, not separable "
+                              "-> normal MIP"
+                            : "not a Benders candidate, normal MIP"));
   } else if (bestRow >= 0 && bestRowPieces >= 2) {
     const HighsInt deg = rowStart[bestRow + 1] - rowStart[bestRow];
     const double ratio =

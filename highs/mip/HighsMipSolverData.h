@@ -277,6 +277,24 @@ struct HighsMipSolverData {
   void analyzeWeakCoupling(const HighsLp& model,
                            const std::vector<HighsDecompComponent>& components,
                            HighsInt numFixedCols) const;
+  // Classical Benders decomposition (implemented in HighsBenders.cpp,
+  // same struct, separate translation unit). findBendersSeparator looks
+  // for a small column separator whose removal leaves blocks coupled
+  // only through the separator; runBenders drives the master/subproblem
+  // loop on LP blocks and fixes proven-optimal coupling columns.
+  struct HighsBendersCandidate {
+    bool valid = false;
+    std::string reason;
+    std::vector<HighsInt> couplingCols;
+    std::vector<std::vector<HighsInt>> blockCols;
+    std::vector<std::vector<HighsInt>> blockRows;
+    std::vector<HighsInt> masterRows;
+  };
+  bool findBendersSeparator(const HighsLp& model,
+                            HighsBendersCandidate& cand) const;
+  bool runBenders();
+  bool verifyBendersSolution(const HighsLp& model,
+                             const std::vector<double>& sol) const;
   void setupDomainPropagation();
   void saveReportMipSolution(const double new_upper_limit = -kHighsInf);
   void checkAddSolution();

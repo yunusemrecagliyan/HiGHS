@@ -1,0 +1,1255 @@
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/*                                                                       */
+/*    This file is part of the HiGHS linear optimization suite           */
+/*                                                                       */
+/*    Available as open-source under the MIT License                     */
+/*                                                                       */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+// Classical Benders decomposition for weakly-coupled MIPs (clean-room
+// implementation of the textbook method; no third-party code).
+//
+// Scope: arrowhead structures with a small column separator S whose
+// removal leaves blocks coupled only through S, where every block is
+// continuous-only so fixed-S subproblems are LPs. The master problem
+// (mixed-integer over S plus one surrogate theta per block) is solved
+// with the in-process exact MIP subsolver; subproblems are LP solves
+// with presolve off so duals/rays refer directly to the passed submodel.
+//
+// Correctness contract (mirrors the components path):
+// - cuts are only added after a tightness/violation gate at the
+//   generating point; any gate failure aborts Benders silently and the
+//   normal MIP path continues with nothing fixed;
+// - the final composed solution is verified against the full presolved
+//   model before any coupling column is fixed;
+// - fixing is via bounds (dimensions preserved, postsolve consistent),
+//   after which the parent MIP continues and produces its own proof.
+
+#include "mip/HighsMipSolverData.h"
+
+#include <algorithm>
+#include <cmath>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "Highs.h"
+#include "mip/HighsMipSolver.h"
+
+namespace {
+
+// Union-find with path halving (local helper, deterministic).
+struct DsU {
+  std::vector<HighsInt> p;
+  DsU() {}
+  explicit DsU(HighsInt n) : p(n) {
+    for (HighsInt i = 0; i != n; ++i) p[i] = i;
+  }
+  HighsInt find(HighsInt a) {
+    while (p[a] != a) {
+      p[a] = p[p[a]];
+      a = p[a];
+    }
+    return a;
+  }
+  void unite(HighsInt a, HighsInt b) {
+    a = find(a);
+    b = find(b);
+    if (a != b) p[a] = b;
+  }
+};
+
+// Outcome of one subproblem LP solve (presolve off, simplex).
+struct SubLpResult {
+  HighsModelStatus status = HighsModelStatus::kNotset;
+  std::vector<double> colSol;
+  std::vector<double> rowDual;
+  double obj = kHighsInf;
+  bool dualValid = false;
+};
+
+SubLpResult solveSubLp(const HighsLp& sublp, double timeLimit) {
+  SubLpResult res;
+  Highs lpsolver;
+  lpsolver.setOptionValue("output_flag", false);
+  // No presolve: duals/rays must refer to exactly the passed submodel.
+  // No IPM: only simplex furnishes bases and Farkas rays.
+  lpsolver.setOptionValue("presolve", kHighsOffString);
+  lpsolver.setOptionValue("solver", kSimplexString);
+  lpsolver.setOptionValue("time_limit", timeLimit);
+  if (lpsolver.passModel(sublp) != HighsStatus::kOk) return res;
+  if (lpsolver.run() != HighsStatus::kOk) return res;
+  res.status = lpsolver.getModelStatus();
+  if (res.status == HighsModelStatus::kOptimal) {
+    const HighsSolution& sol = lpsolver.getSolution();
+    res.dualValid = sol.dual_valid;
+    res.colSol = sol.col_value;
+    res.rowDual = sol.row_dual;
+    res.obj = lpsolver.getInfo().objective_function_value;
+  }
+  return res;
+}
+
+}  // namespace
+
+bool HighsMipSolverData::findBendersSeparator(
+    const HighsLp& model, HighsBendersCandidate& cand) const {
+  cand = HighsBendersCandidate();
+  const HighsInt numCol = model.num_col_;
+  const HighsInt numRow = model.num_row_;
+  if (numCol < 100) {
+    cand.reason = "below toy size";
+    return false;
+  }
+  if (model.a_matrix_.format_ != MatrixFormat::kColwise) {
+    cand.reason = "matrix not colwise";
+    return false;
+  }
+  std::vector<char> colFixed(numCol, 0);
+  for (HighsInt c = 0; c != numCol; ++c) {
+    if (model.col_lower_[c] == model.col_upper_[c]) {
+      if (!std::isfinite(model.col_lower_[c])) {
+        cand.reason = "degenerate fixed column";
+        return false;
+      }
+      colFixed[c] = 1;
+    }
+  }
+  std::vector<HighsInt> degree(numCol, 0);
+  for (HighsInt c = 0; c != numCol; ++c)
+    degree[c] = model.a_matrix_.start_[c + 1] - model.a_matrix_.start_[c];
+
+  const HighsInt maxCoupling = std::max<HighsInt>(
+      1, mipsolver.options_mip_->mip_benders_max_coupling_cols);
+  const HighsInt minBlock = std::max<HighsInt>(
+      1, mipsolver.options_mip_->mip_benders_min_block_cols);
+
+  // Row adjacency over unfixed columns (built once; separator columns
+  // are skipped during the scans).
+  std::vector<HighsInt> rowStart(numRow + 1, 0);
+  {
+    std::vector<HighsInt> cnt(numRow, 0);
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (colFixed[c]) continue;
+      for (HighsInt el = model.a_matrix_.start_[c];
+           el != model.a_matrix_.start_[c + 1]; ++el)
+        ++cnt[model.a_matrix_.index_[el]];
+    }
+    for (HighsInt r = 0; r != numRow; ++r)
+      rowStart[r + 1] = rowStart[r] + cnt[r];
+  }
+  std::vector<HighsInt> rowCols(rowStart[numRow], -1);
+  {
+    std::vector<HighsInt> fill(numRow, 0);
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (colFixed[c]) continue;
+      for (HighsInt el = model.a_matrix_.start_[c];
+           el != model.a_matrix_.start_[c + 1]; ++el) {
+        HighsInt r = model.a_matrix_.index_[el];
+        rowCols[rowStart[r] + fill[r]++] = c;
+      }
+    }
+  }
+
+  // Separator search: repeatedly split the largest remaining piece with
+  // the best verified single-column cut. A cut is only accepted if no row
+  // still spans the resulting pieces (a spanning row would keep coupling
+  // the blocks even with the column fixed). Deterministic (index
+  // tie-breaks); any search failure only rejects candidacy, never harms
+  // correctness (the row assignment below re-verifies independently).
+  HighsInt totalNnz = 0;
+  for (HighsInt c = 0; c != numCol; ++c)
+    if (!colFixed[c]) totalNnz += degree[c];
+  // Candidate cap scales with model size (heuristic): the scan is
+  // O(cap * nnz) per round.
+  const HighsInt scanCap = std::max<HighsInt>(
+      25, std::min<HighsInt>(500, 2000000 / std::max<HighsInt>(1, totalNnz)));
+  std::vector<char> inS(numCol, 0);
+  HighsInt numS = 0;
+  // Pieces of the graph without S.
+  auto computePieces = [&](std::vector<std::vector<HighsInt>>& pieces) {
+    DsU dsu(numCol);
+    for (HighsInt r = 0; r != numRow; ++r) {
+      HighsInt first = -1;
+      for (HighsInt e = rowStart[r]; e != rowStart[r + 1]; ++e) {
+        HighsInt c = rowCols[e];
+        if (inS[c]) continue;
+        if (first < 0)
+          first = c;
+        else
+          dsu.unite(first, c);
+      }
+    }
+    pieces.clear();
+    std::vector<HighsInt> rootToPiece(numCol, -1);
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (colFixed[c] || inS[c]) continue;
+      HighsInt root = dsu.find(c);
+      if (rootToPiece[root] < 0) {
+        rootToPiece[root] = (HighsInt)pieces.size();
+        pieces.emplace_back();
+      }
+      pieces[rootToPiece[root]].push_back(c);
+    }
+  };
+  // Nontrivial-piece count after additionally removing candidate col.
+  auto splitCount = [&](HighsInt excl) -> HighsInt {
+    DsU dsu(numCol);
+    for (HighsInt r = 0; r != numRow; ++r) {
+      HighsInt first = -1;
+      for (HighsInt e = rowStart[r]; e != rowStart[r + 1]; ++e) {
+        HighsInt c = rowCols[e];
+        if (c == excl || inS[c]) continue;
+        if (first < 0)
+          first = c;
+        else
+          dsu.unite(first, c);
+      }
+    }
+    std::vector<HighsInt> sizes(numCol, 0);
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (c == excl || colFixed[c] || inS[c]) continue;
+      ++sizes[dsu.find(c)];
+    }
+    HighsInt nontrivial = 0;
+    for (HighsInt s : sizes)
+      if (s >= minBlock) ++nontrivial;
+    return nontrivial;
+  };
+  // Verified split quality: -1 if some row still spans the resulting
+  // pieces, else the nontrivial-piece count.
+  auto verifiedSplit = [&](HighsInt excl) -> HighsInt {
+    DsU dsu(numCol);
+    for (HighsInt r = 0; r != numRow; ++r) {
+      HighsInt first = -1;
+      for (HighsInt e = rowStart[r]; e != rowStart[r + 1]; ++e) {
+        HighsInt c = rowCols[e];
+        if (c == excl || inS[c]) continue;
+        if (first < 0)
+          first = c;
+        else
+          dsu.unite(first, c);
+      }
+    }
+    std::vector<HighsInt> sizes(numCol, 0);
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (c == excl || colFixed[c] || inS[c]) continue;
+      ++sizes[dsu.find(c)];
+    }
+    std::vector<HighsInt> seen;
+    seen.reserve(8);
+    for (HighsInt r = 0; r != numRow; ++r) {
+      seen.clear();
+      for (HighsInt e = rowStart[r]; e != rowStart[r + 1]; ++e) {
+        HighsInt c = rowCols[e];
+        if (c == excl || inS[c]) continue;
+        HighsInt root = dsu.find(c);
+        if (std::find(seen.begin(), seen.end(), root) == seen.end()) {
+          seen.push_back(root);
+          if (seen.size() > 1) return -1;
+        }
+      }
+    }
+    HighsInt nontrivial = 0;
+    for (HighsInt s : sizes)
+      if (s >= minBlock) ++nontrivial;
+    return nontrivial;
+  };
+  std::vector<std::vector<HighsInt>> searchPieces;
+  for (;;) {
+    computePieces(searchPieces);
+    HighsInt curCount = 0;
+    HighsInt largest = 0;
+    HighsInt largestIdx = -1;
+    for (size_t i = 0; i != searchPieces.size(); ++i) {
+      const HighsInt sz = (HighsInt)searchPieces[i].size();
+      if (sz >= minBlock) ++curCount;
+      if (sz > largest) {
+        largest = sz;
+        largestIdx = (HighsInt)i;
+      }
+    }
+    if (largestIdx < 0 || largest < 2 * minBlock) break;
+    if (numS >= maxCoupling) break;  // finalization decides validity
+    // Rank candidates inside the largest piece (degree filter prunes
+    // leaves, which can never disconnect anything).
+    HighsInt scanned = 0;
+    HighsInt topC[3] = {-1, -1, -1};
+    HighsInt topN[3] = {-1, -1, -1};
+    for (HighsInt c : searchPieces[largestIdx]) {
+      if (degree[c] < 2 || degree[c] > 32) continue;
+      if (scanned >= scanCap) break;
+      ++scanned;
+      const HighsInt q = splitCount(c);
+      for (HighsInt t = 0; t != 3; ++t) {
+        if (q > topN[t]) {
+          for (HighsInt u = 2; u != t; --u) {
+            topN[u] = topN[u - 1];
+            topC[u] = topC[u - 1];
+          }
+          topN[t] = q;
+          topC[t] = c;
+          break;
+        }
+      }
+    }
+    // Accept the first verified strict improvement.
+    bool accepted = false;
+    for (HighsInt t = 0; t != 3; ++t) {
+      if (topC[t] < 0) break;
+      const HighsInt q = verifiedSplit(topC[t]);
+      if (q >= 2 && q > curCount) {
+        inS[topC[t]] = 1;
+        ++numS;
+        accepted = true;
+        if (mipsolver.options_mip_->mip_decomposition_logging)
+          highsLogUser(mipsolver.options_mip_->log_options,
+                       HighsLogType::kInfo,
+                       "[Benders] separator: add column %d (pieces %d -> %d)\n",
+                       (int)topC[t], (int)curCount, (int)q);
+        break;
+      }
+    }
+    if (!accepted) break;
+  }
+
+  // Finalize the separator to a fixpoint: discrete columns can never sit
+  // in LP blocks, so they join S (the master handles discretes natively);
+  // tiny or rowless pieces are absorbed into S. Adding columns to S cannot
+  // invalidate separation, and the row assignment below re-verifies.
+  for (;;) {
+    DsU dsu(numCol);
+    for (HighsInt r = 0; r != numRow; ++r) {
+      HighsInt first = -1;
+      for (HighsInt e = rowStart[r]; e != rowStart[r + 1]; ++e) {
+        HighsInt c = rowCols[e];
+        if (inS[c]) continue;
+        if (first < 0)
+          first = c;
+        else
+          dsu.unite(first, c);
+      }
+    }
+    std::vector<HighsInt> pieceSize(numCol, 0);
+    std::vector<char> pieceHasRow(numCol, 0);
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (colFixed[c] || inS[c]) continue;
+      HighsInt root = dsu.find(c);
+      ++pieceSize[root];
+      if (degree[c] > 0) pieceHasRow[root] = 1;
+    }
+    bool changed = false;
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (colFixed[c] || inS[c]) continue;
+      HighsInt root = dsu.find(c);
+      const bool tiny = pieceSize[root] < minBlock || !pieceHasRow[root];
+      const bool discrete =
+          model.integrality_[c] != HighsVarType::kContinuous;
+      if (tiny || discrete) {
+        inS[c] = 1;
+        ++numS;
+        changed = true;
+      }
+    }
+    if (!changed) break;
+    if (numS > maxCoupling) {
+      cand.reason = "separator exceeds coupling budget after merge";
+      return false;
+    }
+  }
+  // Collect kept blocks (deterministic order by first column).
+  std::vector<std::vector<HighsInt>> pieces;
+  {
+    DsU dsu(numCol);
+    for (HighsInt r = 0; r != numRow; ++r) {
+      HighsInt first = -1;
+      for (HighsInt e = rowStart[r]; e != rowStart[r + 1]; ++e) {
+        HighsInt c = rowCols[e];
+        if (inS[c]) continue;
+        if (first < 0)
+          first = c;
+        else
+          dsu.unite(first, c);
+      }
+    }
+    std::vector<HighsInt> rootToPiece(numCol, -1);
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (colFixed[c] || inS[c]) continue;
+      HighsInt root = dsu.find(c);
+      if (rootToPiece[root] < 0) {
+        rootToPiece[root] = (HighsInt)pieces.size();
+        pieces.emplace_back();
+      }
+      pieces[rootToPiece[root]].push_back(c);
+    }
+  }
+  if ((HighsInt)pieces.size() < 2) {
+    cand.reason = "fewer than two blocks";
+    if (mipsolver.options_mip_->mip_decomposition_logging) {
+      std::string dbg;
+      char buf[64];
+      snprintf(buf, sizeof(buf), " |S|=%d piecesizes=", (int)numS);
+      dbg += buf;
+      std::vector<HighsInt> szs;
+      // Recompute all DSU piece sizes (including absorbed) for diagnosis.
+      DsU dsu2(numCol);
+      for (HighsInt r = 0; r != numRow; ++r) {
+        HighsInt first = -1;
+        for (HighsInt e = rowStart[r]; e != rowStart[r + 1]; ++e) {
+          HighsInt c = rowCols[e];
+          if (first < 0)
+            first = c;
+          else
+            dsu2.unite(first, c);
+        }
+      }
+      std::vector<HighsInt> allSizes(numCol, 0);
+      for (HighsInt c = 0; c != numCol; ++c) {
+        if (colFixed[c]) continue;
+        ++allSizes[dsu2.find(c)];
+      }
+      for (HighsInt s : allSizes)
+        if (s > 0) szs.push_back(s);
+      std::sort(szs.begin(), szs.end());
+      for (HighsInt s : szs) {
+        snprintf(buf, sizeof(buf), "%d,", (int)s);
+        dbg += buf;
+      }
+      highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+                   "[Benders] diagnose%s\n", dbg.c_str());
+    }
+    return false;
+  }
+  // LP blocks only (defensive: the fixpoint above already moved every
+  // discrete column into S).
+  for (const auto& piece : pieces) {
+    for (HighsInt c : piece) {
+      if (model.integrality_[c] != HighsVarType::kContinuous) {
+        cand.reason = "block with discrete columns";
+        return false;
+      }
+    }
+  }
+  for (HighsInt c = 0; c != numCol; ++c)
+    if (inS[c]) cand.couplingCols.push_back(c);
+  cand.blockCols = std::move(pieces);
+  // Assign rows: rows touching no block are master rows; rows touching
+  // exactly one block are block rows. Anything else is a separator bug:
+  // reject instead of risking an invalid decomposition.
+  std::vector<HighsInt> blockOf(numCol, -1);
+  for (size_t k = 0; k != cand.blockCols.size(); ++k)
+    for (HighsInt c : cand.blockCols[k]) blockOf[c] = (HighsInt)k;
+  cand.blockRows.assign(cand.blockCols.size(), {});
+  std::vector<HighsInt> seenBlock;
+  seenBlock.reserve(8);
+  for (HighsInt r = 0; r != numRow; ++r) {
+    seenBlock.clear();
+    for (HighsInt e = rowStart[r]; e != rowStart[r + 1]; ++e) {
+      HighsInt c = rowCols[e];
+      if (inS[c]) continue;
+      HighsInt b = blockOf[c];
+      if (b < 0) continue;  // fixed column (not in rowCols by construction)
+      if (std::find(seenBlock.begin(), seenBlock.end(), b) ==
+          seenBlock.end())
+        seenBlock.push_back(b);
+    }
+    if (seenBlock.empty()) {
+      cand.masterRows.push_back(r);
+    } else if (seenBlock.size() == 1) {
+      cand.blockRows[seenBlock[0]].push_back(r);
+    } else {
+      cand = HighsBendersCandidate();
+      cand.reason = "row spans two blocks (separator bug)";
+      return false;
+    }
+  }
+  cand.valid = true;
+  cand.reason = "ok";
+  return true;
+}
+
+bool HighsMipSolverData::verifyBendersSolution(
+    const HighsLp& model, const std::vector<double>& sol) const {
+  const double tol = mipsolver.options_mip_->mip_feasibility_tolerance;
+  if (sol.size() != (size_t)model.num_col_) return false;
+  if (model.a_matrix_.format_ != MatrixFormat::kColwise) return false;
+  for (HighsInt c = 0; c != model.num_col_; ++c) {
+    const double v = sol[c];
+    if (!std::isfinite(v)) return false;
+    const HighsVarType integrality = model.integrality_[c];
+    if (integrality == HighsVarType::kSemiContinuous ||
+        integrality == HighsVarType::kSemiInteger) {
+      if (std::fabs(v) <= tol) continue;
+    }
+    if (v < model.col_lower_[c] - tol || v > model.col_upper_[c] + tol)
+      return false;
+    if (integrality == HighsVarType::kInteger ||
+        integrality == HighsVarType::kSemiInteger ||
+        integrality == HighsVarType::kImplicitInteger) {
+      if (std::fabs(v - std::round(v)) > tol) return false;
+    }
+  }
+  std::vector<double> activity(model.num_row_, 0.0);
+  for (HighsInt c = 0; c != model.num_col_; ++c) {
+    for (HighsInt el = model.a_matrix_.start_[c];
+         el != model.a_matrix_.start_[c + 1]; ++el)
+      activity[model.a_matrix_.index_[el]] +=
+          model.a_matrix_.value_[el] * sol[c];
+  }
+  for (HighsInt r = 0; r != model.num_row_; ++r) {
+    if (activity[r] < model.row_lower_[r] - tol ||
+        activity[r] > model.row_upper_[r] + tol)
+      return false;
+  }
+  return true;
+}
+
+bool HighsMipSolverData::runBenders() {
+  HighsLp& model = presolvedModel;
+  const HighsInt numCol = model.num_col_;
+  const HighsInt numRow = model.num_row_;
+  if (numCol == 0 || numRow == 0) return true;
+  if (numCol < 100) return true;
+  if (!mipsolver.options_mip_->mip_decomposition) return true;
+  if (!mipsolver.options_mip_->mip_benders) return true;
+  if (model.a_matrix_.format_ != MatrixFormat::kColwise)
+    model.a_matrix_.ensureColwise();
+  const bool logBend = mipsolver.options_mip_->mip_decomposition_logging;
+  const HighsLogOptions& logOptions = mipsolver.options_mip_->log_options;
+
+  HighsBendersCandidate cand;
+  if (!findBendersSeparator(model, cand)) {
+    if (logBend)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[Benders] no candidate (%s) -> normal MIP\n",
+                   cand.reason.c_str());
+    return true;
+  }
+  // Internal minimization: negate costs for maximization parents so all
+  // dual reasoning below uses a single convention.
+  const double sign =
+      (model.sense_ == ObjSense::kMaximize) ? -1.0 : 1.0;
+
+  const HighsInt nY = (HighsInt)cand.couplingCols.size();
+  const HighsInt nB = (HighsInt)cand.blockCols.size();
+  std::vector<HighsInt> sposOf(numCol, -1);
+  for (HighsInt i = 0; i != nY; ++i) sposOf[cand.couplingCols[i]] = i;
+
+  // Fixed-column activity shifted out of every row (exact: lb == ub).
+  std::vector<double> rowShift(numRow, 0.0);
+  for (HighsInt c = 0; c != numCol; ++c) {
+    if (model.col_lower_[c] != model.col_upper_[c]) continue;
+    const double fixval = model.col_lower_[c];
+    for (HighsInt el = model.a_matrix_.start_[c];
+         el != model.a_matrix_.start_[c + 1]; ++el)
+      rowShift[model.a_matrix_.index_[el]] +=
+          model.a_matrix_.value_[el] * fixval;
+  }
+
+  // Row-wise adjacency over unfixed columns (built once) for exact
+  // entry classification: every nonzero of a block/master row is either
+  // fixed (already shifted), separator-owned, or block-owned. Anything
+  // else means the separator is invalid and aborts the attempt.
+  std::vector<HighsInt> browStart(numRow + 1, 0);
+  std::vector<HighsInt> browCol;
+  std::vector<double> browVal;
+  {
+    std::vector<HighsInt> cnt(numRow, 0);
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (model.col_lower_[c] == model.col_upper_[c]) continue;
+      for (HighsInt el = model.a_matrix_.start_[c];
+           el != model.a_matrix_.start_[c + 1]; ++el)
+        ++cnt[model.a_matrix_.index_[el]];
+    }
+    for (HighsInt r = 0; r != numRow; ++r)
+      browStart[r + 1] = browStart[r] + cnt[r];
+    browCol.assign(browStart[numRow], -1);
+    browVal.assign(browStart[numRow], 0.0);
+    std::vector<HighsInt> fill(numRow, 0);
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (model.col_lower_[c] == model.col_upper_[c]) continue;
+      for (HighsInt el = model.a_matrix_.start_[c];
+           el != model.a_matrix_.start_[c + 1]; ++el) {
+        HighsInt r = model.a_matrix_.index_[el];
+        HighsInt p = browStart[r] + fill[r]++;
+        browCol[p] = c;
+        browVal[p] = model.a_matrix_.value_[el];
+      }
+    }
+  }
+
+  struct BendBlock {
+    std::vector<HighsInt> cols;
+    std::vector<HighsInt> rows;
+    // Per block-row: (separator position, value) coupling entries.
+    std::vector<std::vector<std::pair<HighsInt, double>>> coupling;
+    // Per block-column: (block-row position, value) entries, reused in
+    // every iteration when the shifted subproblem is assembled.
+    std::vector<std::vector<std::pair<HighsInt, double>>> colEntries;
+    std::vector<double> baseLo;
+    std::vector<double> baseHi;
+    std::vector<double> cost;  // internal-min costs
+    std::vector<double> lb;
+    std::vector<double> ub;
+  };
+  std::vector<BendBlock> blocks(nB);
+  std::vector<HighsInt> colToBlockPos(numCol, -1);
+  bool separatorBroken = false;
+  for (HighsInt k = 0; k != nB && !separatorBroken; ++k) {
+    BendBlock& blk = blocks[k];
+    blk.cols = cand.blockCols[k];
+    blk.rows = cand.blockRows[k];
+    blk.coupling.assign(blk.rows.size(), {});
+    blk.colEntries.assign(blk.cols.size(), {});
+    blk.baseLo.resize(blk.rows.size());
+    blk.baseHi.resize(blk.rows.size());
+    blk.cost.resize(blk.cols.size());
+    blk.lb.resize(blk.cols.size());
+    blk.ub.resize(blk.cols.size());
+    for (size_t j = 0; j != blk.cols.size(); ++j) {
+      HighsInt c = blk.cols[j];
+      colToBlockPos[c] = (HighsInt)j;
+      blk.cost[j] = sign * model.col_cost_[c];
+      blk.lb[j] = model.col_lower_[c];
+      blk.ub[j] = model.col_upper_[c];
+    }
+    for (size_t i = 0; i != blk.rows.size() && !separatorBroken; ++i) {
+      HighsInt r = blk.rows[i];
+      blk.baseLo[i] = model.row_lower_[r] == -kHighsInf
+                          ? -kHighsInf
+                          : model.row_lower_[r] - rowShift[r];
+      blk.baseHi[i] = model.row_upper_[r] == kHighsInf
+                          ? kHighsInf
+                          : model.row_upper_[r] - rowShift[r];
+      for (HighsInt e = browStart[r]; e != browStart[r + 1]; ++e) {
+        HighsInt c = browCol[e];
+        if (sposOf[c] >= 0) {
+          blk.coupling[i].emplace_back(sposOf[c], browVal[e]);
+        } else if (colToBlockPos[c] >= 0) {
+          blk.colEntries[colToBlockPos[c]].emplace_back((HighsInt)i,
+                                                        browVal[e]);
+        } else {
+          separatorBroken = true;
+          break;
+        }
+      }
+    }
+    for (HighsInt c : blk.cols) colToBlockPos[c] = -1;
+  }
+  if (separatorBroken) {
+    if (logBend)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[Benders] block row touches foreign column -> normal MIP\n");
+    return true;
+  }
+
+  // Master base: separator columns (internal costs, original
+  // bounds/integrality) plus theta per block with a trivial valid lower
+  // bound (block LP without rows can only underestimate block cost).
+  std::vector<double> sepCost(nY);
+  for (HighsInt i = 0; i != nY; ++i)
+    sepCost[i] = sign * model.col_cost_[cand.couplingCols[i]];
+  std::vector<double> thetaLb(nB, 0.0);
+  for (HighsInt k = 0; k != nB; ++k) {
+    double lb = 0.0;
+    bool bounded = true;
+    for (size_t j = 0; j != blocks[k].cols.size(); ++j) {
+      const double cj = blocks[k].cost[j];
+      if (cj > 0) {
+        if (!std::isfinite(blocks[k].lb[j])) {
+          bounded = false;
+          break;
+        }
+        lb += cj * blocks[k].lb[j];
+      } else if (cj < 0) {
+        if (!std::isfinite(blocks[k].ub[j])) {
+          bounded = false;
+          break;
+        }
+        lb += cj * blocks[k].ub[j];
+      }
+    }
+    thetaLb[k] = bounded ? lb : -kHighsInf;
+  }
+  // Master rows: rows fully inside separator/fixed (shifted, S entries).
+  struct MasterRow {
+    std::vector<HighsInt> spos;
+    std::vector<double> val;
+    double lo;
+    double hi;
+  };
+  std::vector<MasterRow> masterBaseRows;
+    for (HighsInt r : cand.masterRows) {
+    MasterRow mr;
+    mr.lo = model.row_lower_[r] == -kHighsInf
+                ? -kHighsInf
+                : model.row_lower_[r] - rowShift[r];
+    mr.hi = model.row_upper_[r] == kHighsInf
+                ? kHighsInf
+                : model.row_upper_[r] - rowShift[r];
+    bool touchesBlock = false;
+    for (HighsInt e = browStart[r]; e != browStart[r + 1]; ++e) {
+      HighsInt c = browCol[e];
+      if (sposOf[c] >= 0) {
+        mr.spos.push_back(sposOf[c]);
+        mr.val.push_back(browVal[e]);
+      } else {
+        // A block column in a master row means the separator is
+        // invalid: abort (defensive, should not happen).
+        touchesBlock = true;
+        break;
+      }
+    }
+    if (touchesBlock) {
+      if (logBend)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[Benders] master row touches block column -> "
+                     "normal MIP\n");
+      return true;
+    }
+    masterBaseRows.push_back(std::move(mr));
+  }
+
+  if (logBend)
+    highsLogUser(logOptions, HighsLogType::kInfo,
+                 "[Benders] candidate: %d coupling cols, %d blocks, %d "
+                 "master rows\n",
+                 (int)nY, (int)nB, (int)masterBaseRows.size());
+
+  struct BendCut {
+    HighsInt block;  // -1 = feasibility cut (no theta)
+    bool le = false;  // true: a*y <= rhs; false: [theta +] a*y >= rhs
+    std::vector<double> ay;
+    double rhs;
+  };
+  std::vector<BendCut> cuts;
+  const HighsInt maxIter = std::max<HighsInt>(
+      1, mipsolver.options_mip_->mip_benders_max_iterations);
+  const double feastol = mipsolver.options_mip_->mip_feasibility_tolerance;
+
+  double UB = kHighsInf;  // internal space
+  std::vector<double> bestY;
+  std::vector<std::vector<double>> bestBlockSol(nB);
+  bool hasBest = false;
+  HighsInt numIter = 0;
+  bool converged = false;
+
+  std::vector<double> y(nY, 0.0);
+  const HighsInt nMasterCol = nY + nB;
+  for (HighsInt iter = 0; iter != maxIter; ++iter) {
+    if (mipsolver.options_mip_->time_limit < kHighsInf &&
+        mipsolver.timer_.read() >= mipsolver.options_mip_->time_limit)
+      break;
+    // ---- master problem ----
+    HighsLp master;
+    master.num_col_ = nMasterCol;
+    master.num_row_ = (HighsInt)(masterBaseRows.size() + cuts.size());
+    master.sense_ = ObjSense::kMinimize;
+    master.offset_ = 0.0;
+    master.a_matrix_.format_ = MatrixFormat::kColwise;
+    master.a_matrix_.start_.assign(nMasterCol + 1, 0);
+    master.col_cost_.assign(nMasterCol, 0.0);
+    master.col_lower_.assign(nMasterCol, -kHighsInf);
+    master.col_upper_.assign(nMasterCol, kHighsInf);
+    master.integrality_.assign(nMasterCol, HighsVarType::kContinuous);
+    for (HighsInt i = 0; i != nY; ++i) {
+      HighsInt c = cand.couplingCols[i];
+      master.col_cost_[i] = sepCost[i];
+      master.col_lower_[i] = model.col_lower_[c];
+      master.col_upper_[i] = model.col_upper_[c];
+      master.integrality_[i] = model.integrality_[c];
+    }
+    for (HighsInt k = 0; k != nB; ++k) {
+      master.col_cost_[nY + k] = 1.0;
+      master.col_lower_[nY + k] = thetaLb[k];
+    }
+    // Row-wise assembly, then transpose to colwise via per-col lists.
+    std::vector<std::vector<std::pair<HighsInt, double>>> colEntries(
+        nMasterCol);
+    std::vector<double> mLo;
+    std::vector<double> mHi;
+    mLo.reserve(master.num_row_);
+    mHi.reserve(master.num_row_);
+    for (const MasterRow& mr : masterBaseRows) {
+      for (size_t t = 0; t != mr.spos.size(); ++t)
+        colEntries[mr.spos[t]].emplace_back((HighsInt)mLo.size(),
+                                            mr.val[t]);
+      mLo.push_back(mr.lo);
+      mHi.push_back(mr.hi);
+    }
+    for (const BendCut& cut : cuts) {
+      for (HighsInt i = 0; i != nY; ++i) {
+        if (cut.ay[i] != 0.0)
+          colEntries[i].emplace_back((HighsInt)mLo.size(), cut.ay[i]);
+      }
+      if (cut.block >= 0)
+        colEntries[nY + cut.block].emplace_back((HighsInt)mLo.size(), 1.0);
+      if (cut.le) {
+        mLo.push_back(-kHighsInf);
+        mHi.push_back(cut.rhs);
+      } else {
+        mLo.push_back(cut.rhs);
+        mHi.push_back(kHighsInf);
+      }
+    }
+    master.row_lower_ = std::move(mLo);
+    master.row_upper_ = std::move(mHi);
+    for (HighsInt j = 0; j != nMasterCol; ++j) {
+      // Deterministic row order within each column.
+      std::sort(colEntries[j].begin(), colEntries[j].end(),
+                [](const std::pair<HighsInt, double>& a,
+                   const std::pair<HighsInt, double>& b) {
+                  return a.first < b.first;
+                });
+      for (const auto& e : colEntries[j]) {
+        master.a_matrix_.index_.push_back(e.first);
+        master.a_matrix_.value_.push_back(e.second);
+      }
+      master.a_matrix_.start_[j + 1] =
+          (HighsInt)master.a_matrix_.index_.size();
+    }
+
+    HighsOptions suboptions = *mipsolver.options_mip_;
+    suboptions.output_flag = false;
+    suboptions.threads = 1;
+    suboptions.mip_max_nodes = 20000;
+    suboptions.mip_max_leaves = 2000;
+    suboptions.mip_detect_symmetry = false;
+    suboptions.random_seed = 0;
+    suboptions.mip_rel_gap = 0.0;
+    suboptions.mip_abs_gap = 0.0;
+    suboptions.mip_feasibility_tolerance = 1e-9;
+    {
+      double remaining =
+          mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
+      suboptions.time_limit = std::min(10.0, remaining);
+    }
+    HighsSolution solution;
+    solution.value_valid = false;
+    solution.dual_valid = false;
+    HighsMipSolver masterSolver(*mipsolver.callback_, suboptions, master,
+                                solution, true, mipsolver.submip_level + 1);
+    masterSolver.setProfiling(mipsolver.profiling_);
+    masterSolver.initialiseTerminator(mipsolver);
+    masterSolver.run();
+    if (masterSolver.modelstatus_ != HighsModelStatus::kOptimal) {
+      if (masterSolver.modelstatus_ == HighsModelStatus::kInfeasible &&
+          cuts.empty()) {
+        // No cuts yet: master rows are original rows, so an infeasible
+        // master proves the whole model infeasible.
+        mipsolver.modelstatus_ = HighsModelStatus::kInfeasible;
+        if (logBend)
+          highsLogUser(logOptions, HighsLogType::kInfo,
+                       "[Benders] master infeasible without cuts -> "
+                       "globally infeasible\n");
+        return true;
+      }
+      if (logBend)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[Benders] master status %d, aborting -> normal MIP\n",
+                     (int)masterSolver.modelstatus_);
+      return true;
+    }
+    const std::vector<double>& masterSol = masterSolver.solution_;
+    if ((HighsInt)masterSol.size() != nMasterCol) {
+      if (logBend)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[Benders] master solution size %d != %d -> normal MIP\n",
+                     (int)masterSol.size(), (int)nMasterCol);
+      return true;
+    }
+    for (HighsInt i = 0; i != nY; ++i) {
+      if (!std::isfinite(masterSol[i])) {
+        if (logBend)
+          highsLogUser(logOptions, HighsLogType::kInfo,
+                       "[Benders] master solution non-finite -> normal MIP\n");
+        return true;
+      }
+      y[i] = masterSol[i];
+    }
+    const double LB = masterSolver.solution_objective_;
+    std::vector<double> thetaStar(nB);
+    for (HighsInt k = 0; k != nB; ++k) thetaStar[k] = masterSol[nY + k];
+    ++numIter;
+
+    // Gap check against the best known feasible composition.
+    const double gapTol = 1e-7 * std::max(1.0, std::fabs(UB));
+    if (hasBest && UB - LB <= gapTol) {
+      converged = true;
+      break;
+    }
+    // ---- subproblems ----
+    bool allFeasible = true;
+    bool anyCut = false;
+    std::vector<std::vector<double>> blockSol(nB);
+    std::vector<double> blockObj(nB, kHighsInf);
+    const double cutTol = 1e-6;
+    for (HighsInt k = 0; k != nB; ++k) {
+      const BendBlock& blk = blocks[k];
+      const HighsInt nbC = (HighsInt)blk.cols.size();
+      const HighsInt nbR = (HighsInt)blk.rows.size();
+      // Coupling shift for this master solution.
+      std::vector<double> shift(nbR, 0.0);
+      for (HighsInt i = 0; i != nbR; ++i) {
+        double s = 0.0;
+        for (const auto& e : blk.coupling[i]) s += e.second * y[e.first];
+        shift[i] = s;
+      }
+      // Sub-LP: block rows (shifted) plus explicit finite-bound rows.
+      // Columns are free: all dual mass sits on rows, a single source
+      // for both cut types.
+      HighsLp sublp;
+      sublp.num_col_ = nbC;
+      sublp.sense_ = ObjSense::kMinimize;
+      sublp.offset_ = 0.0;
+      sublp.a_matrix_.format_ = MatrixFormat::kColwise;
+      sublp.a_matrix_.start_.assign(nbC + 1, 0);
+      sublp.col_cost_ = blk.cost;
+      sublp.col_lower_.assign(nbC, -kHighsInf);
+      sublp.col_upper_.assign(nbC, kHighsInf);
+      sublp.integrality_.assign(nbC, HighsVarType::kContinuous);
+      std::vector<double> subLo;
+      std::vector<double> subHi;
+      subLo.reserve(nbR + 2 * nbC);
+      subHi.reserve(nbR + 2 * nbC);
+      // Block-row entry lookup comes from the precomputed per-column
+      // lists (built once during candidate construction).
+      std::vector<std::vector<std::pair<HighsInt, double>>> subColEntries =
+          blk.colEntries;
+      for (HighsInt i = 0; i != nbR; ++i) {
+        subLo.push_back(blk.baseLo[i] == -kHighsInf
+                            ? -kHighsInf
+                            : blk.baseLo[i] - shift[i]);
+        subHi.push_back(blk.baseHi[i] == kHighsInf
+                            ? kHighsInf
+                            : blk.baseHi[i] - shift[i]);
+      }
+      // Explicit bound rows (finite bounds only).
+      for (HighsInt j = 0; j != nbC; ++j) {
+        if (std::isfinite(blk.lb[j])) {
+          subColEntries[j].emplace_back((HighsInt)subLo.size(), -1.0);
+          subLo.push_back(-kHighsInf);
+          subHi.push_back(-blk.lb[j]);
+        }
+        if (std::isfinite(blk.ub[j])) {
+          subColEntries[j].emplace_back((HighsInt)subLo.size(), 1.0);
+          subLo.push_back(-kHighsInf);
+          subHi.push_back(blk.ub[j]);
+        }
+      }
+      sublp.num_row_ = (HighsInt)subLo.size();
+      sublp.row_lower_ = std::move(subLo);
+      sublp.row_upper_ = std::move(subHi);
+      for (HighsInt j = 0; j != nbC; ++j) {
+        std::sort(subColEntries[j].begin(), subColEntries[j].end(),
+                  [](const std::pair<HighsInt, double>& a,
+                     const std::pair<HighsInt, double>& b) {
+                    return a.first < b.first;
+                  });
+        for (const auto& e : subColEntries[j]) {
+          sublp.a_matrix_.index_.push_back(e.first);
+          sublp.a_matrix_.value_.push_back(e.second);
+        }
+        sublp.a_matrix_.start_[j + 1] =
+            (HighsInt)sublp.a_matrix_.index_.size();
+      }
+      double remaining =
+          mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
+      SubLpResult res = solveSubLp(sublp, std::min(10.0, remaining));
+      if (res.status == HighsModelStatus::kOptimal) {
+        if (!res.dualValid ||
+            (HighsInt)res.colSol.size() != nbC ||
+            (HighsInt)res.rowDual.size() != sublp.num_row_) {
+          if (logBend)
+            highsLogUser(logOptions, HighsLogType::kInfo,
+                         "[Benders] block %d optimal but dual unusable "
+                         "(dual_valid=%d) -> normal MIP\n",
+                         (int)k, (int)res.dualValid);
+          return true;  // cannot build a trusted cut: fallback
+        }
+        // Tightness gate: the dual objective at this point must
+        // reproduce the primal optimum. HiGHS min-LP convention (read off
+        // real duals): pi > 0 pairs with the LOWER bound, pi < 0 with the
+        // UPPER bound. Any systematic convention error trips here and
+        // aborts instead of cutting valid points.
+        const std::vector<double>& pi = res.rowDual;
+        double dualObj = 0.0;
+        bool dualOk = true;
+        for (HighsInt i = 0; i != sublp.num_row_; ++i) {
+          if (pi[i] > 0) {
+            if (sublp.row_lower_[i] == -kHighsInf) {
+              dualOk = false;
+              break;
+            }
+            dualObj += pi[i] * sublp.row_lower_[i];
+          } else if (pi[i] < 0) {
+            if (sublp.row_upper_[i] == kHighsInf) {
+              dualOk = false;
+              break;
+            }
+            dualObj += pi[i] * sublp.row_upper_[i];
+          }
+        }
+        const double dualTol = 1e-6 * std::max(1.0, std::fabs(res.obj));
+        if (!dualOk || std::fabs(dualObj - res.obj) > dualTol) {
+          if (logBend) {
+            highsLogUser(logOptions, HighsLogType::kInfo,
+                         "[Benders] block %d dual tightness failed "
+                         "(dualobj=%.6g primal=%.6g) -> normal MIP\n",
+                         (int)k, dualObj, res.obj);
+            std::string dbg;
+            for (HighsInt i = 0; i != std::min<HighsInt>(12, sublp.num_row_);
+                 ++i) {
+              char buf[160];
+              snprintf(buf, sizeof(buf), " r%d: pi=%.4g [%.4g,%.4g];",
+                       (int)i, pi[i], sublp.row_lower_[i],
+                       sublp.row_upper_[i]);
+              dbg += buf;
+            }
+            highsLogUser(logOptions, HighsLogType::kInfo, "[Benders] dbg%s\n",
+                         dbg.c_str());
+          }
+          return true;
+        }
+        // Optimality cut: theta_k + (pi*C) y >= pi*b(base) + bound terms.
+        BendCut cut;
+        cut.block = k;
+        cut.ay.assign(nY, 0.0);
+        for (HighsInt i = 0; i != nbR; ++i) {
+          if (pi[i] == 0.0) continue;
+          for (const auto& e : blk.coupling[i]) cut.ay[e.first] += pi[i] * e.second;
+        }
+        double rhs = 0.0;
+        bool rhsOk = true;
+        for (HighsInt i = 0; i != nbR; ++i) {
+          if (pi[i] > 0) {
+            if (blk.baseLo[i] == -kHighsInf) {
+              rhsOk = false;
+              break;
+            }
+            rhs += pi[i] * blk.baseLo[i];
+          } else if (pi[i] < 0) {
+            if (blk.baseHi[i] == kHighsInf) {
+              rhsOk = false;
+              break;
+            }
+            rhs += pi[i] * blk.baseHi[i];
+          }
+        }
+        if (!rhsOk) {
+          if (logBend)
+            highsLogUser(logOptions, HighsLogType::kInfo,
+                         "[Benders] block %d cut needs infinite bound -> "
+                         "normal MIP\n",
+                         (int)k);
+          return true;
+        }
+        for (HighsInt i = nbR; i != sublp.num_row_; ++i) {
+          if (pi[i] > 0)
+            rhs += pi[i] * sublp.row_lower_[i];
+          else if (pi[i] < 0)
+            rhs += pi[i] * sublp.row_upper_[i];
+        }
+        // Coefficient hygiene.
+        for (HighsInt i = 0; i != nY; ++i)
+          if (std::fabs(cut.ay[i]) <= 1e-12) cut.ay[i] = 0.0;
+        cut.rhs = rhs;
+        double cutVal = rhs;
+        for (HighsInt i = 0; i != nY; ++i) cutVal -= cut.ay[i] * y[i];
+        const double violTol = cutTol * std::max(1.0, std::fabs(rhs));
+        if (thetaStar[k] < cutVal - violTol) {
+          cuts.push_back(std::move(cut));
+          anyCut = true;
+        }
+        blockSol[k] = res.colSol;
+        blockObj[k] = res.obj;
+      } else if (res.status == HighsModelStatus::kInfeasible) {
+        allFeasible = false;
+        // Farkas ray -> feasibility cut (same row-only dual source).
+        Highs lpsolver;
+        lpsolver.setOptionValue("output_flag", false);
+        lpsolver.setOptionValue("presolve", kHighsOffString);
+        lpsolver.setOptionValue("solver", kSimplexString);
+        bool rayUsable = true;
+        if (lpsolver.passModel(sublp) != HighsStatus::kOk) rayUsable = false;
+        if (rayUsable && lpsolver.run() != HighsStatus::kOk) rayUsable = false;
+        if (rayUsable &&
+            lpsolver.getModelStatus() != HighsModelStatus::kInfeasible)
+          rayUsable = false;
+        std::vector<double> ray(sublp.num_row_, 0.0);
+        bool hasRay = false;
+        if (rayUsable &&
+            (lpsolver.getDualRay(hasRay, ray.data()) != HighsStatus::kOk ||
+             !hasRay))
+          rayUsable = false;
+        if (!rayUsable) {
+          if (logBend)
+            highsLogUser(logOptions, HighsLogType::kInfo,
+                         "[Benders] block %d infeasible but no dual ray -> "
+                         "normal MIP\n",
+                         (int)k);
+          return true;
+        }
+        // Farkas certificate for the shifted rows: with w = -ray and the
+        // conflict-proof pairing (upper bound active for w > 0), the
+        // infeasibility proof is viol < 0, and the valid cut is the same
+        // combination with y-dependent bounds: a*y <= rhs.
+        double viol = 0.0;
+        for (HighsInt i = 0; i != sublp.num_row_; ++i) {
+          const double w = -ray[i];
+          if (w > 0)
+            viol += w * sublp.row_upper_[i];
+          else if (w < 0)
+            viol += w * sublp.row_lower_[i];
+        }
+        if (!(viol < -1e-7 * std::max(1.0, std::fabs(viol)))) {
+          // Ray does not prove infeasibility at this point: unusable.
+          if (logBend)
+            highsLogUser(logOptions, HighsLogType::kInfo,
+                         "[Benders] block %d ray violation %g not negative "
+                         "-> normal MIP\n",
+                         (int)k, viol);
+          return true;
+        }
+        BendCut cut;
+        cut.block = -1;
+        cut.le = true;
+        cut.ay.assign(nY, 0.0);
+        double rhs = 0.0;
+        bool feasRhsOk = true;
+        for (HighsInt i = 0; i != nbR; ++i) {
+          const double w = -ray[i];
+          if (w == 0.0) continue;
+          for (const auto& e : blk.coupling[i]) cut.ay[e.first] += w * e.second;
+          if (w > 0) {
+            if (blk.baseHi[i] == kHighsInf) {
+              feasRhsOk = false;
+              break;
+            }
+            rhs += w * blk.baseHi[i];
+          } else {
+            if (blk.baseLo[i] == -kHighsInf) {
+              feasRhsOk = false;
+              break;
+            }
+            rhs += w * blk.baseLo[i];
+          }
+        }
+        if (!feasRhsOk) {
+          if (logBend)
+            highsLogUser(logOptions, HighsLogType::kInfo,
+                         "[Benders] block %d feasibility cut needs infinite "
+                         "bound -> normal MIP\n",
+                         (int)k);
+          return true;
+        }
+        for (HighsInt i = nbR; i != sublp.num_row_; ++i) {
+          const double w = -ray[i];
+          if (w > 0)
+            rhs += w * sublp.row_upper_[i];
+          else if (w < 0)
+            rhs += w * sublp.row_lower_[i];
+        }
+        for (HighsInt i = 0; i != nY; ++i)
+          if (std::fabs(cut.ay[i]) <= 1e-12) cut.ay[i] = 0.0;
+        cut.rhs = rhs;
+        // The cut a*y <= rhs must be violated at y (by -viol > 0);
+        // anything else signals a broken certificate: abort.
+        double lhs = 0.0;
+        for (HighsInt i = 0; i != nY; ++i) lhs += cut.ay[i] * y[i];
+        const double rayTol = 1e-6 * std::max(1.0, std::fabs(rhs));
+        if (lhs > rhs + rayTol) {
+          cuts.push_back(std::move(cut));
+          anyCut = true;
+        } else {
+          if (logBend)
+            highsLogUser(logOptions, HighsLogType::kInfo,
+                         "[Benders] block %d feasibility cut not violated "
+                         "at y -> normal MIP\n",
+                         (int)k);
+          return true;
+        }
+      } else if (res.status == HighsModelStatus::kUnbounded) {
+        // An unbounded block subproblem means the global problem is
+        // unbounded along this ray; leave that verdict to normal MIP.
+        if (logBend)
+          highsLogUser(logOptions, HighsLogType::kInfo,
+                       "[Benders] block %d unbounded -> normal MIP\n", (int)k);
+        return true;
+      } else {
+        if (logBend)
+          highsLogUser(logOptions, HighsLogType::kInfo,
+                       "[Benders] block %d status %d -> normal MIP\n", (int)k,
+                       (int)res.status);
+        return true;  // time limit, error, ...: fallback
+      }
+    }
+    if (allFeasible) {
+      double composed = 0.0;
+      for (HighsInt i = 0; i != nY; ++i) composed += sepCost[i] * y[i];
+      for (HighsInt k = 0; k != nB; ++k) composed += blockObj[k];
+      if (composed < UB) {
+        UB = composed;
+        bestY = y;
+        bestBlockSol = blockSol;
+        hasBest = true;
+      }
+    }
+    if (logBend)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[Benders] iter %d: master=%.6g LB=%.6g UB=%.6g cuts=%d\n",
+                   (int)iter, LB, LB, UB, (int)cuts.size());
+    if (hasBest && UB - LB <= gapTol) {
+      converged = true;
+      break;
+    }
+    if (!anyCut) break;  // nothing learned: gap decides fix vs fallback
+  }
+
+  if (!converged || !hasBest) {
+    if (logBend)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[Benders] not converged (%d iters) -> normal MIP\n",
+                   (int)numIter);
+    return true;
+  }
+  // Compose the full presolved-space solution and verify it strictly
+  // before fixing anything.
+  std::vector<double> fullSol(numCol, 0.0);
+  for (HighsInt c = 0; c != numCol; ++c)
+    fullSol[c] = model.col_lower_[c];  // fixed cols (lb == ub) included
+  for (HighsInt i = 0; i != nY; ++i) {
+    HighsInt c = cand.couplingCols[i];
+    double v = bestY[i];
+    if (model.integrality_[c] == HighsVarType::kInteger) v = std::round(v);
+    fullSol[c] = v;
+  }
+  for (HighsInt k = 0; k != nB; ++k) {
+    for (size_t j = 0; j != blocks[k].cols.size(); ++j)
+      fullSol[blocks[k].cols[j]] = bestBlockSol[k][j];
+  }
+  if (!verifyBendersSolution(model, fullSol)) {
+    if (logBend)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[Benders] composed solution failed verification -> "
+                   "normal MIP\n");
+    return true;
+  }
+  HighsInt numFixed = 0;
+  for (HighsInt i = 0; i != nY; ++i) {
+    HighsInt c = cand.couplingCols[i];
+    if (model.col_lower_[c] == model.col_upper_[c]) continue;
+    double fixval = fullSol[c];
+    if (model.integrality_[c] == HighsVarType::kInteger)
+      fixval = std::round(fixval);
+    fixval = std::min(std::max(fixval, model.col_lower_[c]),
+                      model.col_upper_[c]);
+    model.col_lower_[c] = model.col_upper_[c] = fixval;
+    ++numFixed;
+  }
+  const double parentUB = sign * UB + model.offset_;
+  highsLogUser(logOptions, HighsLogType::kInfo,
+               "[Benders] fixed %d coupling columns (%d blocks, %d iters, "
+               "verified obj %.6g)\n",
+               (int)numFixed, (int)nB, (int)numIter, parentUB);
+  return true;
+}

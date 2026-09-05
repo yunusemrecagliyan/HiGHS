@@ -530,6 +530,10 @@ struct HighsOptionsStruct {
   HighsInt mip_decomposition_max_comp_cols;
   HighsInt mip_decomposition_max_comp_rows;
   bool mip_decomposition_logging;
+  bool mip_benders;
+  HighsInt mip_benders_max_iterations;
+  HighsInt mip_benders_max_coupling_cols;
+  HighsInt mip_benders_min_block_cols;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -707,7 +711,11 @@ struct HighsOptionsStruct {
         mip_decomposition_max_comp_ints(40),
         mip_decomposition_max_comp_cols(64),
         mip_decomposition_max_comp_rows(64),
-        mip_decomposition_logging(false) {};
+        mip_decomposition_logging(false),
+        mip_benders(true),
+        mip_benders_max_iterations(100),
+        mip_benders_max_coupling_cols(16),
+        mip_benders_min_block_cols(10) {};
   // clang-format on
 };
 
@@ -1350,6 +1358,33 @@ class HighsOptions : public HighsOptionsStruct {
         "weak-coupling (Benders candidate) analysis",
         advanced, &mip_decomposition_logging, false);
     records.push_back(record_bool);
+
+    record_bool = new OptionRecordBool(
+        "mip_benders",
+        "Whether classical Benders decomposition is attempted on "
+        "suitable weakly-coupled models (small coupling set, LP blocks); "
+        "falls back to normal MIP on any doubt",
+        advanced, &mip_benders, true);
+    records.push_back(record_bool);
+
+    record_int = new OptionRecordInt(
+        "mip_benders_max_iterations",
+        "Max master/subproblem iterations of Benders decomposition",
+        advanced, &mip_benders_max_iterations, 1, 100, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_benders_max_coupling_cols",
+        "Max coupling columns of a Benders decomposition candidate",
+        advanced, &mip_benders_max_coupling_cols, 1, 16, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_benders_min_block_cols",
+        "Min columns of a Benders block; smaller pieces are absorbed "
+        "into the master problem",
+        advanced, &mip_benders_min_block_cols, 1, 10, kHighsIInf);
+    records.push_back(record_int);
 
     record_double = new OptionRecordDouble(
         "mip_rel_gap",

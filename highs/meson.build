@@ -258,6 +258,7 @@ _srcs = [
     'lp_data/HighsSolutionDebug.cpp',
     'lp_data/HighsSolve.cpp',
     'lp_data/HighsStatus.cpp',
+    'mip/HighsBenders.cpp',
     'mip/HighsCliqueTable.cpp',
     'mip/HighsConflictPool.cpp',
     'mip/HighsCutGeneration.cpp',
