@@ -540,6 +540,7 @@ struct HighsOptionsStruct {
   HighsInt mip_benders_max_coupling_cols;
   HighsInt mip_benders_min_block_cols;
   bool mip_benders_feas_aux;
+  bool mip_benders_lshaped;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -727,7 +728,8 @@ struct HighsOptionsStruct {
         mip_benders_max_iterations(100),
         mip_benders_max_coupling_cols(16),
         mip_benders_min_block_cols(10),
-        mip_benders_feas_aux(true) {};
+        mip_benders_feas_aux(true),
+        mip_benders_lshaped(true) {};
   // clang-format on
 };
 
@@ -1412,6 +1414,14 @@ class HighsOptions : public HighsOptionsStruct {
         "a feasibility cut when an infeasible block yields no usable Farkas "
         "ray (falls back to normal MIP if the auxiliary also fails)",
         advanced, &mip_benders_feas_aux, true);
+    records.push_back(record_bool);
+
+    record_bool = new OptionRecordBool(
+        "mip_benders_lshaped",
+        "Whether Benders adds integer L-shaped cuts from optimal integer "
+        "block subproblems when all coupling columns are binary (finite "
+        "convergence on binary coupling; skipped on any doubt)",
+        advanced, &mip_benders_lshaped, true);
     records.push_back(record_bool);
 
     record_bool = new OptionRecordBool(

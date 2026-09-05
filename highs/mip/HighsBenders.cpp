@@ -755,6 +755,7 @@ bool HighsMipSolverData::runBenders() {
     HighsInt block;  // -1 = feasibility cut (no theta)
     bool le = false;  // true: a*y <= rhs; false: [theta +] a*y >= rhs
     bool aux = false;  // true: from the auxiliary LP, not a Farkas ray
+    bool lshaped = false;  // true: integer L-shaped cut (binary coupling)
     std::vector<double> ay;
     double rhs;
   };
@@ -1313,6 +1314,65 @@ bool HighsMipSolverData::runBenders() {
             }
             blockSol[k] = msubsolver.solution_;
             blockObj[k] = msubsolver.solution_objective_;
+            // Integer L-shaped cut (Laporte-Louveaux, clean-room): with
+            // binary coupling, the sub-MIP optimum z* at the binary y*
+            // tightens theta_k via theta_k >= z* - (z* - L)*dev(y),
+            // where dev counts coordinates differing from y* and L is
+            // the block's global box lower bound (thetaLb, enforced on
+            // theta in every master). At y* the cut is tight
+            // (theta >= z*); any other binary y has dev >= 1, giving
+            // theta >= L, already enforced hence valid. The master only
+            // ever produces binary y (MIP-optimal), so no fractional
+            // case arises; any doubt skips the cut. Each cut excludes
+            // one y*, giving finite convergence on binary coupling.
+            if (mipsolver.options_mip_->mip_benders_lshaped &&
+                std::isfinite(thetaLb[k])) {
+              bool binaryY = true;
+              for (HighsInt i = 0; i != nY; ++i) {
+                HighsInt c = cand.couplingCols[i];
+                if (model.integrality_[c] != HighsVarType::kInteger ||
+                    model.col_lower_[c] != 0.0 ||
+                    model.col_upper_[c] != 1.0) {
+                  binaryY = false;
+                  break;
+                }
+                const double r = std::round(y[i]);
+                if ((r != 0.0 && r != 1.0) || std::fabs(y[i] - r) > 1e-9) {
+                  binaryY = false;
+                  break;
+                }
+              }
+              if (binaryY) {
+                const double zstar = msubsolver.solution_objective_;
+                const double spread = zstar - thetaLb[k];
+                const double lViolTol =
+                    cutTol * std::max(1.0, std::fabs(zstar));
+                if (spread > lViolTol && thetaStar[k] < zstar - lViolTol) {
+                  BendCut lcut;
+                  lcut.block = k;
+                  lcut.le = false;
+                  lcut.lshaped = true;
+                  lcut.ay.assign(nY, 0.0);
+                  double numOne = 0.0;
+                  for (HighsInt i = 0; i != nY; ++i) {
+                    if (std::round(y[i]) == 1.0) {
+                      lcut.ay[i] = spread;
+                      numOne += 1.0;
+                    } else {
+                      lcut.ay[i] = -spread;
+                    }
+                  }
+                  lcut.rhs = zstar - spread * numOne;
+                  cuts.push_back(std::move(lcut));
+                  anyCut = true;
+                  if (logBend)
+                    highsLogUser(logOptions, HighsLogType::kInfo,
+                                 "[Benders] block %d L-shaped cut: z*=%.6g "
+                                 "L=%.6g\n",
+                                 (int)k, zstar, thetaLb[k]);
+                }
+              }
+            }
           } else if (msubsolver.modelstatus_ == HighsModelStatus::kInfeasible) {
             // LP-relaxation feasible but sub-MIP infeasible: only a
             // binary no-good cut can proceed; anything else aborts.
@@ -1536,10 +1596,12 @@ bool HighsMipSolverData::runBenders() {
       }
     }
     if (logBend) {
-      HighsInt nFeas = 0, nOpt = 0, nNoGood = 0, nAux = 0;
+      HighsInt nFeas = 0, nOpt = 0, nNoGood = 0, nAux = 0, nLshaped = 0;
       for (const BendCut& cut : cuts) {
         if (cut.aux)
           ++nAux;
+        else if (cut.lshaped)
+          ++nLshaped;
         else if (cut.block >= 0)
           ++nOpt;
         else if (cut.le)
@@ -1549,9 +1611,9 @@ bool HighsMipSolverData::runBenders() {
       }
       highsLogUser(logOptions, HighsLogType::kInfo,
                    "[Benders] iter %d: master=%.6g LB=%.6g UB=%.6g cuts=%d "
-                   "(feas=%d opt=%d nogood=%d aux=%d)\n",
+                   "(feas=%d opt=%d nogood=%d aux=%d lshaped=%d)\n",
                    (int)iter, LB, LB, UB, (int)cuts.size(), (int)nFeas,
-                   (int)nOpt, (int)nNoGood, (int)nAux);
+                   (int)nOpt, (int)nNoGood, (int)nAux, (int)nLshaped);
     }
     // Post-subsolve gap check with a FRESH tolerance from the current
     // UB (gapTol above predates this iteration's UB update and may still
