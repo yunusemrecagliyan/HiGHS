@@ -218,6 +218,176 @@ HighsMipSolverData::getInfeasibleRows(
   return infeasibleRows;
 }
 
+bool HighsMipSolverData::polishIncumbent(std::vector<double>& sol,
+                                          double& obj) const {
+  if (!mipsolver.options_mip_->mip_heuristic_polish) return false;
+  const HighsInt numCol = mipsolver.numCol();
+  const HighsInt numRow = mipsolver.numRow();
+  if ((HighsInt)sol.size() != numCol || numCol <= 0 || numRow < 0)
+    return false;
+  if (mipsolver.model_->a_matrix_.format_ != MatrixFormat::kColwise) return false;
+  // Candidate integer columns (same predicate as verification).
+  std::vector<HighsInt> cand;
+  if (!integer_cols.empty()) {
+    for (HighsInt c : integer_cols) {
+      if (c >= 0 && c < numCol && mipsolver.isColInteger(c)) cand.push_back(c);
+    }
+  } else {
+    for (HighsInt c = 0; c != numCol; ++c)
+      if (mipsolver.isColInteger(c)) cand.push_back(c);
+  }
+  if (cand.empty()) return false;
+  for (HighsInt c : cand) {
+    if (!std::isfinite(sol[c]) || fractionality(sol[c]) > feastol)
+      return false;
+  }
+  const std::vector<double>& lb = mipsolver.model_->col_lower_;
+  const std::vector<double>& ub = mipsolver.model_->col_upper_;
+  if ((HighsInt)lb.size() != numCol || (HighsInt)ub.size() != numCol)
+    return false;
+  // Row activities from scratch.
+  std::vector<double> act(numRow, 0.0);
+  for (HighsInt r = 0; r != numRow; ++r) {
+    double a = 0.0;
+    for (HighsInt e = ARstart_[r]; e != ARstart_[r + 1]; ++e)
+      a += sol[ARindex_[e]] * ARvalue_[e];
+    act[r] = a;
+  }
+  const std::vector<double>& ccost = mipsolver.model_->col_cost_;
+  const double minGain = 1e-9 * std::max(1.0, std::fabs(obj));
+  const HighsInt maxPasses = std::max<HighsInt>(
+      1, mipsolver.options_mip_->mip_heuristic_polish_passes);
+  const std::vector<HighsInt>& astart = mipsolver.model_->a_matrix_.start_;
+  const std::vector<HighsInt>& aindex = mipsolver.model_->a_matrix_.index_;
+  const std::vector<double>& avalue = mipsolver.model_->a_matrix_.value_;
+  auto rowOk = [&](HighsInt r, double a) -> bool {
+    return a <= mipsolver.rowUpper(r) + feastol &&
+           a >= mipsolver.rowLower(r) - feastol;
+  };
+  const double origObj = obj;
+  const std::vector<double> origSol = sol;
+  bool improved = false;
+  // oneopt passes: unit shifts in the improving direction.
+  for (HighsInt pass = 0; pass != maxPasses; ++pass) {
+    bool passImproved = false;
+    for (HighsInt c : cand) {
+      const double cost = ccost[c];
+      if (cost == 0.0) continue;
+      const double step = (cost > 0) ? -1.0 : 1.0;
+      const double nv = sol[c] + step;
+      if (nv < lb[c] - feastol || nv > ub[c] + feastol) continue;
+      bool ok = true;
+      for (HighsInt e = astart[c]; e != astart[c + 1]; ++e) {
+        if (!rowOk(aindex[e], act[aindex[e]] + step * avalue[e])) {
+          ok = false;
+          break;
+        }
+      }
+      if (!ok) continue;
+      const double gain = cost * step;
+      if (!(gain < -minGain)) continue;
+      sol[c] = nv;
+      for (HighsInt e = astart[c]; e != astart[c + 1]; ++e)
+        act[aindex[e]] += step * avalue[e];
+      obj += gain;
+      passImproved = true;
+      improved = true;
+    }
+    if (!passImproved) break;
+  }
+  // Single twoopt sweep over row-sharing integer pairs (capped).
+  HighsInt pairsTried = 0;
+  const HighsInt maxPairs = std::max<HighsInt>(
+      0, mipsolver.options_mip_->mip_heuristic_polish_maxpairs);
+  std::vector<char> inCand(numCol, 0);
+  for (HighsInt c : cand) inCand[c] = 1;
+  for (HighsInt r = 0; r != numRow && pairsTried < maxPairs; ++r) {
+    std::vector<HighsInt> rowInts;
+    for (HighsInt e = ARstart_[r]; e != ARstart_[r + 1]; ++e) {
+      const HighsInt c = ARindex_[e];
+      if (c >= 0 && c < numCol && inCand[c]) rowInts.push_back(c);
+    }
+    if (rowInts.size() < 2 || rowInts.size() > 64) continue;
+    for (size_t i = 0; i != rowInts.size() && pairsTried < maxPairs; ++i) {
+      for (size_t j = i + 1;
+           j != rowInts.size() && pairsTried < maxPairs; ++j) {
+        ++pairsTried;
+        const HighsInt ci = rowInts[i], cj = rowInts[j];
+        const double cci = ccost[ci], ccj = ccost[cj];
+        // Unit 2-moves in all four sign patterns, first improvement.
+        const double steps[4][2] = {{1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+        for (int t = 0; t != 4; ++t) {
+          const double si = steps[t][0], sj = steps[t][1];
+          const double gain = cci * si + ccj * sj;
+          if (!(gain < -minGain)) continue;
+          const double nvi = sol[ci] + si, nvj = sol[cj] + sj;
+          if (nvi < lb[ci] - feastol || nvi > ub[ci] + feastol) continue;
+          if (nvj < lb[cj] - feastol || nvj > ub[cj] + feastol) continue;
+          bool ok = true;
+          for (HighsInt e = astart[ci]; e != astart[ci + 1]; ++e) {
+            if (!rowOk(aindex[e], act[aindex[e]] + si * avalue[e])) {
+              ok = false;
+              break;
+            }
+          }
+          if (ok) {
+            for (HighsInt e = astart[cj]; e != astart[cj + 1]; ++e) {
+              if (!rowOk(aindex[e], act[aindex[e]] + sj * avalue[e])) {
+                ok = false;
+                break;
+              }
+            }
+          }
+          if (!ok) continue;
+          sol[ci] = nvi;
+          sol[cj] = nvj;
+          for (HighsInt e = astart[ci]; e != astart[ci + 1]; ++e)
+            act[aindex[e]] += si * avalue[e];
+          for (HighsInt e = astart[cj]; e != astart[cj + 1]; ++e)
+            act[aindex[e]] += sj * avalue[e];
+          obj += gain;
+          improved = true;
+          break;
+        }
+      }
+    }
+  }
+  if (!improved || !(obj < origObj)) {
+    sol = origSol;
+    obj = origObj;
+    return false;
+  }
+  // Re-verify from scratch (never trust construction alone).
+  for (HighsInt c = 0; c != numCol; ++c) {
+    if (sol[c] < lb[c] - feastol || sol[c] > ub[c] + feastol) {
+      sol = origSol;
+      obj = origObj;
+      return false;
+    }
+    if (mipsolver.isColInteger(c) && fractionality(sol[c]) > feastol) {
+      sol = origSol;
+      obj = origObj;
+      return false;
+    }
+  }
+  if (!solutionRowFeasible(sol)) {
+    sol = origSol;
+    obj = origObj;
+    return false;
+  }
+  // Recompute the objective from scratch (no delta drift).
+  HighsCDouble fresh = 0;
+  for (HighsInt c = 0; c != numCol; ++c)
+    fresh += static_cast<HighsCDouble>(ccost[c]) * sol[c];
+  obj = double(fresh);
+  if (!(obj < origObj)) {
+    sol = origSol;
+    obj = origObj;
+    return false;
+  }
+  return true;
+}
+
 bool HighsMipSolverData::trySolution(const std::vector<double>& solution,
                                      const int solution_source) {
   if (int(solution.size()) != mipsolver.numCol()) return false;
@@ -246,7 +416,19 @@ bool HighsMipSolverData::trySolution(const std::vector<double>& solution,
   for (HighsInt i = 0; i != mipsolver.numCol(); ++i)
     obj += static_cast<HighsCDouble>(mipsolver.colCost(i)) * solution[i];
 
-  return addIncumbent(solution, double(obj), solution_source);
+  const bool baseOk =
+      addIncumbent(solution, double(obj), solution_source);
+  // LP-free polish (oneopt/twoopt): the verified point above is already
+  // submitted and never replaced; a strictly improved polished point is
+  // submitted additionally (re-verified inside). Improves incumbents at
+  // ~1ms without any LP/MIP work.
+  if (mipsolver.options_mip_->mip_heuristic_polish) {
+    std::vector<double> polished = solution;
+    double polishedObj = double(obj);
+    if (polishIncumbent(polished, polishedObj))
+      return addIncumbent(polished, polishedObj, solution_source) || baseOk;
+  }
+  return baseOk;
 }
 
 bool HighsMipSolverData::solutionRowFeasible(
@@ -3768,3 +3950,5 @@ void HighsTerminator::report(const HighsLogOptions log_options) const {
                  int(this->record[instance]));
   highsLogUser(log_options, HighsLogType::kInfo, "\n");
 }
+
+

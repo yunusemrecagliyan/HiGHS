@@ -354,6 +354,15 @@ struct HighsMipSolverData {
       const std::vector<double>& solution) const;
   bool trySolution(const std::vector<double>& solution,
                    const int solution_source = kSolutionSourceNone);
+  // LP-free incumbent polish (SCIP oneopt/twoopt-style, clean-room):
+  // strictly improves a verified globally-feasible solution by unit
+  // single/pair integer shifts against global bounds and row activities
+  // (oneopt passes, then one capped twoopt sweep over row-sharing
+  // pairs). Only ever improves the same feasibility; the caller submits
+  // the original first and the polished point additionally. Re-verifies
+  // from scratch before reporting success; restores and fails closed on
+  // any doubt. Returns true iff sol/obj strictly improved.
+  bool polishIncumbent(std::vector<double>& sol, double& obj) const;
   bool rootSeparationRound(HighsMipWorker& worker, HighsSeparation& sepa,
                            HighsInt& ncuts, HighsLpRelaxation::Status& status);
   HighsLpRelaxation::Status evaluateRootLp(HighsMipWorker& worker);

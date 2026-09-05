@@ -2231,6 +2231,45 @@ TEST_CASE("MIP-benders-dualbound-max", "[highs_test_mip_solver]") {
   }
 }
 
+TEST_CASE("MIP-heuristic-polish", "[highs_test_mip_solver]") {
+  // LP-free polish must never change the proven optimum: a model whose
+  // rounded incumbents admit single-shift improvement (min 2x + y over
+  // x + y >= 1: (1,1) polishes to (0,1)) agrees exactly with polish
+  // on/off. (Both paths prove 1.)
+  HighsLp lp;
+  lp.num_col_ = 2;
+  lp.num_row_ = 1;
+  lp.sense_ = ObjSense::kMinimize;
+  lp.col_cost_ = {2.0, 1.0};
+  lp.col_lower_ = {0.0, 0.0};
+  lp.col_upper_ = {1.0, 1.0};
+  lp.integrality_ = {HighsVarType::kInteger, HighsVarType::kInteger};
+  lp.row_lower_ = {1.0};
+  lp.row_upper_ = {kHighsInf};
+  lp.a_matrix_.format_ = MatrixFormat::kColwise;
+  lp.a_matrix_.start_ = {0, 1, 2};
+  lp.a_matrix_.index_ = {0, 0};
+  lp.a_matrix_.value_ = {1.0, 1.0};
+  double reference = kHighsInf;
+  for (HighsInt cfg = 0; cfg != 2; ++cfg) {
+    Highs highs;
+    highs.setOptionValue("output_flag", dev_run);
+    highs.setOptionValue("mip_rel_gap", 0);
+    highs.setOptionValue("mip_abs_gap", 0);
+    highs.setOptionValue("mip_heuristic_polish", cfg == 0);
+    highs.passModel(lp);
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+    double objective = highs.getInfo().objective_function_value;
+    REQUIRE(objective == 1.0);
+    if (cfg == 0)
+      reference = objective;
+    else
+      REQUIRE(objective == reference);
+    highs.resetGlobalScheduler(true);
+  }
+}
+
 TEST_CASE("MIP-decomposition-zero-objective", "[highs_test_mip_solver]") {
   // Zero objective: every feasible point is optimal; decomposition must
   // still agree with the fallback path (objective 0).

@@ -549,6 +549,9 @@ struct HighsOptionsStruct {
   double mip_benders_max_time;
   bool mip_benders_cut_hygiene;
   bool mip_benders_dual_bound;
+  bool mip_heuristic_polish;
+  HighsInt mip_heuristic_polish_passes;
+  HighsInt mip_heuristic_polish_maxpairs;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -745,7 +748,10 @@ struct HighsOptionsStruct {
         mip_benders_branch_priority(0.0),
         mip_benders_max_time(30.0),
         mip_benders_cut_hygiene(false),
-        mip_benders_dual_bound(false) {};
+        mip_benders_dual_bound(false),
+        mip_heuristic_polish(true),
+        mip_heuristic_polish_passes(2),
+        mip_heuristic_polish_maxpairs(5000) {};
   // clang-format on
 };
 
@@ -1504,6 +1510,27 @@ class HighsOptions : public HighsOptionsStruct {
         "the incumbent; off by default)",
         advanced, &mip_benders_dual_bound, false);
     records.push_back(record_bool);
+
+    record_bool = new OptionRecordBool(
+        "mip_heuristic_polish",
+        "Whether verified incumbents are LP-free polished by unit "
+        "single/pair integer shifts before recording (original always "
+        "submitted first; polished additionally if strictly better)",
+        advanced, &mip_heuristic_polish, true);
+    records.push_back(record_bool);
+
+    record_int = new OptionRecordInt(
+        "mip_heuristic_polish_passes",
+        "Max single-shift improvement passes of incumbent polishing",
+        advanced, &mip_heuristic_polish_passes, 1, 2, 100);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_heuristic_polish_maxpairs",
+        "Max row-sharing integer pairs examined per pair-shift sweep "
+        "of incumbent polishing",
+        advanced, &mip_heuristic_polish_maxpairs, 0, 5000, kHighsIInf);
+    records.push_back(record_int);
 
     record_bool = new OptionRecordBool(
         "mip_lagrangian",
