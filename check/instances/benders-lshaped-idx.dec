@@ -1,0 +1,3 @@
+# Benders annotation for benders-lshaped.lp: the five binary coupling
+# columns by original-model index (exercises the index path).
+COUPLING: 0 21 42 63 84

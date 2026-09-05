@@ -38,7 +38,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cctype>
+#include <fstream>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -68,6 +73,41 @@ struct DsU {
   }
 };
 
+// Row adjacency over non-skipped columns (shared by auto-detection and
+// the .dec annotation path): rowStart/rowCols list, per row, the kept
+// columns touching it.
+static void buildRowAdjacency(const HighsLp& model,
+                              const std::vector<char>& skip,
+                              std::vector<HighsInt>& rowStart,
+                              std::vector<HighsInt>& rowCols) {
+  const HighsInt numCol = model.num_col_;
+  const HighsInt numRow = model.num_row_;
+  rowStart.assign(numRow + 1, 0);
+  {
+    std::vector<HighsInt> cnt(numRow, 0);
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (skip[c]) continue;
+      for (HighsInt el = model.a_matrix_.start_[c];
+           el != model.a_matrix_.start_[c + 1]; ++el)
+        ++cnt[model.a_matrix_.index_[el]];
+    }
+    for (HighsInt r = 0; r != numRow; ++r)
+      rowStart[r + 1] = rowStart[r] + cnt[r];
+  }
+  rowCols.assign(rowStart[numRow], -1);
+  {
+    std::vector<HighsInt> fill(numRow, 0);
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (skip[c]) continue;
+      for (HighsInt el = model.a_matrix_.start_[c];
+           el != model.a_matrix_.start_[c + 1]; ++el) {
+        HighsInt r = model.a_matrix_.index_[el];
+        rowCols[rowStart[r] + fill[r]++] = c;
+      }
+    }
+  }
+}
+
 }  // namespace
 
 // Shared presolve-off simplex LP solve (also used by Lagrangian
@@ -95,9 +135,262 @@ HighsMipSolverData::HighsSubLpResult HighsMipSolverData::solveSubLp(
   return res;
 }
 
+// Annotation file format (mip_benders_dec_file), SCIP-.dec-inspired but
+// HiGHS-local (clean-room): '#' comments, case-insensitive keywords,
+//   COUPLING: <tokens...>
+//   BLOCK: <tokens...>   (optional, repeatable)
+// Tokens are original-model column indices (integers) or presolved
+// column names. Fixed columns in either section are dropped silently
+// (constants need no separator); anything unresolvable aborts the file
+// and auto-detection runs instead. Without BLOCK lines the remainder is
+// auto-partitioned; with BLOCK lines they must cover every unfixed
+// non-separator column exactly once.
+bool HighsMipSolverData::tryBendersDecFile(
+    const HighsLp& model, HighsBendersCandidate& cand) const {
+  cand = HighsBendersCandidate();
+  const std::string& path = mipsolver.options_mip_->mip_benders_dec_file;
+  if (path.empty() || path == kHighsFilenameDefault) return false;
+  const bool logBend = mipsolver.options_mip_->mip_decomposition_logging;
+  const HighsLogOptions& logOptions = mipsolver.options_mip_->log_options;
+  auto fail = [&](const std::string& why) -> bool {
+    cand = HighsBendersCandidate();
+    cand.reason = "dec " + why;
+    if (logBend)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[Benders] dec file ignored (%s) -> auto-detect\n",
+                   why.c_str());
+    return false;
+  };
+  if (model.a_matrix_.format_ != MatrixFormat::kColwise)
+    return fail("matrix not colwise");
+  const HighsInt numCol = model.num_col_;
+  const HighsInt numRow = model.num_row_;
+  if (numCol <= 0 || numRow <= 0) return fail("empty model");
+  std::ifstream file(path);
+  if (!file.is_open()) return fail("unreadable");
+  std::vector<std::string> couplingTok;
+  std::vector<std::vector<std::string>> blockToks;
+  std::string line;
+  while (std::getline(file, line)) {
+    const size_t hash = line.find('#');
+    if (hash != std::string::npos) line.erase(hash);
+    std::istringstream ls(line);
+    std::string kw;
+    if (!(ls >> kw)) continue;
+    for (char& ch : kw) ch = (char)std::toupper((unsigned char)ch);
+    if (!kw.empty() && kw.back() == ':') kw.pop_back();
+    std::vector<std::string> toks;
+    std::string tok;
+    while (ls >> tok) toks.push_back(tok);
+    if (kw == "COUPLING") {
+      if (!couplingTok.empty()) return fail("duplicate COUPLING");
+      couplingTok = std::move(toks);
+    } else if (kw == "BLOCK") {
+      if (toks.empty()) return fail("empty BLOCK");
+      blockToks.push_back(std::move(toks));
+    } else {
+      return fail("unknown keyword '" + kw + "'");
+    }
+  }
+  if (couplingTok.empty()) return fail("no COUPLING");
+  // Original->presolved inverse map via the postsolve stack (always
+  // initialized by presolve before this hook runs, same reliance as the
+  // Lagrangian postsolve). Original size comes authoritatively from the
+  // original model.
+  const HighsLp* origLp = mipsolver.orig_model_;
+  if (origLp == nullptr || origLp->num_col_ <= 0) return fail("no orig model");
+  const HighsInt origNumCol = origLp->num_col_;
+  std::vector<HighsInt> origToPres(origNumCol, -1);
+  for (HighsInt c = 0; c != numCol; ++c) {
+    const HighsInt o = postSolveStack.getOrigColIndex(c);
+    if (o >= 0 && o < origNumCol) origToPres[o] = c;
+  }
+  // Presolved-name map (unique names only).
+  std::unordered_map<std::string, HighsInt> nameToCol;
+  std::unordered_map<std::string, HighsInt> nameCount;
+  if ((HighsInt)model.col_names_.size() == numCol) {
+    for (HighsInt c = 0; c != numCol; ++c) {
+      nameToCol[model.col_names_[c]] = c;
+      ++nameCount[model.col_names_[c]];
+    }
+  }
+  const HighsLp* orig = origLp;
+  // Resolve one token to a presolved column. Returns false on hard
+  // failure; droppedFixed reports a presolve-removed fixed column.
+  auto resolve = [&](const std::string& tok, HighsInt& presCol,
+                     bool& droppedFixed) -> bool {
+    droppedFixed = false;
+    bool isInt = !tok.empty() && (std::isdigit((unsigned char)tok[0]) ||
+                                  tok[0] == '-' || tok[0] == '+');
+    for (size_t i = 1; isInt && i < tok.size(); ++i)
+      if (!std::isdigit((unsigned char)tok[i])) isInt = false;
+    if (isInt) {
+      const long o = std::strtol(tok.c_str(), nullptr, 10);
+      if (o < 0 || o >= origNumCol) return false;
+      const HighsInt p = origToPres[(HighsInt)o];
+      if (p < 0) {
+        // Removed by presolve: acceptable only if fixed originally.
+        if (orig == nullptr ||
+            (HighsInt)orig->col_lower_.size() <= (HighsInt)o)
+          return false;
+        if (orig->col_lower_[o] != orig->col_upper_[o]) return false;
+        droppedFixed = true;
+        return true;
+      }
+      presCol = p;
+      return true;
+    }
+    const auto itc = nameCount.find(tok);
+    if (itc == nameCount.end() || itc->second != 1) return false;
+    presCol = nameToCol[tok];
+    return true;
+  };
+  std::vector<char> colFixed(numCol, 0);
+  for (HighsInt c = 0; c != numCol; ++c) {
+    if (model.col_lower_[c] == model.col_upper_[c]) {
+      if (!std::isfinite(model.col_lower_[c])) return fail("degenerate");
+      colFixed[c] = 1;
+    }
+  }
+  std::vector<char> inS(numCol, 0);
+  for (const std::string& tok : couplingTok) {
+    HighsInt p = -1;
+    bool dropped = false;
+    if (!resolve(tok, p, dropped))
+      return fail("bad COUPLING token '" + tok + "'");
+    if (dropped || colFixed[p]) continue;
+    inS[p] = 1;
+  }
+  HighsInt numS = 0;
+  for (HighsInt c = 0; c != numCol; ++c) numS += inS[c] ? 1 : 0;
+  if (numS == 0) return fail("empty separator");
+  const HighsInt maxCoupling = std::max<HighsInt>(
+      1, mipsolver.options_mip_->mip_benders_max_coupling_cols);
+  if (numS > maxCoupling) return fail("coupling budget");
+  std::vector<std::vector<HighsInt>> pieces;
+  if (!blockToks.empty()) {
+    std::vector<char> used(numCol, 0);
+    for (const auto& bt : blockToks) {
+      pieces.emplace_back();
+      for (const std::string& tok : bt) {
+        HighsInt p = -1;
+        bool dropped = false;
+        if (!resolve(tok, p, dropped))
+          return fail("bad BLOCK token '" + tok + "'");
+        if (dropped || colFixed[p]) continue;
+        if (inS[p] || used[p]) return fail("BLOCK overlap");
+        used[p] = 1;
+        pieces.back().push_back(p);
+      }
+      if (pieces.back().empty()) return fail("empty BLOCK after mapping");
+    }
+    // Explicit blocks must cover every unfixed non-separator column.
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (!colFixed[c] && !inS[c] && !used[c])
+        return fail("BLOCK lists incomplete");
+    }
+  } else {
+    // Auto-partition the remainder (same DSU piece step as detection).
+    std::vector<HighsInt> rowStart, rowCols;
+    buildRowAdjacency(model, colFixed, rowStart, rowCols);
+    DsU dsu(numCol);
+    for (HighsInt r = 0; r != numRow; ++r) {
+      HighsInt first = -1;
+      for (HighsInt e = rowStart[r]; e != rowStart[r + 1]; ++e) {
+        HighsInt c = rowCols[e];
+        if (inS[c]) continue;
+        if (first < 0)
+          first = c;
+        else
+          dsu.unite(first, c);
+      }
+    }
+    std::vector<HighsInt> rootToPiece(numCol, -1);
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (colFixed[c] || inS[c]) continue;
+      HighsInt root = dsu.find(c);
+      if (rootToPiece[root] < 0) {
+        rootToPiece[root] = (HighsInt)pieces.size();
+        pieces.emplace_back();
+      }
+      pieces[rootToPiece[root]].push_back(c);
+    }
+  }
+  if ((HighsInt)pieces.size() < 2) return fail("fewer than two blocks");
+  // Block kinds: same rule as auto-detection (LP blocks give exact dual
+  // cuts; discrete blocks need integer-subproblem support).
+  const bool allowMipBlocks =
+      mipsolver.options_mip_->mip_benders_integer_subproblems;
+  cand.blockIsLp.assign(pieces.size(), 1);
+  for (size_t i = 0; i != pieces.size(); ++i) {
+    for (HighsInt c : pieces[i]) {
+      if (model.integrality_[c] != HighsVarType::kContinuous) {
+        if (!allowMipBlocks) return fail("integer blocks unsupported");
+        cand.blockIsLp[i] = 0;
+        break;
+      }
+    }
+  }
+  // Row assignment with the defensive span-check (same as detection: a
+  // row touching two blocks invalidates the annotation).
+  std::vector<HighsInt> rowStart, rowCols;
+  buildRowAdjacency(model, colFixed, rowStart, rowCols);
+  std::vector<HighsInt> blockOf(numCol, -1);
+  for (size_t k = 0; k != pieces.size(); ++k)
+    for (HighsInt c : pieces[k]) blockOf[c] = (HighsInt)k;
+  for (HighsInt c = 0; c != numCol; ++c)
+    if (inS[c]) cand.couplingCols.push_back(c);
+  cand.blockCols = pieces;
+  cand.blockRows.assign(pieces.size(), {});
+  std::vector<HighsInt> seenBlock;
+  seenBlock.reserve(8);
+  for (HighsInt r = 0; r != numRow; ++r) {
+    seenBlock.clear();
+    for (HighsInt e = rowStart[r]; e != rowStart[r + 1]; ++e) {
+      HighsInt c = rowCols[e];
+      if (inS[c]) continue;
+      HighsInt b = blockOf[c];
+      if (b < 0) {
+        // Unfixed column in no block: only possible with explicit
+        // BLOCK lists, already checked complete above; defensive abort.
+        cand = HighsBendersCandidate();
+        cand.reason = "dec orphan column";
+        return false;
+      }
+      if (std::find(seenBlock.begin(), seenBlock.end(), b) ==
+          seenBlock.end())
+        seenBlock.push_back(b);
+    }
+    if (seenBlock.empty()) {
+      cand.masterRows.push_back(r);
+    } else if (seenBlock.size() == 1) {
+      cand.blockRows[seenBlock[0]].push_back(r);
+    } else {
+      cand = HighsBendersCandidate();
+      cand.reason = "dec row spans two blocks";
+      if (logBend)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[Benders] dec file row %d spans blocks -> auto-detect\n",
+                     (int)r);
+      return false;
+    }
+  }
+  cand.valid = true;
+  cand.reason = "dec file";
+  if (logBend)
+    highsLogUser(logOptions, HighsLogType::kInfo,
+                 "[Benders] candidate from dec file: %d coupling cols, %d "
+                 "blocks\n",
+                 (int)cand.couplingCols.size(), (int)cand.blockCols.size());
+  return true;
+}
+
 bool HighsMipSolverData::findBendersSeparator(
     const HighsLp& model, HighsBendersCandidate& cand) const {
   cand = HighsBendersCandidate();
+  // Explicit user annotation first (falls back to auto-detection on any
+  // failure); explicit structure wins when valid.
+  if (tryBendersDecFile(model, cand)) return true;
   const HighsInt numCol = model.num_col_;
   const HighsInt numRow = model.num_row_;
   if (numCol < 100) {
@@ -129,30 +422,9 @@ bool HighsMipSolverData::findBendersSeparator(
 
   // Row adjacency over unfixed columns (built once; separator columns
   // are skipped during the scans).
-  std::vector<HighsInt> rowStart(numRow + 1, 0);
-  {
-    std::vector<HighsInt> cnt(numRow, 0);
-    for (HighsInt c = 0; c != numCol; ++c) {
-      if (colFixed[c]) continue;
-      for (HighsInt el = model.a_matrix_.start_[c];
-           el != model.a_matrix_.start_[c + 1]; ++el)
-        ++cnt[model.a_matrix_.index_[el]];
-    }
-    for (HighsInt r = 0; r != numRow; ++r)
-      rowStart[r + 1] = rowStart[r] + cnt[r];
-  }
-  std::vector<HighsInt> rowCols(rowStart[numRow], -1);
-  {
-    std::vector<HighsInt> fill(numRow, 0);
-    for (HighsInt c = 0; c != numCol; ++c) {
-      if (colFixed[c]) continue;
-      for (HighsInt el = model.a_matrix_.start_[c];
-           el != model.a_matrix_.start_[c + 1]; ++el) {
-        HighsInt r = model.a_matrix_.index_[el];
-        rowCols[rowStart[r] + fill[r]++] = c;
-      }
-    }
-  }
+  std::vector<HighsInt> rowStart;
+  std::vector<HighsInt> rowCols;
+  buildRowAdjacency(model, colFixed, rowStart, rowCols);
 
   // Separator search: repeatedly split the largest remaining piece with
   // the best verified single-column cut. A cut is only accepted if no row

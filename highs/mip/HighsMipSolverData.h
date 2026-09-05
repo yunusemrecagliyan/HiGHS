@@ -296,6 +296,12 @@ struct HighsMipSolverData {
   };
   bool findBendersSeparator(const HighsLp& model,
                             HighsBendersCandidate& cand) const;
+  // User annotation override (mip_benders_dec_file): COUPLING/BLOCK lines
+  // by original-model index or name, mapped to presolved space via the
+  // postsolve stack. Validated strictly (span-check); any failure falls
+  // back to auto-detection. Returns true iff cand was built from file.
+  bool tryBendersDecFile(const HighsLp& model,
+                         HighsBendersCandidate& cand) const;
   bool runBenders();
   bool verifyBendersSolution(const HighsLp& model,
                              const std::vector<double>& sol) const;

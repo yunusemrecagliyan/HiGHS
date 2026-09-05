@@ -543,6 +543,7 @@ struct HighsOptionsStruct {
   bool mip_benders_lshaped;
   HighsInt mip_benders_stall_limit;
   bool mip_benders_incumbent;
+  std::string mip_benders_dec_file;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -733,7 +734,8 @@ struct HighsOptionsStruct {
         mip_benders_feas_aux(true),
         mip_benders_lshaped(true),
         mip_benders_stall_limit(10),
-        mip_benders_incumbent(true) {};
+        mip_benders_incumbent(true),
+        mip_benders_dec_file(kHighsFilenameDefault) {};
   // clang-format on
 };
 
@@ -1443,6 +1445,15 @@ class HighsOptions : public HighsOptionsStruct {
         "(verified in original space; dropped on any doubt)",
         advanced, &mip_benders_incumbent, true);
     records.push_back(record_bool);
+
+    record_string = new OptionRecordString(
+        "mip_benders_dec_file",
+        "Path to a Benders annotation file listing coupling columns "
+        "(COUPLING:) and optionally blocks (BLOCK:) by original-model "
+        "index or name; overrides auto-detection when valid, ignored "
+        "otherwise (empty disables)",
+        advanced, &mip_benders_dec_file, kHighsFilenameDefault);
+    records.push_back(record_string);
 
     record_bool = new OptionRecordBool(
         "mip_lagrangian",

@@ -1,0 +1,2 @@
+# Invalid annotation: unresolvable tokens must fall back to auto-detect.
+COUPLING: 99999 nosuchcol

@@ -2088,6 +2088,42 @@ TEST_CASE("MIP-benders-rescue", "[highs_test_mip_solver]") {
   }
 }
 
+TEST_CASE("MIP-benders-dec", "[highs_test_mip_solver]") {
+  // Annotation override: name-based and index-based .dec files drive
+  // Benders to the proven optimum; garbage and unreadable files fall
+  // back safely. All configurations agree exactly with Benders off.
+  std::string filename =
+      std::string(HIGHS_DIR) + "/check/instances/benders-lshaped.lp";
+  std::string decNames =
+      std::string(HIGHS_DIR) + "/check/instances/benders-lshaped.dec";
+  std::string decIdx =
+      std::string(HIGHS_DIR) + "/check/instances/benders-lshaped-idx.dec";
+  std::string decBad =
+      std::string(HIGHS_DIR) + "/check/instances/benders-bad.dec";
+  std::vector<std::string> decFiles = {decNames, decIdx, decBad,
+                                       "/nonexistent.dec", ""};
+  double reference = kHighsInf;
+  for (HighsInt cfg = 0; cfg != 6; ++cfg) {
+    Highs highs;
+    highs.setOptionValue("output_flag", dev_run);
+    highs.setOptionValue("mip_rel_gap", 0);
+    highs.setOptionValue("mip_abs_gap", 0);
+    highs.setOptionValue("mip_benders", cfg != 5);
+    if (cfg < 5) highs.setOptionValue("mip_benders_dec_file", decFiles[cfg]);
+    highs.setOptionValue("presolve_rule_off", (HighsInt)1048512);
+    highs.readModel(filename);
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+    double objective = highs.getInfo().objective_function_value;
+    REQUIRE(std::isfinite(objective));
+    if (cfg == 0)
+      reference = objective;
+    else
+      REQUIRE(objective == reference);
+    highs.resetGlobalScheduler(true);
+  }
+}
+
 TEST_CASE("MIP-decomposition-zero-objective", "[highs_test_mip_solver]") {
   // Zero objective: every feasible point is optimal; decomposition must
   // still agree with the fallback path (objective 0).
