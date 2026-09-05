@@ -770,6 +770,14 @@ bool HighsMipSolverData::runBenders() {
   bool hasBest = false;
   HighsInt numIter = 0;
   bool converged = false;
+  // Stall discipline (SCIP stalllimit-style): the master lower bound is
+  // monotone (cuts only accumulate), so iterations without LB progress
+  // learn nothing new and only burn subproblem solves. This only stops
+  // the loop EARLIER than max_iterations; cut/fixing logic is unchanged.
+  double bestLB = -kHighsInf;
+  HighsInt lbStall = 0;
+  const HighsInt stallLimit = std::max<HighsInt>(
+      1, mipsolver.options_mip_->mip_benders_stall_limit);
 
   std::vector<double> y(nY, 0.0);
   const HighsInt nMasterCol = nY + nB;
@@ -923,6 +931,19 @@ bool HighsMipSolverData::runBenders() {
     const double gapTol = 1e-7 * std::max(1.0, std::fabs(UB));
     if (hasBest && UB - LB <= gapTol) {
       converged = true;
+      break;
+    }
+    // Stall check: count consecutive iterations without LB improvement.
+    const double lbTol = 1e-9 * std::max(1.0, std::fabs(LB));
+    if (LB > bestLB + lbTol) {
+      bestLB = LB;
+      lbStall = 0;
+    } else if (++lbStall >= stallLimit) {
+      if (logBend)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[Benders] lower bound stalled for %d iters -> "
+                     "normal MIP\n",
+                     (int)lbStall);
       break;
     }
     // ---- subproblems ----

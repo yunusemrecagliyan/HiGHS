@@ -541,6 +541,7 @@ struct HighsOptionsStruct {
   HighsInt mip_benders_min_block_cols;
   bool mip_benders_feas_aux;
   bool mip_benders_lshaped;
+  HighsInt mip_benders_stall_limit;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -729,7 +730,8 @@ struct HighsOptionsStruct {
         mip_benders_max_coupling_cols(16),
         mip_benders_min_block_cols(10),
         mip_benders_feas_aux(true),
-        mip_benders_lshaped(true) {};
+        mip_benders_lshaped(true),
+        mip_benders_stall_limit(10) {};
   // clang-format on
 };
 
@@ -1423,6 +1425,14 @@ class HighsOptions : public HighsOptionsStruct {
         "convergence on binary coupling; skipped on any doubt)",
         advanced, &mip_benders_lshaped, true);
     records.push_back(record_bool);
+
+    record_int = new OptionRecordInt(
+        "mip_benders_stall_limit",
+        "Max consecutive Benders iterations without master lower-bound "
+        "progress before the loop stops and falls back to normal MIP "
+        "(only stops earlier than mip_benders_max_iterations)",
+        advanced, &mip_benders_stall_limit, 1, 10, kHighsIInf);
+    records.push_back(record_int);
 
     record_bool = new OptionRecordBool(
         "mip_lagrangian",
