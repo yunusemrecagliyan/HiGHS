@@ -532,6 +532,10 @@ struct HighsOptionsStruct {
   bool mip_decomposition_logging;
   bool mip_benders;
   bool mip_benders_integer_subproblems;
+  bool mip_lagrangian;
+  HighsInt mip_lagrangian_max_iterations;
+  HighsInt mip_lagrangian_max_coupling_rows;
+  double mip_lagrangian_max_time;
   HighsInt mip_benders_max_iterations;
   HighsInt mip_benders_max_coupling_cols;
   HighsInt mip_benders_min_block_cols;
@@ -715,6 +719,10 @@ struct HighsOptionsStruct {
         mip_decomposition_logging(false),
         mip_benders(true),
         mip_benders_integer_subproblems(true),
+        mip_lagrangian(true),
+        mip_lagrangian_max_iterations(30),
+        mip_lagrangian_max_coupling_rows(16),
+        mip_lagrangian_max_time(5.0),
         mip_benders_max_iterations(100),
         mip_benders_max_coupling_cols(16),
         mip_benders_min_block_cols(10) {};
@@ -1395,6 +1403,32 @@ class HighsOptions : public HighsOptionsStruct {
         "into the master problem",
         advanced, &mip_benders_min_block_cols, 1, 10, kHighsIInf);
     records.push_back(record_int);
+
+    record_bool = new OptionRecordBool(
+        "mip_lagrangian",
+        "Whether Lagrangian decomposition is attempted on models with a "
+        "small coupling-row separator (dual bounds plus verified MIP-start "
+        "incumbents; never fixes variables; falls back on any doubt)",
+        advanced, &mip_lagrangian, true);
+    records.push_back(record_bool);
+
+    record_int = new OptionRecordInt(
+        "mip_lagrangian_max_iterations",
+        "Max subgradient iterations of Lagrangian decomposition",
+        advanced, &mip_lagrangian_max_iterations, 1, 30, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_lagrangian_max_coupling_rows",
+        "Max coupling rows of a Lagrangian decomposition candidate",
+        advanced, &mip_lagrangian_max_coupling_rows, 1, 16, kHighsIInf);
+    records.push_back(record_int);
+
+    record_double = new OptionRecordDouble(
+        "mip_lagrangian_max_time",
+        "Max seconds spent in the Lagrangian subgradient loop",
+        advanced, &mip_lagrangian_max_time, 0.0, 5.0, kHighsInf);
+    records.push_back(record_double);
 
     record_double = new OptionRecordDouble(
         "mip_rel_gap",

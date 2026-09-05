@@ -62,17 +62,13 @@ struct DsU {
   }
 };
 
-// Outcome of one subproblem LP solve (presolve off, simplex).
-struct SubLpResult {
-  HighsModelStatus status = HighsModelStatus::kNotset;
-  std::vector<double> colSol;
-  std::vector<double> rowDual;
-  double obj = kHighsInf;
-  bool dualValid = false;
-};
+}  // namespace
 
-SubLpResult solveSubLp(const HighsLp& sublp, double timeLimit) {
-  SubLpResult res;
+// Shared presolve-off simplex LP solve (also used by Lagrangian
+// subproblems); declared on HighsMipSolverData for cross-TU use.
+HighsMipSolverData::HighsSubLpResult HighsMipSolverData::solveSubLp(
+    const HighsLp& sublp, double timeLimit) {
+  HighsSubLpResult res;
   Highs lpsolver;
   lpsolver.setOptionValue("output_flag", false);
   // No presolve: duals/rays must refer to exactly the passed submodel.
@@ -92,8 +88,6 @@ SubLpResult solveSubLp(const HighsLp& sublp, double timeLimit) {
   }
   return res;
 }
-
-}  // namespace
 
 bool HighsMipSolverData::findBendersSeparator(
     const HighsLp& model, HighsBendersCandidate& cand) const {
@@ -219,45 +213,6 @@ bool HighsMipSolverData::findBendersSeparator(
       if (s >= minBlock) ++nontrivial;
     return nontrivial;
   };
-  // Verified split quality: -1 if some row still spans the resulting
-  // pieces, else the nontrivial-piece count.
-  auto verifiedSplit = [&](HighsInt excl) -> HighsInt {
-    DsU dsu(numCol);
-    for (HighsInt r = 0; r != numRow; ++r) {
-      HighsInt first = -1;
-      for (HighsInt e = rowStart[r]; e != rowStart[r + 1]; ++e) {
-        HighsInt c = rowCols[e];
-        if (c == excl || inS[c]) continue;
-        if (first < 0)
-          first = c;
-        else
-          dsu.unite(first, c);
-      }
-    }
-    std::vector<HighsInt> sizes(numCol, 0);
-    for (HighsInt c = 0; c != numCol; ++c) {
-      if (c == excl || colFixed[c] || inS[c]) continue;
-      ++sizes[dsu.find(c)];
-    }
-    std::vector<HighsInt> seen;
-    seen.reserve(8);
-    for (HighsInt r = 0; r != numRow; ++r) {
-      seen.clear();
-      for (HighsInt e = rowStart[r]; e != rowStart[r + 1]; ++e) {
-        HighsInt c = rowCols[e];
-        if (c == excl || inS[c]) continue;
-        HighsInt root = dsu.find(c);
-        if (std::find(seen.begin(), seen.end(), root) == seen.end()) {
-          seen.push_back(root);
-          if (seen.size() > 1) return -1;
-        }
-      }
-    }
-    HighsInt nontrivial = 0;
-    for (HighsInt s : sizes)
-      if (s >= minBlock) ++nontrivial;
-    return nontrivial;
-  };
   std::vector<std::vector<HighsInt>> searchPieces;
   for (;;) {
     computePieces(searchPieces);
@@ -296,16 +251,18 @@ bool HighsMipSolverData::findBendersSeparator(
         }
       }
     }
-    // Accept the first verified strict improvement, or a purification
-    // move: a discrete column whose removal keeps the piece count but
-    // takes discretes out of blocks (the master handles them exactly;
-    // leaving them would force weaker MIP blocks). Continuous
-    // non-improving moves stay rejected. S strictly grows, so this
-    // terminates at the coupling budget.
+    // Accept the first strict improvement, or a purification move: a
+    // discrete column whose removal keeps the piece count but takes
+    // discretes out of blocks (the master handles them exactly; leaving
+    // them would force weaker MIP blocks). Continuous non-improving
+    // moves stay rejected. S strictly grows, so this terminates at the
+    // coupling budget. (Every remaining row touches exactly one DSU
+    // piece by construction, so counting pieces is already a sound
+    // separator test; the row assignment below re-verifies defensively.)
     bool accepted = false;
     for (HighsInt t = 0; t != 3; ++t) {
       if (topC[t] < 0) break;
-      const HighsInt q = verifiedSplit(topC[t]);
+      const HighsInt q = splitCount(topC[t]);
       const bool discrete =
           model.integrality_[topC[t]] != HighsVarType::kContinuous;
       if (q >= 2 &&
@@ -1039,7 +996,8 @@ bool HighsMipSolverData::runBenders() {
       }
       double remaining =
           mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
-      SubLpResult res = solveSubLp(sublp, std::min(10.0, remaining));
+      HighsSubLpResult res =
+          solveSubLp(sublp, std::min(10.0, remaining));
       if (res.status == HighsModelStatus::kOptimal) {
         if (!res.dualValid ||
             (HighsInt)res.colSol.size() != nbC ||

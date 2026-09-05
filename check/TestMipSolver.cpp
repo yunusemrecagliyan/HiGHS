@@ -1972,3 +1972,111 @@ TEST_CASE("MIP-decomposition-unbounded", "[highs_test_mip_solver]") {
     highs.resetGlobalScheduler(true);
   }
 }
+
+// Lagrangian decomposition: two continuous LP blocks (above the exact
+// subsolve caps so components leaves them) joined by one coupling row,
+// plus a tiny integer side block to force the MIP path. Requires
+// optimality plus on/off agreement; the Lagrangian loop itself is
+// exercised (separator + subgradient + optional injection) while the
+// parent MIP always proves.
+static HighsLp lagrangianTwoBlocks(double couplingCap) {
+  const HighsInt nb = 80;
+  HighsLp lp;
+  lp.num_col_ = 2 * nb + 10;
+  lp.num_row_ = 2 * 3 + 1 + 1;
+  lp.sense_ = ObjSense::kMinimize;
+  lp.col_cost_.resize(lp.num_col_);
+  lp.col_lower_.assign(lp.num_col_, 0.0);
+  lp.col_upper_.assign(lp.num_col_, 10.0);
+  lp.integrality_.assign(lp.num_col_, HighsVarType::kContinuous);
+  lp.row_lower_.resize(lp.num_row_);
+  lp.row_upper_.resize(lp.num_row_);
+  for (HighsInt b = 0; b < 2; ++b) {
+    lp.row_lower_[3 * b + 0] = -kHighsInf;
+    lp.row_upper_[3 * b + 0] = 350.0;
+    lp.row_lower_[3 * b + 1] = 460.0;
+    lp.row_upper_[3 * b + 1] = kHighsInf;
+    lp.row_lower_[3 * b + 2] = 0.0;
+    lp.row_upper_[3 * b + 2] = 0.0;
+  }
+  lp.row_lower_[6] = -kHighsInf;  // coupling row over 5+5 vars
+  lp.row_upper_[6] = couplingCap;
+  lp.row_lower_[7] = -kHighsInf;  // integer side block knapsack
+  lp.row_upper_[7] = 5.0;
+  lp.a_matrix_.format_ = MatrixFormat::kColwise;
+  lp.a_matrix_.start_.resize(lp.num_col_ + 1);
+  for (HighsInt b = 0; b < 2; ++b) {
+    for (HighsInt i = 0; i < nb; ++i) {
+      HighsInt c = b * nb + i;
+      lp.col_cost_[c] = double((i % 7) - 3);
+      lp.a_matrix_.start_[c + 1] = (HighsInt)lp.a_matrix_.index_.size() + 3;
+      lp.a_matrix_.index_.push_back(3 * b + 0);
+      lp.a_matrix_.value_.push_back(1.0);
+      lp.a_matrix_.index_.push_back(3 * b + 1);
+      lp.a_matrix_.value_.push_back(double((i % 5) + 1));
+      lp.a_matrix_.index_.push_back(3 * b + 2);
+      lp.a_matrix_.value_.push_back(i < nb / 2 ? 1.0 : -1.0);
+      if (i < 5) {
+        lp.a_matrix_.index_.push_back(6);
+        lp.a_matrix_.value_.push_back(1.0);
+        lp.a_matrix_.start_[c + 1]++;
+      }
+    }
+  }
+  for (HighsInt i = 0; i < 10; ++i) {
+    HighsInt c = 2 * nb + i;
+    lp.col_cost_[c] = -double(i + 1);
+    lp.col_upper_[c] = 1.0;
+    lp.integrality_[c] = HighsVarType::kInteger;
+    lp.a_matrix_.start_[c + 1] = (HighsInt)lp.a_matrix_.index_.size() + 1;
+    lp.a_matrix_.index_.push_back(7);
+    lp.a_matrix_.value_.push_back(1.0);
+  }
+  return lp;
+}
+
+TEST_CASE("MIP-lagrangian-binding", "[highs_test_mip_solver]") {
+  // Tight coupling row (binds at block optima): the Lagrangian loop
+  // must run without changing the proven optimum.
+  double objective_on = kHighsInf;
+  for (bool lagrangian : {true, false}) {
+    Highs highs;
+    highs.setOptionValue("output_flag", dev_run);
+    highs.setOptionValue("mip_rel_gap", 0);
+    highs.setOptionValue("mip_abs_gap", 0);
+    highs.setOptionValue("mip_lagrangian", lagrangian);
+    highs.passModel(lagrangianTwoBlocks(60.0));
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+    double objective = highs.getInfo().objective_function_value;
+    REQUIRE(std::isfinite(objective));
+    if (lagrangian)
+      objective_on = objective;
+    else
+      REQUIRE(objective == objective_on);
+    highs.resetGlobalScheduler(true);
+  }
+}
+
+TEST_CASE("MIP-lagrangian-loose", "[highs_test_mip_solver]") {
+  // Loose coupling row: block optima satisfy it, so the loop converges
+  // immediately and may inject the composition as incumbent.
+  double objective_on = kHighsInf;
+  for (bool lagrangian : {true, false}) {
+    Highs highs;
+    highs.setOptionValue("output_flag", dev_run);
+    highs.setOptionValue("mip_rel_gap", 0);
+    highs.setOptionValue("mip_abs_gap", 0);
+    highs.setOptionValue("mip_lagrangian", lagrangian);
+    highs.passModel(lagrangianTwoBlocks(95.0));
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+    double objective = highs.getInfo().objective_function_value;
+    REQUIRE(std::isfinite(objective));
+    if (lagrangian)
+      objective_on = objective;
+    else
+      REQUIRE(objective == objective_on);
+    highs.resetGlobalScheduler(true);
+  }
+}

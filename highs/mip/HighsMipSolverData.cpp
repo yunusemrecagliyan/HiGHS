@@ -861,6 +861,13 @@ void HighsMipSolverData::runMipPresolve(
       !mipsolver.submip &&
       mipsolver.options_mip_->presolve != kHighsOffString)
     runBenders();
+
+  // Lagrangian decomposition on coupling-row structure: dual bounds
+  // plus verified MIP-start incumbents, never any fixing.
+  if (mipsolver.modelstatus_ == HighsModelStatus::kNotset &&
+      !mipsolver.submip &&
+      mipsolver.options_mip_->presolve != kHighsOffString)
+    runLagrangian();
 }
 
 void HighsMipSolverData::solveComponents() {

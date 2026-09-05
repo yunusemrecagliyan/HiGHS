@@ -373,6 +373,7 @@ set(highs_sources
     lp_data/HighsSolve.cpp
     lp_data/HighsStatus.cpp
     mip/HighsBenders.cpp
+    mip/HighsLagrangian.cpp
     mip/HighsCliqueTable.cpp
     mip/HighsConflictPool.cpp
     mip/HighsCutGeneration.cpp

@@ -299,6 +299,30 @@ struct HighsMipSolverData {
   bool runBenders();
   bool verifyBendersSolution(const HighsLp& model,
                              const std::vector<double>& sol) const;
+  // Outcome of one presolve-off simplex LP solve (shared by Benders and
+  // Lagrangian subproblems so duals/rays refer to the passed submodel).
+  struct HighsSubLpResult {
+    HighsModelStatus status = HighsModelStatus::kNotset;
+    std::vector<double> colSol;
+    std::vector<double> rowDual;
+    double obj = kHighsInf;
+    bool dualValid = false;
+  };
+  static HighsSubLpResult solveSubLp(const HighsLp& sublp, double timeLimit);
+  // Lagrangian decomposition (HighsLagrangian.cpp): row separator whose
+  // removal splits the model; coupling rows are dualized (priced) while
+  // blocks solve independently. Produces dual bounds (logged) and, when
+  // a composed solution is feasible, a verified incumbent injected via
+  // the native MIP-start channel. Never fixes variables.
+  struct HighsLagCandidate {
+    bool valid = false;
+    std::string reason;
+    std::vector<HighsInt> couplingRows;
+    std::vector<std::vector<HighsInt>> blockCols;
+    std::vector<std::vector<HighsInt>> blockRows;
+  };
+  bool findLagSeparator(const HighsLp& model, HighsLagCandidate& cand) const;
+  bool runLagrangian();
   void setupDomainPropagation();
   void saveReportMipSolution(const double new_upper_limit = -kHighsInf);
   void checkAddSolution();
