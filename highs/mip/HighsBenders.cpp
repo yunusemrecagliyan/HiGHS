@@ -1075,75 +1075,81 @@ bool HighsMipSolverData::runBenders() {
           }
         }
         const double dualTol = 1e-6 * std::max(1.0, std::fabs(res.obj));
-        if (!dualOk || std::fabs(dualObj - res.obj) > dualTol) {
-          if (logBend) {
-            highsLogUser(logOptions, HighsLogType::kInfo,
-                         "[Benders] block %d dual tightness failed "
-                         "(dualobj=%.6g primal=%.6g) -> normal MIP\n",
-                         (int)k, dualObj, res.obj);
-            std::string dbg;
-            for (HighsInt i = 0; i != std::min<HighsInt>(12, sublp.num_row_);
-                 ++i) {
-              char buf[160];
-              snprintf(buf, sizeof(buf), " r%d: pi=%.4g [%.4g,%.4g];",
-                       (int)i, pi[i], sublp.row_lower_[i],
-                       sublp.row_upper_[i]);
-              dbg += buf;
-            }
-            highsLogUser(logOptions, HighsLogType::kInfo, "[Benders] dbg%s\n",
-                         dbg.c_str());
-          }
-          return true;
-        }
-        // Optimality cut: theta_k + (pi*C) y >= pi*b(base) + bound terms.
-        BendCut cut;
-        cut.block = k;
-        cut.ay.assign(nY, 0.0);
-        for (HighsInt i = 0; i != nbR; ++i) {
-          if (pi[i] == 0.0) continue;
-          for (const auto& e : blk.coupling[i]) cut.ay[e.first] += pi[i] * e.second;
-        }
-        double rhs = 0.0;
-        bool rhsOk = true;
-        for (HighsInt i = 0; i != nbR; ++i) {
-          if (pi[i] > 0) {
-            if (blk.baseLo[i] == -kHighsInf) {
-              rhsOk = false;
-              break;
-            }
-            rhs += pi[i] * blk.baseLo[i];
-          } else if (pi[i] < 0) {
-            if (blk.baseHi[i] == kHighsInf) {
-              rhsOk = false;
-              break;
-            }
-            rhs += pi[i] * blk.baseHi[i];
-          }
-        }
-        if (!rhsOk) {
+        const double dualLooseTol = 1e-4 * std::max(1.0, std::fabs(res.obj));
+        const double dualErr = std::fabs(dualObj - res.obj);
+        if (!dualOk || dualErr > dualLooseTol) {
+          // Loose failure: systematic convention error, not noise.
+          // Abort rather than risk an invalid cut.
           if (logBend)
             highsLogUser(logOptions, HighsLogType::kInfo,
-                         "[Benders] block %d cut needs infinite bound -> "
-                         "normal MIP\n",
-                         (int)k);
+                         "[Benders] block %d dual mismatch "
+                         "(dualobj=%.6g primal=%.6g) -> normal MIP\n",
+                         (int)k, dualObj, res.obj);
           return true;
         }
-        for (HighsInt i = nbR; i != sublp.num_row_; ++i) {
-          if (pi[i] > 0)
-            rhs += pi[i] * sublp.row_lower_[i];
-          else if (pi[i] < 0)
-            rhs += pi[i] * sublp.row_upper_[i];
-        }
-        // Coefficient hygiene.
-        for (HighsInt i = 0; i != nY; ++i)
-          if (std::fabs(cut.ay[i]) <= 1e-12) cut.ay[i] = 0.0;
-        cut.rhs = rhs;
-        double cutVal = rhs;
-        for (HighsInt i = 0; i != nY; ++i) cutVal -= cut.ay[i] * y[i];
-        const double violTol = cutTol * std::max(1.0, std::fabs(rhs));
-        if (thetaStar[k] < cutVal - violTol) {
-          cuts.push_back(std::move(cut));
-          anyCut = true;
+        // Tight failure within loose tolerance: real-world dual noise
+        // (large unscaled models). Skip only this cut and continue with
+        // the block's primal solution for the upper bound; convergence
+        // (and hence any fixing) still needs the gap to close.
+        const bool cutTrusted = (dualOk && dualErr <= dualTol);
+        if (!cutTrusted && logBend)
+          highsLogUser(logOptions, HighsLogType::kInfo,
+                       "[Benders] block %d dual noisy (err=%.3g), skipping "
+                       "cut\n",
+                       (int)k, dualErr);
+        // Optimality cut: theta_k + (pi*C) y >= pi*b(base) + bound terms.
+        // Built only from trusted duals (see gate above).
+        if (cutTrusted) {
+          BendCut cut;
+          cut.block = k;
+          cut.ay.assign(nY, 0.0);
+          for (HighsInt i = 0; i != nbR; ++i) {
+            if (pi[i] == 0.0) continue;
+            for (const auto& e : blk.coupling[i])
+              cut.ay[e.first] += pi[i] * e.second;
+          }
+          double rhs = 0.0;
+          bool rhsOk = true;
+          for (HighsInt i = 0; i != nbR; ++i) {
+            if (pi[i] > 0) {
+              if (blk.baseLo[i] == -kHighsInf) {
+                rhsOk = false;
+                break;
+              }
+              rhs += pi[i] * blk.baseLo[i];
+            } else if (pi[i] < 0) {
+              if (blk.baseHi[i] == kHighsInf) {
+                rhsOk = false;
+                break;
+              }
+              rhs += pi[i] * blk.baseHi[i];
+            }
+          }
+          if (!rhsOk) {
+            if (logBend)
+              highsLogUser(logOptions, HighsLogType::kInfo,
+                           "[Benders] block %d cut needs infinite bound -> "
+                           "normal MIP\n",
+                           (int)k);
+            return true;
+          }
+          for (HighsInt i = nbR; i != sublp.num_row_; ++i) {
+            if (pi[i] > 0)
+              rhs += pi[i] * sublp.row_lower_[i];
+            else if (pi[i] < 0)
+              rhs += pi[i] * sublp.row_upper_[i];
+          }
+          // Coefficient hygiene.
+          for (HighsInt i = 0; i != nY; ++i)
+            if (std::fabs(cut.ay[i]) <= 1e-12) cut.ay[i] = 0.0;
+          cut.rhs = rhs;
+          double cutVal = rhs;
+          for (HighsInt i = 0; i != nY; ++i) cutVal -= cut.ay[i] * y[i];
+          const double violTol = cutTol * std::max(1.0, std::fabs(rhs));
+          if (thetaStar[k] < cutVal - violTol) {
+            cuts.push_back(std::move(cut));
+            anyCut = true;
+          }
         }
         const bool lpBlock = (bool)cand.blockIsLp[k];
         if (lpBlock) {
