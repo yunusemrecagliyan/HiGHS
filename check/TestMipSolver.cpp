@@ -1742,7 +1742,7 @@ static HighsLp bendersArrowhead(bool maximize) {
     lp.row_upper_[4 * b + 1] = kHighsInf;
     lp.row_lower_[4 * b + 2] = 0.0;  // alternating equality
     lp.row_upper_[4 * b + 2] = 0.0;
-    lp.row_lower_[4 * b + 3] = -kHighsInf;  // difference cap
+    lp.row_lower_[4 * b + 3] = 10.0;  // ranged difference rows
     lp.row_upper_[4 * b + 3] = 50.0;
   }
   for (HighsInt t = 0; t < 3; ++t) {
@@ -1885,4 +1885,90 @@ TEST_CASE("MIP-benders-farkas", "[highs_test_mip_solver]") {
   lp.row_upper_ = {kHighsInf, kHighsInf, 350.0, kHighsInf, kHighsInf,
                    350.0, 300.0, kHighsInf, 0.0, 50.0};
   runBendersOnOff(lp, false, true);
+}
+
+TEST_CASE("MIP-benders-integer-subproblems", "[highs_test_mip_solver]") {
+  // Arrowhead with integer blocks (LP-tight single knapsacks plus a
+  // parity block): exercises LP-relaxation cuts, sub-MIP upper bounds
+  // and the no-good path machinery with on/off agreement. Presolve
+  // rules are switched off by bit mask (bits 6..19 = all allow-off
+  // rules) so the arrowhead structure survives to Benders; the test
+  // pins optimality and agreement, not presolve behavior.
+  std::string filename =
+      std::string(HIGHS_DIR) + "/check/instances/benders-int.lp";
+  double objective_on = kHighsInf;
+  for (bool benders : {true, false}) {
+    Highs highs;
+    highs.setOptionValue("output_flag", dev_run);
+    highs.setOptionValue("mip_rel_gap", 0);
+    highs.setOptionValue("mip_abs_gap", 0);
+    highs.setOptionValue("mip_benders", benders);
+    highs.setOptionValue("presolve_rule_off", (HighsInt)1048512);
+    highs.readModel(filename);
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+    double objective = highs.getInfo().objective_function_value;
+    REQUIRE(std::isfinite(objective));
+    if (benders)
+      objective_on = objective;
+    else
+      REQUIRE(objective == objective_on);
+    highs.resetGlobalScheduler(true);
+  }
+}
+
+TEST_CASE("MIP-decomposition-zero-objective", "[highs_test_mip_solver]") {
+  // Zero objective: every feasible point is optimal; decomposition must
+  // still agree with the fallback path (objective 0).
+  HighsLp lp = decompBlockKnapsack(6, 20, 10);
+  lp.col_cost_.assign(lp.num_col_, 0.0);
+  for (bool decomposition : {true, false}) {
+    Highs highs;
+    highs.setOptionValue("output_flag", dev_run);
+    highs.setOptionValue("mip_decomposition", decomposition);
+    highs.passModel(lp);
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+    REQUIRE(highs.getInfo().objective_function_value == 0.0);
+    highs.resetGlobalScheduler(true);
+  }
+}
+
+TEST_CASE("MIP-decomposition-unbounded", "[highs_test_mip_solver]") {
+  // One unbounded component (free continuous column with cost pushing
+  // to infinity, kept in a row so it is not an isolated column) padded
+  // with 100 isolated binaries: the exact subsolve must skip it and the
+  // parent MIP must report unbounded-or-infeasible (plain HiGHS MIP
+  // semantics without allow_unbounded_or_infeasible) on both paths.
+  HighsLp lp;
+  lp.num_col_ = 101;
+  lp.num_row_ = 1;
+  lp.sense_ = ObjSense::kMinimize;
+  lp.col_cost_.assign(lp.num_col_, 1.0);
+  lp.col_cost_[0] = -1.0;
+  lp.col_lower_.assign(lp.num_col_, 0.0);
+  lp.col_upper_.assign(lp.num_col_, 1.0);
+  lp.col_lower_[0] = -kHighsInf;
+  lp.col_upper_[0] = kHighsInf;
+  lp.integrality_.assign(lp.num_col_, HighsVarType::kInteger);
+  lp.integrality_[0] = HighsVarType::kContinuous;
+  lp.row_lower_ = {0.0};
+  lp.row_upper_ = {kHighsInf};
+  lp.a_matrix_.format_ = MatrixFormat::kColwise;
+  lp.a_matrix_.start_.resize(lp.num_col_ + 1);
+  lp.a_matrix_.start_[0] = 0;
+  lp.a_matrix_.start_[1] = 1;
+  for (HighsInt c = 1; c < lp.num_col_; ++c) lp.a_matrix_.start_[c + 1] = 1;
+  lp.a_matrix_.index_ = {0};
+  lp.a_matrix_.value_ = {1.0};
+  for (bool decomposition : {true, false}) {
+    Highs highs;
+    highs.setOptionValue("output_flag", dev_run);
+    highs.setOptionValue("mip_decomposition", decomposition);
+    highs.passModel(lp);
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() ==
+            HighsModelStatus::kUnboundedOrInfeasible);
+    highs.resetGlobalScheduler(true);
+  }
 }

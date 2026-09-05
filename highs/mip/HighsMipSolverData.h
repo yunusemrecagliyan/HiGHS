@@ -289,6 +289,10 @@ struct HighsMipSolverData {
     std::vector<std::vector<HighsInt>> blockCols;
     std::vector<std::vector<HighsInt>> blockRows;
     std::vector<HighsInt> masterRows;
+    // Per block: true if all columns are continuous (LP subproblem).
+    // Non-LP blocks need integer-subproblem support (LP-relaxation cuts
+    // plus sub-MIP upper bounds); see mip_benders_integer_subproblems.
+    std::vector<char> blockIsLp;
   };
   bool findBendersSeparator(const HighsLp& model,
                             HighsBendersCandidate& cand) const;

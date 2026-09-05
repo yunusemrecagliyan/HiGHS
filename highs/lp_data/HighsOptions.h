@@ -531,6 +531,7 @@ struct HighsOptionsStruct {
   HighsInt mip_decomposition_max_comp_rows;
   bool mip_decomposition_logging;
   bool mip_benders;
+  bool mip_benders_integer_subproblems;
   HighsInt mip_benders_max_iterations;
   HighsInt mip_benders_max_coupling_cols;
   HighsInt mip_benders_min_block_cols;
@@ -713,6 +714,7 @@ struct HighsOptionsStruct {
         mip_decomposition_max_comp_rows(64),
         mip_decomposition_logging(false),
         mip_benders(true),
+        mip_benders_integer_subproblems(true),
         mip_benders_max_iterations(100),
         mip_benders_max_coupling_cols(16),
         mip_benders_min_block_cols(10) {};
@@ -1365,6 +1367,14 @@ class HighsOptions : public HighsOptionsStruct {
         "suitable weakly-coupled models (small coupling set, LP blocks); "
         "falls back to normal MIP on any doubt",
         advanced, &mip_benders, true);
+    records.push_back(record_bool);
+
+    record_bool = new OptionRecordBool(
+        "mip_benders_integer_subproblems",
+        "Whether Benders blocks with discrete columns are supported via "
+        "LP-relaxation cuts, sub-MIP upper bounds and binary no-good cuts "
+        "(strictly weaker convergence; falls back when the gap stalls)",
+        advanced, &mip_benders_integer_subproblems, true);
     records.push_back(record_bool);
 
     record_int = new OptionRecordInt(

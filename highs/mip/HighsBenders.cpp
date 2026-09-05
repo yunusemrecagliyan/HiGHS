@@ -9,11 +9,15 @@
 // implementation of the textbook method; no third-party code).
 //
 // Scope: arrowhead structures with a small column separator S whose
-// removal leaves blocks coupled only through S, where every block is
-// continuous-only so fixed-S subproblems are LPs. The master problem
-// (mixed-integer over S plus one surrogate theta per block) is solved
-// with the in-process exact MIP subsolver; subproblems are LP solves
-// with presolve off so duals/rays refer directly to the passed submodel.
+// removal leaves blocks coupled only through S. LP blocks (all
+// continuous) give exact dual cuts. Blocks with discrete columns are
+// supported via LP-relaxation cuts (valid but weaker), sub-MIP upper
+// bounds and binary no-good cuts; see
+// mip_benders_integer_subproblems. Anything else falls back.
+// The master problem (mixed-integer over S plus one surrogate theta per
+// block) is solved with the in-process exact MIP subsolver; LP
+// subproblems are presolve-off simplex solves so duals/rays refer
+// directly to the passed submodel.
 //
 // Correctness contract (mirrors the components path):
 // - cuts are only added after a tightness/violation gate at the
@@ -292,12 +296,20 @@ bool HighsMipSolverData::findBendersSeparator(
         }
       }
     }
-    // Accept the first verified strict improvement.
+    // Accept the first verified strict improvement, or a purification
+    // move: a discrete column whose removal keeps the piece count but
+    // takes discretes out of blocks (the master handles them exactly;
+    // leaving them would force weaker MIP blocks). Continuous
+    // non-improving moves stay rejected. S strictly grows, so this
+    // terminates at the coupling budget.
     bool accepted = false;
     for (HighsInt t = 0; t != 3; ++t) {
       if (topC[t] < 0) break;
       const HighsInt q = verifiedSplit(topC[t]);
-      if (q >= 2 && q > curCount) {
+      const bool discrete =
+          model.integrality_[topC[t]] != HighsVarType::kContinuous;
+      if (q >= 2 &&
+          (q > curCount || (q == curCount && discrete && curCount >= 2))) {
         inS[topC[t]] = 1;
         ++numS;
         accepted = true;
@@ -312,10 +324,14 @@ bool HighsMipSolverData::findBendersSeparator(
     if (!accepted) break;
   }
 
-  // Finalize the separator to a fixpoint: discrete columns can never sit
-  // in LP blocks, so they join S (the master handles discretes natively);
-  // tiny or rowless pieces are absorbed into S. Adding columns to S cannot
-  // invalidate separation, and the row assignment below re-verifies.
+  // Finalize the separator to a fixpoint. Tiny or rowless pieces are
+  // always absorbed into S. Discrete columns prefer S as well (the
+  // master handles them exactly, keeping subproblems LP); only the
+  // overflow beyond the coupling budget stays in MIP blocks, and only
+  // when integer-subproblem support is enabled. Adding columns to S
+  // cannot invalidate separation; the row assignment below re-verifies.
+  const bool allowMipBlocks =
+      mipsolver.options_mip_->mip_benders_integer_subproblems;
   for (;;) {
     DsU dsu(numCol);
     for (HighsInt r = 0; r != numRow; ++r) {
@@ -341,20 +357,37 @@ bool HighsMipSolverData::findBendersSeparator(
     for (HighsInt c = 0; c != numCol; ++c) {
       if (colFixed[c] || inS[c]) continue;
       HighsInt root = dsu.find(c);
-      const bool tiny = pieceSize[root] < minBlock || !pieceHasRow[root];
-      const bool discrete =
-          model.integrality_[c] != HighsVarType::kContinuous;
-      if (tiny || discrete) {
+      if (pieceSize[root] < minBlock || !pieceHasRow[root]) {
         inS[c] = 1;
         ++numS;
         changed = true;
       }
     }
-    if (!changed) break;
-    if (numS > maxCoupling) {
-      cand.reason = "separator exceeds coupling budget after merge";
-      return false;
+    if (changed) {
+      if (numS > maxCoupling) {
+        cand.reason = "separator exceeds coupling budget after merge";
+        return false;
+      }
+      continue;
     }
+    // Kept pieces only from here on.
+    std::vector<HighsInt> discreteCols;
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (colFixed[c] || inS[c]) continue;
+      if (model.integrality_[c] != HighsVarType::kContinuous)
+        discreteCols.push_back(c);
+    }
+    if (discreteCols.empty()) break;
+    if (numS + (HighsInt)discreteCols.size() <= maxCoupling) {
+      for (HighsInt c : discreteCols) {
+        inS[c] = 1;
+        ++numS;
+      }
+      continue;
+    }
+    if (allowMipBlocks) break;  // overflow stays in MIP blocks
+    cand.reason = "integer blocks unsupported";
+    return false;
   }
   // Collect kept blocks (deterministic order by first column).
   std::vector<std::vector<HighsInt>> pieces;
@@ -419,13 +452,28 @@ bool HighsMipSolverData::findBendersSeparator(
     }
     return false;
   }
-  // LP blocks only (defensive: the fixpoint above already moved every
-  // discrete column into S).
-  for (const auto& piece : pieces) {
-    for (HighsInt c : piece) {
-      if (model.integrality_[c] != HighsVarType::kContinuous) {
-        cand.reason = "block with discrete columns";
-        return false;
+  // Block kinds: LP blocks (all continuous) give exact dual cuts;
+  // blocks with discrete columns need integer-subproblem support. If
+  // that support is disabled, any discrete block rejects the candidate.
+  cand.blockIsLp.assign(pieces.size(), 1);
+  if (mipsolver.options_mip_->mip_benders_integer_subproblems) {
+    for (size_t i = 0; i != pieces.size(); ++i) {
+      for (HighsInt c : pieces[i]) {
+        if (model.integrality_[c] != HighsVarType::kContinuous) {
+          cand.blockIsLp[i] = 0;
+          break;
+        }
+      }
+    }
+  } else {
+    // LP blocks only (defensive: the fixpoint above already moved every
+    // discrete column into S).
+    for (const auto& piece : pieces) {
+      for (HighsInt c : piece) {
+        if (model.integrality_[c] != HighsVarType::kContinuous) {
+          cand.reason = "block with discrete columns";
+          return false;
+        }
       }
     }
   }
@@ -515,6 +563,15 @@ bool HighsMipSolverData::runBenders() {
     model.a_matrix_.ensureColwise();
   const bool logBend = mipsolver.options_mip_->mip_decomposition_logging;
   const HighsLogOptions& logOptions = mipsolver.options_mip_->log_options;
+  if (logBend) {
+    std::string mdbg;
+    char mbuf[200];
+    snprintf(mbuf, sizeof(mbuf), "model %dx%d sense=%d",
+             (int)numCol, (int)numRow, (int)model.sense_);
+    mdbg += mbuf;
+    highsLogUser(logOptions, HighsLogType::kInfo, "[Benders] entry%s\n",
+                 mdbg.c_str());
+  }
 
   HighsBendersCandidate cand;
   if (!findBendersSeparator(model, cand)) {
@@ -590,6 +647,7 @@ bool HighsMipSolverData::runBenders() {
     std::vector<double> cost;  // internal-min costs
     std::vector<double> lb;
     std::vector<double> ub;
+    std::vector<HighsVarType> integ;  // parent integrality (for sub-MIPs)
   };
   std::vector<BendBlock> blocks(nB);
   std::vector<HighsInt> colToBlockPos(numCol, -1);
@@ -605,12 +663,14 @@ bool HighsMipSolverData::runBenders() {
     blk.cost.resize(blk.cols.size());
     blk.lb.resize(blk.cols.size());
     blk.ub.resize(blk.cols.size());
+    blk.integ.resize(blk.cols.size());
     for (size_t j = 0; j != blk.cols.size(); ++j) {
       HighsInt c = blk.cols[j];
       colToBlockPos[c] = (HighsInt)j;
       blk.cost[j] = sign * model.col_cost_[c];
       blk.lb[j] = model.col_lower_[c];
       blk.ub[j] = model.col_upper_[c];
+      blk.integ[j] = model.integrality_[c];
     }
     for (size_t i = 0; i != blk.rows.size() && !separatorBroken; ++i) {
       HighsInt r = blk.rows[i];
@@ -709,11 +769,26 @@ bool HighsMipSolverData::runBenders() {
     masterBaseRows.push_back(std::move(mr));
   }
 
-  if (logBend)
+  if (logBend) {
+    HighsInt numLpBlocks = 0;
+    HighsInt blockCols = 0;
+    for (size_t k = 0; k != cand.blockCols.size(); ++k) {
+      numLpBlocks += (cand.blockIsLp[k] != 0);
+      blockCols += (HighsInt)cand.blockCols[k].size();
+    }
+    // Conservative benefit/cost heuristic (Part 12): benefit scales with
+    // the columns Benders decides (coupling fixed plus blocks decoupled
+    // into independent subproblems); cost scales with solves per
+    // iteration times the iteration cap. Caps are the enforcement.
     highsLogUser(logOptions, HighsLogType::kInfo,
-                 "[Benders] candidate: %d coupling cols, %d blocks, %d "
-                 "master rows\n",
-                 (int)nY, (int)nB, (int)masterBaseRows.size());
+                 "[Benders] candidate: %d coupling cols, %d blocks (%d LP, "
+                 "%d MIP, %d block cols), %d master rows; score: benefit~%d "
+                 "cols decided, cost~%d solves/iter x %d iters\n",
+                 (int)nY, (int)nB, (int)numLpBlocks, (int)(nB - numLpBlocks),
+                 (int)blockCols, (int)masterBaseRows.size(),
+                 (int)(nY + blockCols), (int)(nB + 1),
+                 (int)mipsolver.options_mip_->mip_benders_max_iterations);
+  }
 
   struct BendCut {
     HighsInt block;  // -1 = feasibility cut (no theta)
@@ -870,6 +945,16 @@ bool HighsMipSolverData::runBenders() {
     std::vector<double> thetaStar(nB);
     for (HighsInt k = 0; k != nB; ++k) thetaStar[k] = masterSol[nY + k];
     ++numIter;
+    if (logBend) {
+      std::string ydbg;
+      char ybuf[64];
+      for (HighsInt i = 0; i != std::min<HighsInt>(nY, 12); ++i) {
+        snprintf(ybuf, sizeof(ybuf), " y%d=%.4g", (int)i, y[i]);
+        ydbg += ybuf;
+      }
+      highsLogUser(logOptions, HighsLogType::kInfo, "[Benders] yhat:%s\n",
+                   ydbg.c_str());
+    }
 
     // Gap check against the best known feasible composition.
     const double gapTol = 1e-7 * std::max(1.0, std::fabs(UB));
@@ -1060,8 +1145,117 @@ bool HighsMipSolverData::runBenders() {
           cuts.push_back(std::move(cut));
           anyCut = true;
         }
-        blockSol[k] = res.colSol;
-        blockObj[k] = res.obj;
+        const bool lpBlock = (bool)cand.blockIsLp[k];
+        if (lpBlock) {
+          blockSol[k] = res.colSol;
+          blockObj[k] = res.obj;
+        } else {
+          // Integer block: the LP solution above is only a relaxation
+          // (its cut stays valid). Solve the true sub-MIP for the upper
+          // bound; anything but a proven optimal/infeasible outcome
+          // aborts to the normal MIP path.
+          HighsLp msublp = sublp;
+          msublp.integrality_ = blk.integ;
+          HighsOptions msuboptions = *mipsolver.options_mip_;
+          msuboptions.output_flag = false;
+          msuboptions.threads = 1;
+          msuboptions.mip_max_nodes = 20000;
+          msuboptions.mip_max_leaves = 2000;
+          msuboptions.mip_detect_symmetry = false;
+          msuboptions.random_seed = 0;
+          msuboptions.mip_rel_gap = 0.0;
+          msuboptions.mip_abs_gap = 0.0;
+          msuboptions.mip_feasibility_tolerance = 1e-9;
+          {
+            double remaining =
+                mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
+            msuboptions.time_limit = std::min(10.0, remaining);
+          }
+          HighsSolution msolution;
+          msolution.value_valid = false;
+          msolution.dual_valid = false;
+          HighsMipSolver msubsolver(*mipsolver.callback_, msuboptions, msublp,
+                                    msolution, true,
+                                    mipsolver.submip_level + 1);
+          msubsolver.setProfiling(mipsolver.profiling_);
+          msubsolver.initialiseTerminator(mipsolver);
+          msubsolver.run();
+          if (msubsolver.modelstatus_ == HighsModelStatus::kOptimal) {
+            if (!verifyComponentSolution(msublp, msubsolver.solution_)) {
+              if (logBend)
+                highsLogUser(logOptions, HighsLogType::kInfo,
+                             "[Benders] block %d sub-MIP solution failed "
+                             "verification -> normal MIP\n",
+                             (int)k);
+              return true;
+            }
+            blockSol[k] = msubsolver.solution_;
+            blockObj[k] = msubsolver.solution_objective_;
+          } else if (msubsolver.modelstatus_ == HighsModelStatus::kInfeasible) {
+            // LP-relaxation feasible but sub-MIP infeasible: only a
+            // binary no-good cut can proceed; anything else aborts.
+            allFeasible = false;
+            bool allBinary = true;
+            for (HighsInt i = 0; i != nY; ++i) {
+              HighsInt c = cand.couplingCols[i];
+              if (model.integrality_[c] != HighsVarType::kInteger ||
+                  model.col_lower_[c] != 0.0 || model.col_upper_[c] != 1.0) {
+                allBinary = false;
+                break;
+              }
+            }
+            if (!allBinary) {
+              if (logBend)
+                highsLogUser(logOptions, HighsLogType::kInfo,
+                             "[Benders] block %d MIP-infeasible with "
+                             "non-binary coupling -> normal MIP\n",
+                             (int)k);
+              return true;
+            }
+            // No-good cut over binary coupling: the proven-infeasible y
+            // admits no feasible completion, so every global solution
+            // differs from it in at least one coordinate.
+            BendCut ngcut;
+            ngcut.block = -1;
+            ngcut.le = false;
+            ngcut.ay.assign(nY, 0.0);
+            HighsInt numOnes = 0;
+            bool binaryY = true;
+            for (HighsInt i = 0; i != nY; ++i) {
+              const double r = std::round(y[i]);
+              if (r == 0.0) {
+                ngcut.ay[i] = 1.0;
+              } else if (r == 1.0) {
+                ngcut.ay[i] = -1.0;
+                ++numOnes;
+              } else {
+                binaryY = false;
+                break;
+              }
+            }
+            if (!binaryY) return true;
+            ngcut.rhs = 1.0 - (double)numOnes;
+            double nglhs = 0.0;
+            for (HighsInt i = 0; i != nY; ++i) nglhs += ngcut.ay[i] * y[i];
+            if (!(nglhs < ngcut.rhs - 1e-9)) {
+              if (logBend)
+                highsLogUser(logOptions, HighsLogType::kInfo,
+                             "[Benders] block %d no-good not violated -> "
+                             "normal MIP\n",
+                             (int)k);
+              return true;
+            }
+            cuts.push_back(std::move(ngcut));
+            anyCut = true;
+          } else {
+            if (logBend)
+              highsLogUser(logOptions, HighsLogType::kInfo,
+                           "[Benders] block %d sub-MIP status %d -> "
+                           "normal MIP\n",
+                           (int)k, (int)msubsolver.modelstatus_);
+            return true;
+          }
+        }
       } else if (res.status == HighsModelStatus::kInfeasible) {
         allFeasible = false;
         // Farkas ray -> feasibility cut (same row-only dual source).
@@ -1160,6 +1354,24 @@ bool HighsMipSolverData::runBenders() {
         if (lhs > rhs + rayTol) {
           cuts.push_back(std::move(cut));
           anyCut = true;
+          if (logBend) {
+            HighsInt nnz = 0;
+            std::string aydbg;
+            char abuf[64];
+            for (HighsInt i = 0; i != nY; ++i) {
+              if (cuts.back().ay[i] != 0.0) {
+                ++nnz;
+                snprintf(abuf, sizeof(abuf), " a%d=%.4g", (int)i,
+                         cuts.back().ay[i]);
+                aydbg += abuf;
+              }
+            }
+            highsLogUser(logOptions, HighsLogType::kInfo,
+                         "[Benders] block %d feasibility cut: nnz=%d rhs=%.6g "
+                         "viol=%.4g%s\n",
+                         (int)k, (int)nnz, cuts.back().rhs, lhs - rhs,
+                         aydbg.c_str());
+          }
         } else {
           if (logBend)
             highsLogUser(logOptions, HighsLogType::kInfo,
@@ -1194,13 +1406,32 @@ bool HighsMipSolverData::runBenders() {
         hasBest = true;
       }
     }
-    if (logBend)
+    if (logBend) {
+      HighsInt nFeas = 0, nOpt = 0, nNoGood = 0;
+      for (const BendCut& cut : cuts) {
+        if (cut.block >= 0)
+          ++nOpt;
+        else if (cut.le)
+          ++nFeas;
+        else
+          ++nNoGood;
+      }
       highsLogUser(logOptions, HighsLogType::kInfo,
-                   "[Benders] iter %d: master=%.6g LB=%.6g UB=%.6g cuts=%d\n",
-                   (int)iter, LB, LB, UB, (int)cuts.size());
-    if (hasBest && UB - LB <= gapTol) {
-      converged = true;
-      break;
+                   "[Benders] iter %d: master=%.6g LB=%.6g UB=%.6g cuts=%d "
+                   "(feas=%d opt=%d nogood=%d)\n",
+                   (int)iter, LB, LB, UB, (int)cuts.size(), (int)nFeas,
+                   (int)nOpt, (int)nNoGood);
+    }
+    // Post-subsolve gap check with a FRESH tolerance from the current
+    // UB (gapTol above predates this iteration's UB update and may still
+    // be infinite from the first iteration: using it here would declare
+    // convergence on any first feasible UB regardless of the gap).
+    if (hasBest) {
+      const double postGapTol = 1e-7 * std::max(1.0, std::fabs(UB));
+      if (UB - LB <= postGapTol) {
+        converged = true;
+        break;
+      }
     }
     if (!anyCut) break;  // nothing learned: gap decides fix vs fallback
   }
