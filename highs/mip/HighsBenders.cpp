@@ -1030,6 +1030,11 @@ bool HighsMipSolverData::runBenders() {
     bool le = false;  // true: a*y <= rhs; false: [theta +] a*y >= rhs
     bool aux = false;  // true: from the auxiliary LP, not a Farkas ray
     bool lshaped = false;  // true: integer L-shaped cut (binary coupling)
+    // Cut-management priority (SCIP order: aux > feas > opt > nogood >
+    // integer) and post-scale violation, used only when the total cut
+    // cap (mip_benders_max_cuts) trims an iteration's new cuts.
+    int prio = 0;
+    double viol = 0.0;
     std::vector<double> ay;
     double rhs;
   };
@@ -1076,6 +1081,49 @@ bool HighsMipSolverData::runBenders() {
                    "%.2g) -> dropped\n",
                    boundViol, rowViol, intViol);
     }
+  };
+  // Exact power-of-two cut normalization to unit max-|ay| (shared
+  // hygiene for every cut family): scaling (ay, rhs) by 2^k is bit-exact
+  // short of overflow, so already-passed violation gates are unaffected;
+  // only master-LP numerics improve. Returns the scale, or 0.0 when the
+  // cut must be dropped (non-finite coefficients or scaling overflow).
+  auto normalizeCut = [&](BendCut& cut) -> double {
+    double mx = 0.0;
+    for (HighsInt i = 0; i != nY; ++i)
+      mx = std::max(mx, std::fabs(cut.ay[i]));
+    if (mx == 0.0) return 1.0;  // theta-only bound: keep unscaled
+    if (!std::isfinite(mx)) return 0.0;
+    int e = 0;
+    std::frexp(mx, &e);
+    const double s = std::ldexp(1.0, -e);
+    if (!std::isfinite(s) || s == 0.0) return 0.0;
+    for (HighsInt i = 0; i != nY; ++i) {
+      cut.ay[i] *= s;
+      if (!std::isfinite(cut.ay[i])) return 0.0;
+    }
+    cut.rhs *= s;
+    if (!std::isfinite(cut.rhs)) return 0.0;
+    return s;
+  };
+  // Exact-duplicate suppression against kept cuts (same shape and
+  // bitwise coefficients, e.g. a revisited y*): duplicates add nothing
+  // mathematically, only master-LP degeneracy.
+  auto isDuplicateCut = [&](const BendCut& cut) -> bool {
+    for (const BendCut& e : cuts) {
+      if (e.block != cut.block || e.le != cut.le || e.aux != cut.aux ||
+          e.lshaped != cut.lshaped || e.prio != cut.prio ||
+          e.rhs != cut.rhs)
+        continue;
+      bool same = true;
+      for (HighsInt i = 0; i != nY; ++i) {
+        if (e.ay[i] != cut.ay[i]) {
+          same = false;
+          break;
+        }
+      }
+      if (same) return true;
+    }
+    return false;
   };
 
   double UB = kHighsInf;  // internal space
@@ -1263,6 +1311,7 @@ bool HighsMipSolverData::runBenders() {
     // ---- subproblems ----
     bool allFeasible = true;
     bool anyCut = false;
+    std::vector<BendCut> newCuts;  // this iteration's cuts, priority-merged
     std::vector<std::vector<double>> blockSol(nB);
     std::vector<double> blockObj(nB, kHighsInf);
     const double cutTol = 1e-6;
@@ -1406,16 +1455,22 @@ bool HighsMipSolverData::runBenders() {
       for (HighsInt i = 0; i != nY; ++i) lhs += cut.ay[i] * y[i];
       const double violTol = cutTol * std::max(1.0, std::fabs(rhs));
       if (!(rhs - lhs > violTol)) return false;
-      cuts.push_back(std::move(cut));
-      anyCut = true;
+      const double rawViol = rhs - lhs;
+      const double s = normalizeCut(cut);
+      if (s == 0.0) return false;
+      cut.prio = 4;
+      cut.viol = s * rawViol;
+      HighsInt nnz = 0;
+      for (HighsInt i = 0; i != nY; ++i)
+        if (cut.ay[i] != 0.0) ++nnz;
+      const double logRhs = cut.rhs;
+      const double logViol = cut.viol;
+      newCuts.push_back(std::move(cut));
       if (logBend) {
-        HighsInt nnz = 0;
-        for (HighsInt i = 0; i != nY; ++i)
-          if (cuts.back().ay[i] != 0.0) ++nnz;
         highsLogUser(logOptions, HighsLogType::kInfo,
                      "[Benders] block %d aux feasibility cut: nnz=%d rhs=%.6g "
                      "viol=%.4g\n",
-                     (int)kk, (int)nnz, cuts.back().rhs, rhs - lhs);
+                     (int)kk, (int)nnz, logRhs, logViol);
       }
       return true;
     };
@@ -1599,8 +1654,13 @@ bool HighsMipSolverData::runBenders() {
           for (HighsInt i = 0; i != nY; ++i) cutVal -= cut.ay[i] * y[i];
           const double violTol = cutTol * std::max(1.0, std::fabs(rhs));
           if (thetaStar[k] < cutVal - violTol) {
-            cuts.push_back(std::move(cut));
-            anyCut = true;
+            const double rawViol = cutVal - thetaStar[k];
+            const double s = normalizeCut(cut);
+            if (s > 0.0) {
+              cut.prio = 2;
+              cut.viol = s * rawViol;
+              newCuts.push_back(std::move(cut));
+            }
           }
         }
         const bool lpBlock = (bool)cand.blockIsLp[k];
@@ -1698,8 +1758,13 @@ bool HighsMipSolverData::runBenders() {
                     }
                   }
                   lcut.rhs = zstar - spread * numOne;
-                  cuts.push_back(std::move(lcut));
-                  anyCut = true;
+                  const double rawViol = zstar - thetaStar[k];
+                  const double s = normalizeCut(lcut);
+                  if (s > 0.0) {
+                    lcut.prio = 0;
+                    lcut.viol = s * rawViol;
+                    newCuts.push_back(std::move(lcut));
+                  }
                   if (logBend)
                     highsLogUser(logOptions, HighsLogType::kInfo,
                                  "[Benders] block %d L-shaped cut: z*=%.6g "
@@ -1762,8 +1827,15 @@ bool HighsMipSolverData::runBenders() {
                              (int)k);
               return true;
             }
-            cuts.push_back(std::move(ngcut));
-            anyCut = true;
+            {
+              const double rawViol = ngcut.rhs - nglhs;
+              const double s = normalizeCut(ngcut);
+              if (s > 0.0) {
+                ngcut.prio = 1;
+                ngcut.viol = s * rawViol;
+                newCuts.push_back(std::move(ngcut));
+              }
+            }
           } else {
             if (logBend)
               highsLogUser(logOptions, HighsLogType::kInfo,
@@ -1870,30 +1942,37 @@ bool HighsMipSolverData::runBenders() {
           if (std::fabs(cut.ay[i]) <= 1e-12) cut.ay[i] = 0.0;
         cut.rhs = rhs;
         // The cut a*y <= rhs must be violated at y (by -viol > 0);
-        // anything else signals a broken certificate: abort.
+        // anything else signals a broken certificate: auxiliary fallback.
         double lhs = 0.0;
         for (HighsInt i = 0; i != nY; ++i) lhs += cut.ay[i] * y[i];
         const double rayTol = 1e-6 * std::max(1.0, std::fabs(rhs));
         if (lhs > rhs + rayTol) {
-          cuts.push_back(std::move(cut));
-          anyCut = true;
-          if (logBend) {
+          const double rawViol = lhs - rhs;
+          const double s = normalizeCut(cut);
+          if (s > 0.0) {
+            cut.prio = 3;
+            cut.viol = s * rawViol;
             HighsInt nnz = 0;
             std::string aydbg;
             char abuf[64];
             for (HighsInt i = 0; i != nY; ++i) {
-              if (cuts.back().ay[i] != 0.0) {
+              if (cut.ay[i] != 0.0) {
                 ++nnz;
                 snprintf(abuf, sizeof(abuf), " a%d=%.4g", (int)i,
-                         cuts.back().ay[i]);
+                         cut.ay[i]);
                 aydbg += abuf;
               }
             }
-            highsLogUser(logOptions, HighsLogType::kInfo,
-                         "[Benders] block %d feasibility cut: nnz=%d rhs=%.6g "
-                         "viol=%.4g%s\n",
-                         (int)k, (int)nnz, cuts.back().rhs, lhs - rhs,
-                         aydbg.c_str());
+            const double logRhs = cut.rhs;
+            const double logViol = cut.viol;
+            newCuts.push_back(std::move(cut));
+            if (logBend) {
+              highsLogUser(logOptions, HighsLogType::kInfo,
+                           "[Benders] block %d feasibility cut: nnz=%d "
+                           "rhs=%.6g viol=%.4g%s\n",
+                           (int)k, (int)nnz, logRhs, logViol,
+                           aydbg.c_str());
+            }
           }
         } else {
           if (pushAuxFeasCut(k, blk, sublp)) continue;
@@ -1918,6 +1997,45 @@ bool HighsMipSolverData::runBenders() {
                        (int)res.status);
         return true;  // time limit, error, ...: fallback
       }
+    }
+    // Priority merge of this iteration's cuts (SCIP cut-management
+    // order: aux > feas > opt > nogood > lshaped). Unlimited cap
+    // (default): deduped append in generation order. Capped: keep the
+    // most-violated cuts first. Dropping valid cuts only slows
+    // convergence; the stall limit and fallback cover non-convergence.
+    {
+      const HighsInt maxCuts =
+          mipsolver.options_mip_->mip_benders_max_cuts;
+      std::vector<size_t> order(newCuts.size());
+      for (size_t i = 0; i != order.size(); ++i) order[i] = i;
+      if (maxCuts < kHighsIInf) {
+        std::stable_sort(
+            order.begin(), order.end(),
+            [&](size_t a, size_t b) {
+              if (newCuts[a].prio != newCuts[b].prio)
+                return newCuts[a].prio > newCuts[b].prio;
+              return newCuts[a].viol > newCuts[b].viol;
+            });
+      }
+      HighsInt dropped = 0;
+      const HighsInt before = (HighsInt)cuts.size();
+      for (size_t idx : order) {
+        BendCut& nc = newCuts[idx];
+        if (isDuplicateCut(nc)) {
+          ++dropped;
+          continue;
+        }
+        if ((HighsInt)cuts.size() >= maxCuts) {
+          ++dropped;
+          continue;
+        }
+        cuts.push_back(std::move(nc));
+      }
+      if ((HighsInt)cuts.size() > before) anyCut = true;
+      if (logBend && dropped > 0)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[Benders] iter %d: dropped %d duplicate/excess cuts\n",
+                     (int)iter, (int)dropped);
     }
     if (allFeasible) {
       double composed = 0.0;

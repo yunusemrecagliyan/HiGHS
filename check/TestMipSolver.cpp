@@ -2124,6 +2124,34 @@ TEST_CASE("MIP-benders-dec", "[highs_test_mip_solver]") {
   }
 }
 
+TEST_CASE("MIP-benders-maxcuts", "[highs_test_mip_solver]") {
+  // Cut cap: with mip_benders_max_cuts = 2 the loop is starved of cuts
+  // (priority trimming fires) and falls back, yet the rescued incumbent
+  // and the fallback path agree exactly with uncapped and Benders-off.
+  std::string filename =
+      std::string(HIGHS_DIR) + "/check/instances/benders-lshaped.lp";
+  double reference = kHighsInf;
+  for (HighsInt cfg = 0; cfg != 3; ++cfg) {
+    Highs highs;
+    highs.setOptionValue("output_flag", dev_run);
+    highs.setOptionValue("mip_rel_gap", 0);
+    highs.setOptionValue("mip_abs_gap", 0);
+    highs.setOptionValue("mip_benders", cfg != 2);
+    highs.setOptionValue("mip_benders_max_cuts", cfg == 0 ? 2 : 1000000);
+    highs.setOptionValue("presolve_rule_off", (HighsInt)1048512);
+    highs.readModel(filename);
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+    double objective = highs.getInfo().objective_function_value;
+    REQUIRE(std::isfinite(objective));
+    if (cfg == 0)
+      reference = objective;
+    else
+      REQUIRE(objective == reference);
+    highs.resetGlobalScheduler(true);
+  }
+}
+
 TEST_CASE("MIP-decomposition-zero-objective", "[highs_test_mip_solver]") {
   // Zero objective: every feasible point is optimal; decomposition must
   // still agree with the fallback path (objective 0).

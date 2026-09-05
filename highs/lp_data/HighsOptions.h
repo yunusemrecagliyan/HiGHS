@@ -544,6 +544,7 @@ struct HighsOptionsStruct {
   HighsInt mip_benders_stall_limit;
   bool mip_benders_incumbent;
   std::string mip_benders_dec_file;
+  HighsInt mip_benders_max_cuts;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -735,7 +736,8 @@ struct HighsOptionsStruct {
         mip_benders_lshaped(true),
         mip_benders_stall_limit(10),
         mip_benders_incumbent(true),
-        mip_benders_dec_file(kHighsFilenameDefault) {};
+        mip_benders_dec_file(kHighsFilenameDefault),
+        mip_benders_max_cuts(kHighsIInf) {};
   // clang-format on
 };
 
@@ -1454,6 +1456,14 @@ class HighsOptions : public HighsOptionsStruct {
         "otherwise (empty disables)",
         advanced, &mip_benders_dec_file, kHighsFilenameDefault);
     records.push_back(record_string);
+
+    record_int = new OptionRecordInt(
+        "mip_benders_max_cuts",
+        "Max total Benders cuts kept across iterations (excess dropped "
+        "in priority order aux > feas > opt > nogood > lshaped); "
+        "unlimited by default",
+        advanced, &mip_benders_max_cuts, 1, kHighsIInf, kHighsIInf);
+    records.push_back(record_int);
 
     record_bool = new OptionRecordBool(
         "mip_lagrangian",
