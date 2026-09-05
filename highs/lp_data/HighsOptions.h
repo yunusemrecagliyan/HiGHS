@@ -546,6 +546,7 @@ struct HighsOptionsStruct {
   std::string mip_benders_dec_file;
   HighsInt mip_benders_max_cuts;
   double mip_benders_branch_priority;
+  double mip_benders_max_time;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -739,7 +740,8 @@ struct HighsOptionsStruct {
         mip_benders_incumbent(true),
         mip_benders_dec_file(kHighsFilenameDefault),
         mip_benders_max_cuts(kHighsIInf),
-        mip_benders_branch_priority(0.0) {};
+        mip_benders_branch_priority(0.0),
+        mip_benders_max_time(30.0) {};
   // clang-format on
 };
 
@@ -1473,6 +1475,14 @@ class HighsOptions : public HighsOptionsStruct {
         "selecting branching candidates (branch-on-bridges-first); 0 "
         "disables (bit-identical search)",
         advanced, &mip_benders_branch_priority, 0.0, 0.0, kHighsInf);
+    records.push_back(record_double);
+
+    record_double = new OptionRecordDouble(
+        "mip_benders_max_time",
+        "Max seconds spent in one Benders loop (Benders must never "
+        "starve the parent search; exhaustion falls back, keeping any "
+        "rescued incumbent)",
+        advanced, &mip_benders_max_time, 0.0, 30.0, kHighsInf);
     records.push_back(record_double);
 
     record_bool = new OptionRecordBool(

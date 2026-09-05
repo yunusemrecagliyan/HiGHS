@@ -786,8 +786,30 @@ bool HighsMipSolverData::verifyBendersSolution(
   return true;
 }
 
+// RAII accumulator: every runBenders exit (all fallback returns and the
+// normal end) adds its elapsed time to the solve-wide Benders budget,
+// so post-restart loops share one total instead of each taking a fresh
+// allowance.
+struct BendersTimeGuard {
+  HighsMipSolverData& data;
+  double start;
+  explicit BendersTimeGuard(HighsMipSolverData& d)
+      : data(d), start(d.mipsolver.timer_.read()) {}
+  ~BendersTimeGuard() {
+    data.bendersTotalTime += data.mipsolver.timer_.read() - start;
+  }
+};
+
 bool HighsMipSolverData::runBenders() {
   bendersCoupling.clear();
+  // Initial presolve only: post-restart models are LP relaxations plus
+  // cuts, where arrowhead structure is a cut artifact. Re-running the
+  // fixing loop there drives fix-restart churn (each fix collapses
+  // integer activity, triggering another restart and another loop)
+  // while the initial pass plus its rescued incumbent carry the value.
+  // (The stored coupling hint is intentionally kept across restarts:
+  // column indices are stable and it is soft branching guidance.)
+  if (numRestarts > 0) return true;
   HighsLp& model = presolvedModel;
   const HighsInt numCol = model.num_col_;
   const HighsInt numRow = model.num_row_;
@@ -817,6 +839,7 @@ bool HighsMipSolverData::runBenders() {
                    cand.reason.c_str());
     return true;
   }
+  BendersTimeGuard timeGuard(*this);
   // Publish the coupling set for structure-aware branching (cleared on
   // convergence-and-fix below, when S is fixed away).
   bendersCoupling.assign(numCol, 0);
@@ -1145,10 +1168,28 @@ bool HighsMipSolverData::runBenders() {
   HighsInt lbStall = 0;
   const HighsInt stallLimit = std::max<HighsInt>(
       1, mipsolver.options_mip_->mip_benders_stall_limit);
+  // Total time budget (Lagrangian max_time-style), shared across all
+  // runBenders calls of one solve: Benders must never starve the parent
+  // search (100 iters x sub-MIPs per loop, times post-restart loops, is
+  // otherwise unbounded and can drive fix-restart churn). On exhaustion
+  // the loop falls back with whatever UB the rescue can inject; the
+  // parent keeps the remaining budget.
+  const double bendStart = mipsolver.timer_.read();
+  const double bendMaxTime = mipsolver.options_mip_->mip_benders_max_time;
 
   std::vector<double> y(nY, 0.0);
   const HighsInt nMasterCol = nY + nB;
   for (HighsInt iter = 0; iter != maxIter; ++iter) {
+    const double bendSpent =
+        bendersTotalTime + mipsolver.timer_.read() - bendStart;
+    if (bendSpent >= bendMaxTime) {
+      if (logBend)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[Benders] time budget %.1fs exhausted (%.1fs used) -> "
+                     "normal MIP\n",
+                     bendMaxTime, bendSpent);
+      break;
+    }
     if (mipsolver.options_mip_->time_limit < kHighsInf &&
         mipsolver.timer_.read() >= mipsolver.options_mip_->time_limit)
       break;

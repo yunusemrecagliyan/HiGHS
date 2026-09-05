@@ -302,6 +302,11 @@ struct HighsMipSolverData {
   // Set from the candidate (fallback case); cleared at entry (restart
   // safety) and on convergence-and-fix (S fixed away).
   std::vector<char> bendersCoupling;
+  // Accumulated Benders time across runBenders calls of one solve
+  // (restarts re-enter): the total budget (mip_benders_max_time) is
+  // shared, so repeated post-restart loops cannot starve the parent
+  // search via fix-restart churn.
+  double bendersTotalTime = 0.0;
   // User annotation override (mip_benders_dec_file): COUPLING/BLOCK lines
   // by original-model index or name, mapped to presolved space via the
   // postsolve stack. Validated strictly (span-check); any failure falls
