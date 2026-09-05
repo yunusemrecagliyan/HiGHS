@@ -224,10 +224,59 @@ struct HighsMipSolverData {
 
   // Independent-components subsolver (SCIP cons_components-style, clean
   // room): solve tiny disconnected (var, constraint) pieces exactly and
-  // fix their columns. Called once after MIP presolve on the presolved
-  // model; model dimensions are preserved (only bounds tighten) so the
-  // postsolve stack stays consistent.
+  // fix their columns. Called after MIP presolve on the presolved model
+  // (and again after a restart, which re-runs presolve); model dimensions
+  // are preserved (only bounds tighten) so the postsolve stack stays
+  // consistent.
+  //
+  // Structural information of one detected (var, constraint) block, used
+  // for eligibility, debug logging and weak-coupling analysis.
+  struct HighsDecompComponent {
+    std::vector<HighsInt> cols;
+    std::vector<HighsInt> rows;
+    HighsInt numInt = 0;       // integer + semi-integer + implicit-integer
+    HighsInt numBinary = 0;    // discrete columns with [0, 1] bounds
+    HighsInt numContinuous = 0;
+    HighsInt numNz = 0;        // internal nonzeros
+    HighsInt numObjNz = 0;     // columns with nonzero objective coefficient
+  };
+  // Accumulated statistics over all decomposition passes of one
+  // solveComponents() call. Only informational: solver decisions never
+  // depend on these counters.
+  struct HighsDecompStats {
+    HighsInt numPasses = 0;
+    HighsInt numComponents = 0;
+    HighsInt numSolved = 0;
+    HighsInt numFixed = 0;
+    double detectTime = 0.0;
+    double solveTime = 0.0;
+  };
   void solveComponents();
+  // Pure graph analysis: union-find over unfixed columns and rows linked
+  // by matrix nonzeros. Fixed columns (lb == ub) are constants, so they
+  // are excluded: this lets later passes split blocks that were glued by
+  // an already-fixed bridge column. Rows whose columns are all fixed are
+  // reported via fixedRows for a consistency check by the caller.
+  void detectComponents(const HighsLp& model,
+                        std::vector<HighsDecompComponent>& components,
+                        std::vector<HighsInt>& fixedRows) const;
+  // Solve every eligible component of one pass and fix proven-optimal
+  // columns via bounds. Returns false with modelstatus kInfeasible set if
+  // a component (or a fully-fixed row) proves global infeasibility.
+  bool solveComponentPass(const HighsInt pass, HighsDecompStats& stats);
+  // Verify a subsolver solution against the extracted submodel before it
+  // is baked into parent bounds: row activities within feastol and
+  // integrality within feastol. Never trust kOptimal alone.
+  bool verifyComponentSolution(const HighsLp& sublp,
+                               const std::vector<double>& subcol) const;
+  // Log-only weak-coupling analysis (no solver action): searches for
+  // single coupling rows/columns whose removal would split the largest
+  // remaining block, and reports whether the structure is a Benders
+  // candidate (coupling variables), a dual-decomposition candidate
+  // (coupling rows), or heavily coupled.
+  void analyzeWeakCoupling(const HighsLp& model,
+                           const std::vector<HighsDecompComponent>& components,
+                           HighsInt numFixedCols) const;
   void setupDomainPropagation();
   void saveReportMipSolution(const double new_upper_limit = -kHighsInf);
   void checkAddSolution();

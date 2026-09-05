@@ -1605,3 +1605,106 @@ TEST_CASE("issue-3118a", "[highs_test_mip_solver]") {
 
   highs.resetGlobalScheduler(true);
 }
+
+// Independent-component decomposition: block-diagonal binary knapsacks
+// with a known closed-form optimum. Each block is far below the exact
+// subsolve caps, so decomposition must collapse the model; the same
+// optimum must come out of the fallback path (mip_decomposition=false).
+static double decompBlockOptimum(HighsInt blockCols, HighsInt cap) {
+  double optimum = 0.0;
+  for (HighsInt i = 0; i < cap; ++i) optimum -= (blockCols - i);
+  return optimum;
+}
+
+static HighsLp decompBlockKnapsack(HighsInt numBlocks, HighsInt blockCols,
+                                   HighsInt cap) {
+  HighsLp lp;
+  lp.num_col_ = numBlocks * blockCols;
+  lp.num_row_ = numBlocks;
+  lp.sense_ = ObjSense::kMinimize;
+  lp.col_cost_.resize(lp.num_col_);
+  lp.col_lower_.assign(lp.num_col_, 0.0);
+  lp.col_upper_.assign(lp.num_col_, 1.0);
+  lp.integrality_.assign(lp.num_col_, HighsVarType::kInteger);
+  lp.row_lower_.assign(lp.num_row_, -kHighsInf);
+  lp.row_upper_.assign(lp.num_row_, double(cap));
+  lp.a_matrix_.format_ = MatrixFormat::kColwise;
+  lp.a_matrix_.start_.resize(lp.num_col_ + 1);
+  for (HighsInt c = 0; c < lp.num_col_; ++c) {
+    lp.col_cost_[c] = -double(c % blockCols + 1);
+    lp.a_matrix_.start_[c + 1] = c + 1;
+    lp.a_matrix_.index_.push_back(c / blockCols);
+    lp.a_matrix_.value_.push_back(1.0);
+  }
+  return lp;
+}
+
+TEST_CASE("MIP-decomposition-blocks", "[highs_test_mip_solver]") {
+  // 6 blocks x 20 binary cols = 120 cols: above the toy-model skip, each
+  // block far below the exact-subsolve caps.
+  HighsLp lp = decompBlockKnapsack(6, 20, 10);
+  const double optimal_objective = 6 * decompBlockOptimum(20, 10);
+  Highs highs;
+  highs.setOptionValue("output_flag", dev_run);
+  highs.setOptionValue("mip_rel_gap", 0);
+  highs.setOptionValue("mip_abs_gap", 0);
+  highs.passModel(lp);
+  solve(highs, kHighsOnString, HighsModelStatus::kOptimal, optimal_objective);
+  // Fallback path must give the identical optimum.
+  REQUIRE(highs.setOptionValue("mip_decomposition", false) ==
+          HighsStatus::kOk);
+  highs.clearSolver();
+  solve(highs, kHighsOnString, HighsModelStatus::kOptimal, optimal_objective);
+
+  highs.resetGlobalScheduler(true);
+}
+
+TEST_CASE("MIP-decomposition-infeasible", "[highs_test_mip_solver]") {
+  // One provably infeasible 2-variable block padded with 100 isolated
+  // binaries (102 columns, above the toy-model skip): an infeasible
+  // exact subsolve must propagate to global infeasibility, and the
+  // fallback path must agree.
+  HighsLp lp;
+  lp.num_col_ = 102;
+  lp.num_row_ = 2;
+  lp.sense_ = ObjSense::kMinimize;
+  lp.col_cost_.assign(lp.num_col_, 1.0);
+  lp.col_lower_.assign(lp.num_col_, 0.0);
+  lp.col_upper_.assign(lp.num_col_, 1.0);
+  lp.integrality_.assign(lp.num_col_, HighsVarType::kInteger);
+  lp.row_lower_ = {2.0, -kHighsInf};
+  lp.row_upper_ = {kHighsInf, 1.0};
+  lp.a_matrix_.format_ = MatrixFormat::kColwise;
+  lp.a_matrix_.start_.resize(lp.num_col_ + 1);
+  lp.a_matrix_.start_[0] = 0;
+  lp.a_matrix_.start_[1] = 2;
+  lp.a_matrix_.start_[2] = 4;
+  for (HighsInt c = 2; c < lp.num_col_; ++c) lp.a_matrix_.start_[c + 1] = 4;
+  lp.a_matrix_.index_ = {0, 1, 0, 1};
+  lp.a_matrix_.value_ = {1.0, 1.0, 1.0, 1.0};
+  for (bool decomposition : {true, false}) {
+    Highs highs;
+    highs.setOptionValue("output_flag", dev_run);
+    highs.setOptionValue("mip_decomposition", decomposition);
+    highs.passModel(lp);
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kInfeasible);
+    highs.resetGlobalScheduler(true);
+  }
+}
+
+TEST_CASE("MIP-decomposition-logging", "[highs_test_mip_solver]") {
+  // Single large block (nothing eligible) with the log-only analyser on:
+  // exercises the weak-coupling detector without changing the result.
+  HighsLp lp = decompBlockKnapsack(1, 120, 60);
+  const double optimal_objective = decompBlockOptimum(120, 60);
+  Highs highs;
+  highs.setOptionValue("output_flag", dev_run);
+  highs.setOptionValue("mip_rel_gap", 0);
+  highs.setOptionValue("mip_abs_gap", 0);
+  highs.setOptionValue("mip_decomposition_logging", true);
+  highs.passModel(lp);
+  solve(highs, kHighsOnString, HighsModelStatus::kOptimal, optimal_objective);
+
+  highs.resetGlobalScheduler(true);
+}

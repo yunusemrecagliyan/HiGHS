@@ -524,6 +524,12 @@ struct HighsOptionsStruct {
   HighsInt mip_lifting_for_probing;
   bool mip_search_simulate_concurrency;
   bool mip_allow_cut_separation_at_nodes;
+  bool mip_decomposition;
+  HighsInt mip_decomposition_max_passes;
+  HighsInt mip_decomposition_max_comp_ints;
+  HighsInt mip_decomposition_max_comp_cols;
+  HighsInt mip_decomposition_max_comp_rows;
+  bool mip_decomposition_logging;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -695,7 +701,13 @@ struct HighsOptionsStruct {
         mip_lifting_for_probing(-1),
         mip_search_simulate_concurrency(false),
         // clang-format off
-        mip_allow_cut_separation_at_nodes(true) {};
+        mip_allow_cut_separation_at_nodes(true),
+        mip_decomposition(true),
+        mip_decomposition_max_passes(5),
+        mip_decomposition_max_comp_ints(40),
+        mip_decomposition_max_comp_cols(64),
+        mip_decomposition_max_comp_rows(64),
+        mip_decomposition_logging(false) {};
   // clang-format on
 };
 
@@ -1298,6 +1310,45 @@ class HighsOptions : public HighsOptionsStruct {
         "mip_allow_cut_separation_at_nodes",
         "Whether cut separation at nodes other than the root node is permitted",
         advanced, &mip_allow_cut_separation_at_nodes, true);
+    records.push_back(record_bool);
+
+    record_bool = new OptionRecordBool(
+        "mip_decomposition",
+        "Whether tiny independent MIP components detected after presolve "
+        "are solved exactly and fixed in the parent model",
+        advanced, &mip_decomposition, true);
+    records.push_back(record_bool);
+
+    record_int = new OptionRecordInt(
+        "mip_decomposition_max_passes",
+        "Max passes of component detection after variable fixing "
+        "(re-detection stops early when nothing is fixed)",
+        advanced, &mip_decomposition_max_passes, 1, 5, 100);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_decomposition_max_comp_ints",
+        "Max integer columns of a component solved exactly by decomposition",
+        advanced, &mip_decomposition_max_comp_ints, 0, 40, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_decomposition_max_comp_cols",
+        "Max columns of a component solved exactly by decomposition",
+        advanced, &mip_decomposition_max_comp_cols, 1, 64, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_decomposition_max_comp_rows",
+        "Max rows of a component solved exactly by decomposition",
+        advanced, &mip_decomposition_max_comp_rows, 0, 64, kHighsIInf);
+    records.push_back(record_int);
+
+    record_bool = new OptionRecordBool(
+        "mip_decomposition_logging",
+        "Whether decomposition reports per-component metrics and "
+        "weak-coupling (Benders candidate) analysis",
+        advanced, &mip_decomposition_logging, false);
     records.push_back(record_bool);
 
     record_double = new OptionRecordDouble(

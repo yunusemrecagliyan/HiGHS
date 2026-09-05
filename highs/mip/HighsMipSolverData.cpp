@@ -864,10 +864,75 @@ void HighsMipSolverData::solveComponents() {
   // is not worth it below trivial size, and the test suite asserts
   // bit-exact classic behaviour on small instances.
   if (numCol < 100) return;
+  // Master switch (default on): off means the pure baseline MIP path.
+  if (!mipsolver.options_mip_->mip_decomposition) return;
   if (model.a_matrix_.format_ != MatrixFormat::kColwise)
     model.a_matrix_.ensureColwise();
+  // Degenerate fixed columns (lb == ub non-finite) cannot be shifted out
+  // of row bounds exactly; leave the model to the normal MIP path.
+  for (HighsInt c = 0; c != numCol; ++c) {
+    if (model.col_lower_[c] == model.col_upper_[c] &&
+        !std::isfinite(model.col_lower_[c]))
+      return;
+  }
 
-  // Union-find over columns and rows linked by matrix nonzeros.
+  // Repeated decomposition: fixing one pass can disconnect the blocks
+  // glued by an already-fixed bridge column, so re-detect until no
+  // further column is fixed, a pass budget is hit, or time runs out.
+  // Iterative (not recursive) by design; each pass rebuilds only the
+  // cheap union-find structure, never the LP or domain.
+  HighsDecompStats stats;
+  const HighsInt maxPasses = std::max<HighsInt>(
+      1, mipsolver.options_mip_->mip_decomposition_max_passes);
+  // A further pass is only started if the previous pass fixed something:
+  // fixed columns are the only thing that can change the unfixed-column
+  // graph, so re-running on an unchanged model would pointlessly retry
+  // the same subsolves. (Cross-restart repetition after re-presolve is
+  // handled by the restart path, which calls runMipPresolve again.)
+  HighsInt lastPassFixed = 1;
+  for (HighsInt pass = 0; pass != maxPasses && lastPassFixed > 0; ++pass) {
+    // Respect the global time limit.
+    if (mipsolver.options_mip_->time_limit < kHighsInf &&
+        mipsolver.timer_.read() >= mipsolver.options_mip_->time_limit)
+      break;
+    ++stats.numPasses;
+    const HighsInt fixedBefore = stats.numFixed;
+    if (!solveComponentPass(pass, stats)) return;  // proven infeasible
+    lastPassFixed = stats.numFixed - fixedBefore;
+  }
+
+  if ((stats.numSolved > 0 || stats.numFixed > 0) && numRestarts == 0)
+    highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+                 "MIP presolve: solved %d components, fixed %d columns in "
+                 "%d pass(es) (detect %.2fs, solve %.2fs)\n",
+                 (int)stats.numSolved, (int)stats.numFixed,
+                 (int)stats.numPasses, stats.detectTime, stats.solveTime);
+
+  // Log-only weak-coupling analysis: never changes solver behaviour.
+  if (mipsolver.options_mip_->mip_decomposition_logging &&
+      mipsolver.modelstatus_ == HighsModelStatus::kNotset) {
+    std::vector<HighsDecompComponent> components;
+    std::vector<HighsInt> fixedRows;
+    detectComponents(model, components, fixedRows);
+    analyzeWeakCoupling(model, components, stats.numFixed);
+  }
+}
+
+void HighsMipSolverData::detectComponents(
+    const HighsLp& model, std::vector<HighsDecompComponent>& components,
+    std::vector<HighsInt>& fixedRows) const {
+  const HighsInt numCol = model.num_col_;
+  const HighsInt numRow = model.num_row_;
+  components.clear();
+  fixedRows.clear();
+
+  // Fixed columns are constants: excluding them from the graph can only
+  // split blocks further, never merge them, and keeps size caps honest.
+  std::vector<char> colFixed(numCol, 0);
+  for (HighsInt c = 0; c != numCol; ++c)
+    if (model.col_lower_[c] == model.col_upper_[c]) colFixed[c] = 1;
+
+  // Union-find over unfixed columns and rows linked by matrix nonzeros.
   std::vector<HighsInt> parent(numCol + numRow);
   for (HighsInt i = 0; i != numCol + numRow; ++i) parent[i] = i;
   std::function<HighsInt(HighsInt)> find = [&](HighsInt a) {
@@ -885,18 +950,15 @@ void HighsMipSolverData::solveComponents() {
     if (ra != rb) parent[ra] = rb;
   };
   for (HighsInt c = 0; c != numCol; ++c) {
+    if (colFixed[c]) continue;
     for (HighsInt el = model.a_matrix_.start_[c];
          el != model.a_matrix_.start_[c + 1]; ++el)
       unite(c, numCol + model.a_matrix_.index_[el]);
   }
 
-  struct Component {
-    std::vector<HighsInt> cols;
-    std::vector<HighsInt> rows;
-  };
-  std::vector<Component> components;
   std::unordered_map<HighsInt, HighsInt> rootToComp;
   for (HighsInt c = 0; c != numCol; ++c) {
+    if (colFixed[c]) continue;
     HighsInt r = find(c);
     auto it = rootToComp.find(r);
     HighsInt idx;
@@ -912,32 +974,148 @@ void HighsMipSolverData::solveComponents() {
   for (HighsInt rw = 0; rw != numRow; ++rw) {
     HighsInt r = find(numCol + rw);
     auto it = rootToComp.find(r);
-    if (it == rootToComp.end()) continue;  // empty row: no columns
+    if (it == rootToComp.end()) {
+      // Row touches no unfixed column: either empty or fully fixed, so
+      // its activity is already determined (checked by the caller).
+      fixedRows.push_back(rw);
+      continue;
+    }
     components[it->second].rows.push_back(rw);
+  }
+
+  // Structural metrics per block (used for eligibility, logging and
+  // weak-coupling ratios).
+  for (HighsDecompComponent& comp : components) {
+    for (HighsInt c : comp.cols) {
+      const HighsVarType integrality = model.integrality_[c];
+      const bool discrete = integrality == HighsVarType::kInteger ||
+                            integrality == HighsVarType::kSemiInteger ||
+                            integrality == HighsVarType::kImplicitInteger;
+      if (discrete) {
+        ++comp.numInt;
+        if (model.col_lower_[c] == 0.0 && model.col_upper_[c] == 1.0)
+          ++comp.numBinary;
+      } else {
+        ++comp.numContinuous;
+      }
+      if (model.col_cost_[c] != 0.0) ++comp.numObjNz;
+      comp.numNz +=
+          model.a_matrix_.start_[c + 1] - model.a_matrix_.start_[c];
+    }
   }
 
   // Deterministic order: by (cols, rows, first col).
   std::vector<HighsInt> order(components.size());
   for (size_t k = 0; k != components.size(); ++k) order[k] = (HighsInt)k;
   pdqsort(order.begin(), order.end(), [&](HighsInt a, HighsInt b) {
-    const Component& A = components[a];
-    const Component& B = components[b];
+    const HighsDecompComponent& A = components[a];
+    const HighsDecompComponent& B = components[b];
     if (A.cols.size() != B.cols.size()) return A.cols.size() < B.cols.size();
     if (A.rows.size() != B.rows.size()) return A.rows.size() < B.rows.size();
     HighsInt fa = A.cols.empty() ? numCol : A.cols[0];
     HighsInt fb = B.cols.empty() ? numCol : B.cols[0];
     return fa < fb;
   });
+  std::vector<HighsDecompComponent> sorted;
+  sorted.reserve(components.size());
+  for (HighsInt idx : order) sorted.push_back(std::move(components[idx]));
+  components.swap(sorted);
+}
+
+bool HighsMipSolverData::verifyComponentSolution(
+    const HighsLp& sublp, const std::vector<double>& subcol) const {
+  const double tol = mipsolver.options_mip_->mip_feasibility_tolerance;
+  if (sublp.a_matrix_.format_ != MatrixFormat::kColwise) return false;
+  if (subcol.size() != (size_t)sublp.num_col_) return false;
+  // Bound and integrality check in the submodel space.
+  for (HighsInt c = 0; c != sublp.num_col_; ++c) {
+    const double v = subcol[c];
+    if (!std::isfinite(v)) return false;
+    const HighsVarType integrality = sublp.integrality_[c];
+    if (integrality == HighsVarType::kSemiContinuous ||
+        integrality == HighsVarType::kSemiInteger) {
+      // Semi-continuous: zero or within [lower, upper].
+      if (std::fabs(v) <= tol) continue;
+    }
+    if (v < sublp.col_lower_[c] - tol || v > sublp.col_upper_[c] + tol)
+      return false;
+    if (integrality == HighsVarType::kInteger ||
+        integrality == HighsVarType::kSemiInteger ||
+        integrality == HighsVarType::kImplicitInteger) {
+      if (std::fabs(v - std::round(v)) > tol) return false;
+    }
+  }
+  // Row-activity check: the fixing is only valid if the submodel rows
+  // hold (up to the parent feasibility tolerance).
+  std::vector<double> activity(sublp.num_row_, 0.0);
+  for (HighsInt c = 0; c != sublp.num_col_; ++c) {
+    for (HighsInt el = sublp.a_matrix_.start_[c];
+         el != sublp.a_matrix_.start_[c + 1]; ++el)
+      activity[sublp.a_matrix_.index_[el]] +=
+          sublp.a_matrix_.value_[el] * subcol[c];
+  }
+  for (HighsInt r = 0; r != sublp.num_row_; ++r) {
+    if (activity[r] < sublp.row_lower_[r] - tol ||
+        activity[r] > sublp.row_upper_[r] + tol)
+      return false;
+  }
+  return true;
+}
+
+bool HighsMipSolverData::solveComponentPass(const HighsInt pass,
+                                            HighsDecompStats& stats) {
+  HighsLp& model = presolvedModel;
+  const HighsInt numCol = model.num_col_;
+  const HighsInt numRow = model.num_row_;
+  const bool logDecomp = mipsolver.options_mip_->mip_decomposition_logging;
+
+  const double tDetect0 = mipsolver.timer_.getWallTime();
+  std::vector<HighsDecompComponent> components;
+  std::vector<HighsInt> fixedRows;
+  detectComponents(model, components, fixedRows);
+  stats.detectTime += mipsolver.timer_.getWallTime() - tDetect0;
+  stats.numComponents = (HighsInt)components.size();
+
+  // Shift fixed-column contributions out of the rows. Extracted submodels
+  // contain unfixed columns only, so their row bounds must be the parent
+  // bounds minus the fixed activity; the shift is exact because fixed
+  // columns have lb == ub (degenerate non-finite fixings bail out in the
+  // caller before the first pass).
+  std::vector<double> rowShift(numRow, 0.0);
+  for (HighsInt c = 0; c != numCol; ++c) {
+    if (model.col_lower_[c] != model.col_upper_[c]) continue;
+    const double fixval = model.col_lower_[c];
+    for (HighsInt el = model.a_matrix_.start_[c];
+         el != model.a_matrix_.start_[c + 1]; ++el)
+      rowShift[model.a_matrix_.index_[el]] +=
+          model.a_matrix_.value_[el] * fixval;
+  }
+
+  // Rows whose activity is already fully determined must hold; a
+  // violation proves the whole model infeasible (no search can repair a
+  // row with nothing left to decide).
+  const double feastol = mipsolver.options_mip_->mip_feasibility_tolerance;
+  for (HighsInt r : fixedRows) {
+    if (rowShift[r] < model.row_lower_[r] - feastol ||
+        rowShift[r] > model.row_upper_[r] + feastol) {
+      mipsolver.modelstatus_ = HighsModelStatus::kInfeasible;
+      return false;
+    }
+  }
 
   const bool isMin = model.sense_ == ObjSense::kMinimize;
-  HighsInt numSolved = 0;
-  HighsInt numFixed = 0;
-  // Size caps for exact subsolves (SCIP-style: tiny pieces only).
-  const HighsInt maxCompInts = 40;
-  const HighsInt maxCompCols = 64;
-  const HighsInt maxCompRows = 64;
-  for (HighsInt oi = 0; oi != (HighsInt)order.size(); ++oi) {
-    const Component& comp = components[order[oi]];
+  // Eligibility caps (SCIP-style: tiny pieces only). Defaults reproduce
+  // the proven 40/64/64 behaviour; configurable, not hardcoded.
+  const HighsInt maxCompInts =
+      mipsolver.options_mip_->mip_decomposition_max_comp_ints;
+  const HighsInt maxCompCols =
+      mipsolver.options_mip_->mip_decomposition_max_comp_cols;
+  const HighsInt maxCompRows =
+      mipsolver.options_mip_->mip_decomposition_max_comp_rows;
+
+  const double tSolve0 = mipsolver.timer_.getWallTime();
+  for (size_t oi = 0; oi != components.size(); ++oi) {
+    const HighsDecompComponent& comp = components[oi];
     if (comp.rows.empty()) {
       // Isolated columns: fix directly by cost sign (trivially optimal).
       for (HighsInt c : comp.cols) {
@@ -953,22 +1131,41 @@ void HighsMipSolverData::solveComponents() {
         if (model.integrality_[c] == HighsVarType::kInteger)
           fixval = std::round(fixval);
         model.col_lower_[c] = model.col_upper_[c] = fixval;
-        ++numFixed;
+        ++stats.numFixed;
       }
+      if (logDecomp)
+        highsLogUser(mipsolver.options_mip_->log_options,
+                     HighsLogType::kInfo,
+                     "[Decomp] pass %d block %d: rows=0 cols=%d nnz=0: "
+                     "isolated columns fixed by cost\n",
+                     (int)pass, (int)oi, (int)comp.cols.size());
       continue;
     }
+    // Eligibility counts strict integers only (proven behaviour); the
+    // metrics struct additionally reports semi/implicit discreteness.
     HighsInt nInt = 0;
     for (HighsInt c : comp.cols)
       if (model.integrality_[c] == HighsVarType::kInteger) ++nInt;
     if (nInt > maxCompInts || (HighsInt)comp.cols.size() > maxCompCols ||
-        (HighsInt)comp.rows.size() > maxCompRows)
+        (HighsInt)comp.rows.size() > maxCompRows) {
+      if (logDecomp)
+        highsLogUser(mipsolver.options_mip_->log_options,
+                     HighsLogType::kInfo,
+                     "[Decomp] pass %d block %d: rows=%d cols=%d int=%d "
+                     "bin=%d cont=%d nnz=%d objnz=%d: skipped (above caps)\n",
+                     (int)pass, (int)oi, (int)comp.rows.size(),
+                     (int)comp.cols.size(), (int)comp.numInt,
+                     (int)comp.numBinary, (int)comp.numContinuous,
+                     (int)comp.numNz, (int)comp.numObjNz);
       continue;
+    }
     // Respect the global time limit.
     if (mipsolver.options_mip_->time_limit < kHighsInf &&
         mipsolver.timer_.read() >= mipsolver.options_mip_->time_limit)
       break;
 
-    // Extract the sub-MIP.
+    // Extract the sub-MIP over unfixed columns only, with row bounds
+    // shifted by the fixed activity (exact restriction of the parent).
     HighsLp sublp;
     sublp.num_col_ = (HighsInt)comp.cols.size();
     sublp.num_row_ = (HighsInt)comp.rows.size();
@@ -997,8 +1194,12 @@ void HighsMipSolverData::solveComponents() {
     sublp.row_upper_.resize(sublp.num_row_);
     for (size_t k = 0; k != comp.rows.size(); ++k) {
       HighsInt r = comp.rows[k];
-      sublp.row_lower_[k] = model.row_lower_[r];
-      sublp.row_upper_[k] = model.row_upper_[r];
+      sublp.row_lower_[k] = model.row_lower_[r] == -kHighsInf
+                                ? -kHighsInf
+                                : model.row_lower_[r] - rowShift[r];
+      sublp.row_upper_[k] = model.row_upper_[r] == kHighsInf
+                                ? kHighsInf
+                                : model.row_upper_[r] - rowShift[r];
     }
     for (size_t k = 0; k != comp.cols.size(); ++k) {
       HighsInt c = comp.cols[k];
@@ -1027,7 +1228,8 @@ void HighsMipSolverData::solveComponents() {
     // bounds, so subsolver tolerance leaks directly into the reported
     // objective.
     suboptions.mip_feasibility_tolerance = 1e-9;
-    double remaining = mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
+    double remaining =
+        mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
     suboptions.time_limit = std::min(10.0, remaining);
 
     HighsSolution solution;
@@ -1039,30 +1241,270 @@ void HighsMipSolverData::solveComponents() {
     subsolver.initialiseTerminator(mipsolver);
     subsolver.run();
     if (subsolver.modelstatus_ == HighsModelStatus::kInfeasible) {
+      // The block shares no constraint with the rest of the model, so a
+      // proven-infeasible block proves the whole model infeasible.
       mipsolver.modelstatus_ = HighsModelStatus::kInfeasible;
-      return;
+      stats.solveTime += mipsolver.timer_.getWallTime() - tSolve0;
+      return false;
     }
-    if (subsolver.modelstatus_ != HighsModelStatus::kOptimal) continue;
+    if (subsolver.modelstatus_ != HighsModelStatus::kOptimal) {
+      if (logDecomp)
+        highsLogUser(mipsolver.options_mip_->log_options,
+                     HighsLogType::kInfo,
+                     "[Decomp] pass %d block %d: rows=%d cols=%d int=%d "
+                     "nnz=%d: subsolver status %d, left to parent\n",
+                     (int)pass, (int)oi, (int)comp.rows.size(),
+                     (int)comp.cols.size(), (int)comp.numInt, (int)comp.numNz,
+                     (int)subsolver.modelstatus_);
+      continue;
+    }
     const std::vector<double>& subcol = subsolver.solution_;
-    if (subcol.size() != comp.cols.size()) continue;
+    // Independently re-verify before baking values into parent bounds;
+    // an unverified fixing is silently dropped (safe fallback).
+    if (!verifyComponentSolution(sublp, subcol)) {
+      if (logDecomp)
+        highsLogUser(mipsolver.options_mip_->log_options,
+                     HighsLogType::kInfo,
+                     "[Decomp] pass %d block %d: subsolver optimal but "
+                     "verification failed, left to parent\n",
+                     (int)pass, (int)oi);
+      continue;
+    }
+    bool allFixed = true;
     for (size_t k = 0; k != comp.cols.size(); ++k) {
       HighsInt c = comp.cols[k];
       double fixval = subcol[k];
-      if (!std::isfinite(fixval)) break;
+      if (!std::isfinite(fixval)) {
+        allFixed = false;
+        break;
+      }
       if (model.integrality_[c] == HighsVarType::kInteger)
         fixval = std::round(fixval);
       fixval = std::min(std::max(fixval, model.col_lower_[c]),
                         model.col_upper_[c]);
       model.col_lower_[c] = model.col_upper_[c] = fixval;
-      ++numFixed;
+      ++stats.numFixed;
     }
-    ++numSolved;
+    if (!allFixed) continue;
+    ++stats.numSolved;
+    if (logDecomp)
+      highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
+                   "[Decomp] pass %d block %d: rows=%d cols=%d int=%d "
+                   "nnz=%d solved optimal, fixed %d columns\n",
+                   (int)pass, (int)oi, (int)comp.rows.size(),
+                   (int)comp.cols.size(), (int)comp.numInt, (int)comp.numNz,
+                   (int)comp.cols.size());
   }
+  stats.solveTime += mipsolver.timer_.getWallTime() - tSolve0;
+  return true;
+}
 
-  if ((numSolved > 0 || numFixed > 0) && numRestarts == 0)
-    highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
-                 "MIP presolve: solved %d components, fixed %d columns\n",
-                 (int)numSolved, (int)numFixed);
+void HighsMipSolverData::analyzeWeakCoupling(
+    const HighsLp& model, const std::vector<HighsDecompComponent>& components,
+    HighsInt numFixedCols) const {
+  const HighsLogOptions& logOptions = mipsolver.options_mip_->log_options;
+  const HighsInt numCol = model.num_col_;
+  const HighsInt numRow = model.num_row_;
+  if (numCol == 0) return;
+  // Block table: quality metrics for every detected block.
+  HighsInt totalNnz = 0;
+  for (size_t i = 0; i != components.size(); ++i) {
+    const HighsDecompComponent& comp = components[i];
+    totalNnz += comp.numNz;
+    const double density =
+        comp.cols.empty() || comp.rows.empty()
+            ? 0.0
+            : (double)comp.numNz /
+                  ((double)comp.cols.size() * (double)comp.rows.size());
+    highsLogUser(logOptions, HighsLogType::kInfo,
+                 "[Decomp] block %d: rows=%d cols=%d int=%d bin=%d cont=%d "
+                 "nnz=%d objnz=%d density=%.4g intratio=%.3g\n",
+                 (int)i, (int)comp.rows.size(), (int)comp.cols.size(),
+                 (int)comp.numInt, (int)comp.numBinary,
+                 (int)comp.numContinuous, (int)comp.numNz, (int)comp.numObjNz,
+                 density,
+                 comp.cols.empty()
+                     ? 0.0
+                     : (double)comp.numInt / (double)comp.cols.size());
+  }
+  if (components.size() != 1) {
+    highsLogUser(logOptions, HighsLogType::kInfo,
+                 "[Decomp] structure: %d independent blocks (%d parent "
+                 "columns fixed by exact subsolves); no coupling analysis "
+                 "needed\n",
+                 (int)components.size(), (int)numFixedCols);
+    return;
+  }
+  // Single remaining block: look for one coupling row/column whose
+  // removal would split it. Heuristic caps keep this log-only analysis
+  // cheap; thresholds are reported, not tuned.
+  const HighsDecompComponent& big = components[0];
+  if (big.cols.size() < 20) {
+    highsLogUser(logOptions, HighsLogType::kInfo,
+                 "[Decomp] structure: single small block, no decomposition "
+                 "analysis needed\n");
+    return;
+  }
+  if (model.a_matrix_.format_ != MatrixFormat::kColwise) return;
+  // The single-cut scan below is quadratic-ish; on giant blocks it would
+  // dominate presolve. It is a log-only heuristic, so skip the scan (not
+  // the block table above) beyond a documented size. Threshold heuristic.
+  const HighsInt maxScanCols = 3000;
+  if (numCol > maxScanCols) {
+    highsLogUser(logOptions, HighsLogType::kInfo,
+                 "[Decomp] structure: single block with %d columns exceeds "
+                 "the coupling-scan limit (%d); no cut search performed -> "
+                 "normal MIP\n",
+                 (int)numCol, (int)maxScanCols);
+    return;
+  }
+  // Row-wise adjacency for the row-cut search.
+  std::vector<HighsInt> rowStart(numRow + 1, 0);
+  std::vector<HighsInt> rowCount(numRow, 0);
+  for (HighsInt c = 0; c != numCol; ++c) {
+    if (model.col_lower_[c] == model.col_upper_[c]) continue;
+    for (HighsInt el = model.a_matrix_.start_[c];
+         el != model.a_matrix_.start_[c + 1]; ++el)
+      ++rowCount[model.a_matrix_.index_[el]];
+  }
+  for (HighsInt r = 0; r != numRow; ++r) rowStart[r + 1] = rowStart[r] + rowCount[r];
+  std::vector<HighsInt> rowCols(rowStart[numRow], -1);
+  std::vector<HighsInt> rowFill(numRow, 0);
+  for (HighsInt c = 0; c != numCol; ++c) {
+    if (model.col_lower_[c] == model.col_upper_[c]) continue;
+    for (HighsInt el = model.a_matrix_.start_[c];
+         el != model.a_matrix_.start_[c + 1]; ++el) {
+      HighsInt r = model.a_matrix_.index_[el];
+      rowCols[rowStart[r] + rowFill[r]++] = c;
+    }
+  }
+  auto countPiecesExcludingCol = [&](HighsInt exclCol) {
+    // Union-find over unfixed columns except exclCol; counts nontrivial
+    // pieces (size >= 10 columns) and the largest piece.
+    std::vector<HighsInt> parent(numCol + numRow);
+    for (HighsInt i = 0; i != numCol + numRow; ++i) parent[i] = i;
+    std::function<HighsInt(HighsInt)> find = [&](HighsInt a) {
+      while (parent[a] != a) {
+        parent[a] = parent[parent[a]];
+        a = parent[a];
+      }
+      return a;
+    };
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (c == exclCol) continue;
+      if (model.col_lower_[c] == model.col_upper_[c]) continue;
+      for (HighsInt el = model.a_matrix_.start_[c];
+           el != model.a_matrix_.start_[c + 1]; ++el) {
+        HighsInt a = find(c), b = find(numCol + model.a_matrix_.index_[el]);
+        if (a != b) parent[a] = b;
+      }
+    }
+    std::unordered_map<HighsInt, HighsInt> sizes;
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (c == exclCol) continue;
+      if (model.col_lower_[c] == model.col_upper_[c]) continue;
+      ++sizes[find(c)];
+    }
+    HighsInt nontrivial = 0, largest = 0;
+    for (const auto& kv : sizes) {
+      largest = std::max(largest, kv.second);
+      if (kv.second >= 10) ++nontrivial;
+    }
+    return std::make_pair(nontrivial, largest);
+  };
+  // Coupling-column (Benders-shape) search over low-degree columns.
+  const HighsInt maxColCands = 2000;
+  HighsInt colCands = 0;
+  HighsInt bestCol = -1;
+  HighsInt bestColPieces = 1;
+  for (HighsInt c = 0; c != numCol && colCands != maxColCands; ++c) {
+    if (model.col_lower_[c] == model.col_upper_[c]) continue;
+    const HighsInt deg =
+        model.a_matrix_.start_[c + 1] - model.a_matrix_.start_[c];
+    if (deg < 2 || deg > 16) continue;
+    ++colCands;
+    auto pieces = countPiecesExcludingCol(c);
+    if (pieces.first > bestColPieces) {
+      bestColPieces = pieces.first;
+      bestCol = c;
+    }
+  }
+  // Coupling-row (dual-decomposition-shape) search over sparse rows.
+  HighsInt bestRow = -1;
+  HighsInt bestRowPieces = 1;
+  HighsInt rowCands = 0;
+  const HighsInt maxRowCands = 2000;
+  // Removal of row r splits the block iff its columns fall into >= 2
+  // DSU pieces built without r. Reuse a full DSU per candidate row.
+  for (HighsInt r = 0; r != numRow && rowCands != maxRowCands; ++r) {
+    const HighsInt deg = rowStart[r + 1] - rowStart[r];
+    if (deg < 2 || deg > 8) continue;
+    ++rowCands;
+    std::vector<HighsInt> parent(numCol + numRow);
+    for (HighsInt i = 0; i != numCol + numRow; ++i) parent[i] = i;
+    std::function<HighsInt(HighsInt)> find = [&](HighsInt a) {
+      while (parent[a] != a) {
+        parent[a] = parent[parent[a]];
+        a = parent[a];
+      }
+      return a;
+    };
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (model.col_lower_[c] == model.col_upper_[c]) continue;
+      for (HighsInt el = model.a_matrix_.start_[c];
+           el != model.a_matrix_.start_[c + 1]; ++el) {
+        HighsInt rr = model.a_matrix_.index_[el];
+        if (rr == r) continue;
+        HighsInt a = find(c), b = find(numCol + rr);
+        if (a != b) parent[a] = b;
+      }
+    }
+    std::unordered_map<HighsInt, HighsInt> sizes;
+    for (HighsInt c : big.cols) ++sizes[find(c)];
+    HighsInt nontrivial = 0;
+    for (const auto& kv : sizes)
+      if (kv.second >= 10) ++nontrivial;
+    if (nontrivial > bestRowPieces) {
+      bestRowPieces = nontrivial;
+      bestRow = r;
+    }
+  }
+  const double couplingTol = 0.05;  // reported heuristic, not tuned
+  if (bestCol >= 0 && bestColPieces >= 2) {
+    const HighsInt deg =
+        model.a_matrix_.start_[bestCol + 1] - model.a_matrix_.start_[bestCol];
+    const double ratio =
+        totalNnz == 0 ? 0.0 : (double)deg / (double)totalNnz;
+    const HighsVarType vt = model.integrality_[bestCol];
+    const bool discreteMaster = vt == HighsVarType::kInteger ||
+                                vt == HighsVarType::kSemiInteger ||
+                                vt == HighsVarType::kImplicitInteger;
+    highsLogUser(logOptions, HighsLogType::kInfo,
+                 "[Decomp] weak coupling: removing column %d (degree %d, "
+                 "coupling ratio %.4g) splits the block into %d pieces; "
+                 "master type %s -> %s\n",
+                 (int)bestCol, (int)deg, ratio, (int)bestColPieces,
+                 discreteMaster ? "discrete" : "continuous",
+                 ratio < couplingTol && discreteMaster
+                     ? "possible Benders candidate (not attempted)"
+                     : "not a Benders candidate, normal MIP");
+  } else if (bestRow >= 0 && bestRowPieces >= 2) {
+    const HighsInt deg = rowStart[bestRow + 1] - rowStart[bestRow];
+    const double ratio =
+        totalNnz == 0 ? 0.0 : (double)deg / (double)totalNnz;
+    highsLogUser(logOptions, HighsLogType::kInfo,
+                 "[Decomp] weak coupling: removing row %d (degree %d, "
+                 "coupling ratio %.4g) splits the block into %d pieces; "
+                 "coupling-row shape suits Lagrangian/dual decomposition, "
+                 "not Benders -> normal MIP\n",
+                 (int)bestRow, (int)deg, ratio, (int)bestRowPieces);
+  } else {
+    highsLogUser(logOptions, HighsLogType::kInfo,
+                 "[Decomp] structure: heavily coupled single block "
+                 "(no single row/column cut found over %d row / %d column "
+                 "candidates) -> normal MIP\n",
+                 (int)rowCands, (int)colCands);
+  }
 }
 
 void HighsMipSolverData::checkAddSolution() {
