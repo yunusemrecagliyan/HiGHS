@@ -778,9 +778,10 @@ restart:
       double ms = 0.0;
       int64_t improvements = 0;
     };
-    static HeurStats hstats[7];
-    static const char* hnames[7] = {"CAR", "RR",  "DIV", "RENS",
-                                    "RINS", "LB", "SHF"};
+    static HeurStats hstats[9];
+    static const char* hnames[9] = {"CAR", "RR",  "DIV", "RENS",
+                                    "RINS", "LB", "SHF",  "HAM",
+                                    "PRX"};
     static std::chrono::steady_clock::time_point hstatsT0 =
         std::chrono::steady_clock::now();
     static bool hstatsReg = [] {
@@ -792,7 +793,7 @@ restart:
                                std::chrono::steady_clock::now() - hstatsT0)
                                .count();
         fprintf(f, "total=%.2fs\n", tot);
-        for (int t = 0; t < 7; ++t)
+        for (int t = 0; t < 9; ++t)
           fprintf(f, "%5s calls=%lld ms=%.0f improvements=%lld\n", hnames[t],
                   (long long)hstats[t].calls, hstats[t].ms,
                   (long long)hstats[t].improvements);
@@ -942,6 +943,20 @@ restart:
               worker,
               worker.getLpRelaxation().getLpSolver().getSolution().col_value);
         });
+        if (!mipdata_->parallelLockActive())
+          profiling_->stop(kMipClockDiveRins);
+      }
+      if (options_mip_->mip_heuristic_run_hamming) {
+        if (!mipdata_->parallelLockActive())
+          profiling_->start(kMipClockDiveRins);
+        HEUR_RUN(7, { mipdata_->heuristics.hammingSearch(worker); });
+        if (!mipdata_->parallelLockActive())
+          profiling_->stop(kMipClockDiveRins);
+      }
+      if (options_mip_->mip_heuristic_run_proximity) {
+        if (!mipdata_->parallelLockActive())
+          profiling_->start(kMipClockDiveRins);
+        HEUR_RUN(8, { mipdata_->heuristics.proximitySearch(worker); });
         if (!mipdata_->parallelLockActive())
           profiling_->stop(kMipClockDiveRins);
       }

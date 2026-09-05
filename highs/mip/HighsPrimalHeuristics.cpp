@@ -650,6 +650,290 @@ void HighsPrimalHeuristics::localBranching(HighsMipWorker& worker,
       200 + mipsolver.mipdata_->num_nodes / (node_reduction_factor * 20), 12);
 }
 
+void HighsPrimalHeuristics::proximitySearch(HighsMipWorker& worker) {
+  // Proximity search (SCIP proximity-style, clean-room): minimize the
+  // binary Hamming distance to the incumbent subject to a strict
+  // objective cutoff, and solve the restricted sub-MIP. Any sub-MIP
+  // solution strictly improves the incumbent by construction; results
+  // flow through the verified incumbent channel. Re-runs across node
+  // visits iterate implicitly as the incumbent improves. No auxiliary
+  // columns (sub-MIP dimensions match the parent). Bounded by sub-MIP
+  // caps plus the global time limit; opt-in.
+  if (worker.getGlobalDomain().infeasible()) return;
+  const auto& incumbent = mipsolver.mipdata_->incumbent;
+  if (incumbent.empty()) return;
+  if ((HighsInt)incumbent.size() != mipsolver.numCol()) return;
+  if (mipsolver.submip && mipsolver.mipdata_->numImprovingSols != 0) return;
+  const HighsDomain& globaldom = worker.getGlobalDomain();
+  const double feastol = mipsolver.mipdata_->feastol;
+  struct DistVar {
+    HighsInt col;
+    double coef;  // +1 if center 0, -1 if center 1
+  };
+  std::vector<DistVar> dist;
+  for (HighsInt j : intcols) {
+    if (j < 0 || j >= mipsolver.numCol()) continue;
+    if (globaldom.isFixed(j)) continue;
+    if (globaldom.variableType(j) != HighsVarType::kInteger) continue;
+    if (globaldom.col_lower_[j] != 0.0 || globaldom.col_upper_[j] != 1.0)
+      continue;
+    const double v = incumbent[j];
+    if (!std::isfinite(v)) continue;
+    const double c = std::round(v);
+    if (std::fabs(v - c) > feastol) continue;
+    dist.push_back({j, (c == 0.0) ? 1.0 : -1.0});
+  }
+  const double ub = mipsolver.mipdata_->upper_bound;
+  if (!std::isfinite(ub) || ub >= 0.5 * kHighsInf) return;
+  const double deltaFrac =
+      mipsolver.options_mip_->mip_heuristic_proximity_delta;
+  const double cutoff = ub - deltaFrac * std::max(1.0, std::fabs(ub));
+  // LP relaxation instantiation (mirrors hammingSearch).
+  HighsLpRelaxation heurlp(mipsolver);
+  heurlp.setMipWorker(worker);
+  heurlp.setProfiling(mipsolver.profiling_);
+  heurlp.loadModel();
+  heurlp.setIterationLimit(
+      std::max(int64_t{10000}, 2 * mipsolver.mipdata_->firstrootlpiters));
+  heurlp.getLpSolver().changeColsBounds(0, mipsolver.numCol() - 1,
+                                        globaldom.col_lower_.data(),
+                                        globaldom.col_upper_.data());
+  heurlp.getLpSolver().setBasis(mipsolver.mipdata_->firstrootbasis,
+                                "HighsPrimalHeuristics::proximitySearch");
+  heurlp.removeObsoleteRows(false);
+  HighsLp sublp = heurlp.getLp();
+  if (sublp.a_matrix_.format_ != MatrixFormat::kColwise)
+    sublp.a_matrix_.ensureColwise();
+  const HighsInt ncols0 = sublp.num_col_;
+  const HighsInt nrows0 = sublp.num_row_;
+  if ((HighsInt)sublp.col_cost_.size() != ncols0) return;
+  const std::vector<double> origCost = sublp.col_cost_;
+  // Distance objective (constant #ones dropped: argmin unaffected).
+  std::fill(sublp.col_cost_.begin(), sublp.col_cost_.end(), 0.0);
+  for (const DistVar& d : dist) sublp.col_cost_[d.col] = d.coef;
+  // Cutoff row with original costs (single appended row).
+  const HighsInt cutRow = nrows0;
+  std::vector<std::vector<std::pair<HighsInt, double>>> colNew(ncols0);
+  for (HighsInt c = 0; c != ncols0; ++c) {
+    if (origCost[c] != 0.0) colNew[c].emplace_back(cutRow, origCost[c]);
+  }
+  sublp.num_row_ = nrows0 + 1;
+  if (!sublp.row_names_.empty()) sublp.row_names_.push_back("proximity_cut");
+  sublp.row_lower_.resize(sublp.num_row_, -kHighsInf);
+  sublp.row_upper_.resize(sublp.num_row_, kHighsInf);
+  sublp.row_upper_[cutRow] = cutoff;
+  {
+    std::vector<HighsInt> newIndex;
+    std::vector<double> newValue;
+    std::vector<HighsInt> newStart(sublp.num_col_ + 1, 0);
+    newIndex.reserve(sublp.a_matrix_.index_.size() + ncols0);
+    newValue.reserve(sublp.a_matrix_.value_.size() + ncols0);
+    for (HighsInt c = 0; c != ncols0; ++c) {
+      for (HighsInt e = sublp.a_matrix_.start_[c];
+           e != sublp.a_matrix_.start_[c + 1]; ++e) {
+        newIndex.push_back(sublp.a_matrix_.index_[e]);
+        newValue.push_back(sublp.a_matrix_.value_[e]);
+      }
+      for (const auto& e : colNew[c]) {
+        newIndex.push_back(e.first);
+        newValue.push_back(e.second);
+      }
+      newStart[c + 1] = (HighsInt)newIndex.size();
+    }
+    sublp.a_matrix_.index_ = std::move(newIndex);
+    sublp.a_matrix_.value_ = std::move(newValue);
+    sublp.a_matrix_.start_ = std::move(newStart);
+  }
+  HighsBasis basis = heurlp.getLpSolver().getBasis();
+  if ((HighsInt)basis.col_status.size() == ncols0 &&
+      (HighsInt)basis.row_status.size() == nrows0) {
+    basis.row_status.resize(sublp.num_row_, HighsBasisStatus::kBasic);
+  } else {
+    basis.col_status.assign(ncols0, HighsBasisStatus::kNonbasic);
+    basis.row_status.assign(sublp.num_row_, HighsBasisStatus::kBasic);
+    basis.valid = false;
+  }
+  std::vector<double> subLB = globaldom.col_lower_;
+  std::vector<double> subUB = globaldom.col_upper_;
+  HighsInt node_reduction_factor =
+      mipsolver.mipdata_->parallelLockActive()
+          ? std::max(
+                HighsInt{1},
+                static_cast<HighsInt>(mipsolver.mipdata_->workers.size()) / 4)
+          : 1;
+  solveSubMip(worker, sublp, basis, 0.0, std::move(subLB), std::move(subUB),
+              500,
+              200 + mipsolver.mipdata_->num_nodes /
+                        (node_reduction_factor * 20),
+              12);
+}
+
+void HighsPrimalHeuristics::hammingSearch(HighsMipWorker& worker) {
+  // Hamming-ball neighbourhood search (SCIP localbranching-style,
+  // clean-room): restrict the neighbourhood of the incumbent and solve
+  // the restricted sub-MIP. Binaries enter an L1 ball row (every k-flip
+  // combination explored); general integers get a box tightening around
+  // the incumbent. Deliberately NO auxiliary columns: sub-MIP dimensions
+  // stay identical to the parent, so all shared sub-MIP initialisation
+  // (implications, cliques, pseudocosts) stays in-bounds. The ball/box
+  // always contains the incumbent, so the sub-MIP can only improve;
+  // results flow through the verified incumbent channel. Bounded by
+  // sub-MIP node/leaf/stall caps plus the global time limit; opt-in.
+  if (worker.getGlobalDomain().infeasible()) return;
+  const auto& incumbent = mipsolver.mipdata_->incumbent;
+  if (incumbent.empty()) return;
+  if ((HighsInt)incumbent.size() != mipsolver.numCol()) return;
+  if (mipsolver.submip && mipsolver.mipdata_->numImprovingSols != 0) return;
+  const HighsDomain& globaldom = worker.getGlobalDomain();
+  const double feastol = mipsolver.mipdata_->feastol;
+  struct BallVar {
+    HighsInt col;
+    double center;
+    bool binary;
+  };
+  std::vector<BallVar> ball;
+  for (HighsInt j : intcols) {
+    if (j < 0 || j >= mipsolver.numCol()) continue;
+    if (globaldom.isFixed(j)) continue;
+    const HighsVarType vtype = globaldom.variableType(j);
+    const bool isInt = (vtype == HighsVarType::kInteger);
+    const bool isImpl = (vtype == HighsVarType::kImplicitInteger);
+    if (!isInt && !isImpl) continue;
+    const double v = incumbent[j];
+    if (!std::isfinite(v)) continue;
+    const double c = std::round(v);
+    if (std::fabs(v - c) > feastol) continue;
+    const bool binary =
+        isInt && globaldom.col_lower_[j] == 0.0 &&
+        globaldom.col_upper_[j] == 1.0;
+    ball.push_back({j, c, binary});
+  }
+  if (ball.empty()) return;
+  HighsInt nBallTerms = 0;
+  for (const BallVar& b : ball) {
+    if (b.binary) ++nBallTerms;
+  }
+  HighsInt radius = std::max<HighsInt>(
+      1, mipsolver.options_mip_->mip_heuristic_hamming_radius);
+  // Without a ball row (vacuous or no binaries) the box below still
+  // restricts; with neither, there is nothing to solve.
+  const bool haveBallRow = (nBallTerms > 0) && (radius < nBallTerms);
+  // LP relaxation instantiation (mirrors localBranching).
+  HighsLpRelaxation heurlp(mipsolver);
+  heurlp.setMipWorker(worker);
+  heurlp.setProfiling(mipsolver.profiling_);
+  heurlp.loadModel();
+  heurlp.setIterationLimit(
+      std::max(int64_t{10000}, 2 * mipsolver.mipdata_->firstrootlpiters));
+  heurlp.getLpSolver().changeColsBounds(0, mipsolver.numCol() - 1,
+                                        globaldom.col_lower_.data(),
+                                        globaldom.col_upper_.data());
+  heurlp.getLpSolver().setBasis(mipsolver.mipdata_->firstrootbasis,
+                                "HighsPrimalHeuristics::hammingSearch");
+  heurlp.removeObsoleteRows(false);
+  HighsLp sublp = heurlp.getLp();
+  if (sublp.a_matrix_.format_ != MatrixFormat::kColwise)
+    sublp.a_matrix_.ensureColwise();
+  const HighsInt ncols0 = sublp.num_col_;
+  const HighsInt nrows0 = sublp.num_row_;
+  if ((HighsInt)sublp.col_cost_.size() != ncols0) return;
+  // Map general ball vars to box tightening (bounds vectors built
+  // below); binaries go to the ball row. No auxiliary columns.
+  const HighsInt ballRow = nrows0;
+  std::vector<std::vector<std::pair<HighsInt, double>>> colNew(ncols0);
+  double ballRhs = (double)radius;
+  if (haveBallRow) {
+    for (const BallVar& b : ball) {
+      if (!b.binary) continue;
+      if (b.center == 0.0) {
+        colNew[b.col].emplace_back(ballRow, 1.0);
+      } else {
+        colNew[b.col].emplace_back(ballRow, -1.0);
+        ballRhs -= 1.0;
+      }
+    }
+  }
+  std::vector<double> subLB = globaldom.col_lower_;
+  std::vector<double> subUB = globaldom.col_upper_;
+  HighsInt nTightened = 0;
+  for (const BallVar& b : ball) {
+    if (b.binary) continue;
+    const double lo = std::max(globaldom.col_lower_[b.col],
+                               b.center - (double)radius);
+    const double hi = std::min(globaldom.col_upper_[b.col],
+                               b.center + (double)radius);
+    if (lo > globaldom.col_lower_[b.col] + feastol ||
+        hi < globaldom.col_upper_[b.col] - feastol)
+      ++nTightened;
+    subLB[b.col] = lo;
+    subUB[b.col] = hi;
+  }
+  if (!haveBallRow && nTightened == 0) return;  // nothing restricted
+  const HighsInt nNewRows = haveBallRow ? 1 : 0;
+  sublp.num_col_ = ncols0;  // unchanged: no auxiliary columns
+  sublp.num_row_ = nrows0 + nNewRows;
+  // No new columns: costs, bounds and integrality carry over untouched.
+  if (!sublp.row_names_.empty() && haveBallRow)
+    sublp.row_names_.push_back("hamming_ball");
+  sublp.row_lower_.resize(sublp.num_row_, -kHighsInf);
+  sublp.row_upper_.resize(sublp.num_row_, kHighsInf);
+  if (haveBallRow) sublp.row_upper_[ballRow] = ballRhs;
+  // Rebuild the colwise matrix with the appended ball row.
+  {
+    std::vector<HighsInt> newIndex;
+    std::vector<double> newValue;
+    std::vector<HighsInt> newStart(sublp.num_col_ + 1, 0);
+    newIndex.reserve(sublp.a_matrix_.index_.size() + 2 * ncols0);
+    newValue.reserve(sublp.a_matrix_.value_.size() + 2 * ncols0);
+    for (HighsInt c = 0; c != ncols0; ++c) {
+      for (HighsInt e = sublp.a_matrix_.start_[c];
+           e != sublp.a_matrix_.start_[c + 1]; ++e) {
+        newIndex.push_back(sublp.a_matrix_.index_[e]);
+        newValue.push_back(sublp.a_matrix_.value_[e]);
+      }
+      for (const auto& e : colNew[c]) {
+        newIndex.push_back(e.first);
+        newValue.push_back(e.second);
+      }
+      newStart[c + 1] = (HighsInt)newIndex.size();
+    }
+    sublp.a_matrix_.index_ = std::move(newIndex);
+    sublp.a_matrix_.value_ = std::move(newValue);
+    sublp.a_matrix_.start_ = std::move(newStart);
+  }
+  // Basis hint: column part unchanged (same dimensions); extend the row
+  // part for the appended ball row, or fabricate a well-formed all-slack
+  // descriptor (marked invalid) when no usable hint exists, so sizes are
+  // always consistent and nothing reads out of bounds.
+  HighsBasis basis = heurlp.getLpSolver().getBasis();
+  if ((HighsInt)basis.col_status.size() == ncols0 &&
+      (HighsInt)basis.row_status.size() == nrows0) {
+    basis.row_status.resize(sublp.num_row_, HighsBasisStatus::kBasic);
+  } else {
+    basis.col_status.assign(ncols0, HighsBasisStatus::kNonbasic);
+    basis.row_status.assign(sublp.num_row_, HighsBasisStatus::kBasic);
+    basis.valid = false;
+  }
+  HighsInt node_reduction_factor =
+      mipsolver.mipdata_->parallelLockActive()
+          ? std::max(
+                HighsInt{1},
+                static_cast<HighsInt>(mipsolver.mipdata_->workers.size()) / 4)
+          : 1;
+  // Restriction share for shared adaptive stats: fraction of ball vars
+  // actually restricted (ball row and/or tightened box). Directionally
+  // like a high fixing rate; the ball/box itself fixes nothing.
+  HighsInt nTouched = (haveBallRow ? nBallTerms : 0) + nTightened;
+  const double restrictRate =
+      (double)nTouched /
+      (double)std::max<HighsInt>(1, (HighsInt)ball.size());
+  solveSubMip(worker, sublp, basis, restrictRate, std::move(subLB),
+              std::move(subUB), 500,
+              200 + mipsolver.mipdata_->num_nodes /
+                        (node_reduction_factor * 20),
+              12);
+}
+
 void HighsPrimalHeuristics::rootReducedCost(HighsMipWorker& worker) {
   std::vector<std::pair<double, HighsDomainChange>> lurkingBounds =
       mipsolver.mipdata_->redcostfixing.getLurkingBounds(

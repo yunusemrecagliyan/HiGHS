@@ -552,6 +552,10 @@ struct HighsOptionsStruct {
   bool mip_heuristic_polish;
   HighsInt mip_heuristic_polish_passes;
   HighsInt mip_heuristic_polish_maxpairs;
+  bool mip_heuristic_run_hamming;
+  HighsInt mip_heuristic_hamming_radius;
+  bool mip_heuristic_run_proximity;
+  double mip_heuristic_proximity_delta;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -751,7 +755,11 @@ struct HighsOptionsStruct {
         mip_benders_dual_bound(false),
         mip_heuristic_polish(true),
         mip_heuristic_polish_passes(2),
-        mip_heuristic_polish_maxpairs(5000) {};
+        mip_heuristic_polish_maxpairs(5000),
+        mip_heuristic_run_hamming(false),
+        mip_heuristic_hamming_radius(20),
+        mip_heuristic_run_proximity(false),
+        mip_heuristic_proximity_delta(0.01) {};
   // clang-format on
 };
 
@@ -1531,6 +1539,36 @@ class HighsOptions : public HighsOptionsStruct {
         "of incumbent polishing",
         advanced, &mip_heuristic_polish_maxpairs, 0, 5000, kHighsIInf);
     records.push_back(record_int);
+
+    record_bool = new OptionRecordBool(
+        "mip_heuristic_run_hamming",
+        "Whether Hamming-ball neighbourhood search around the incumbent "
+        "is run (opt-in sub-MIP heuristic)",
+        advanced, &mip_heuristic_run_hamming, false);
+    records.push_back(record_bool);
+
+    record_int = new OptionRecordInt(
+        "mip_heuristic_hamming_radius",
+        "Neighbourhood radius: max flips for the binary ball row, box "
+        "half-width around the incumbent for general integers "
+        "(neighbourhood skipped when it restricts nothing)",
+        advanced, &mip_heuristic_hamming_radius, 1, 20, kHighsIInf);
+    records.push_back(record_int);
+
+    record_bool = new OptionRecordBool(
+        "mip_heuristic_run_proximity",
+        "Whether proximity search (minimize distance to incumbent "
+        "subject to a strict objective cutoff) is run (opt-in sub-MIP "
+        "heuristic)",
+        advanced, &mip_heuristic_run_proximity, false);
+    records.push_back(record_bool);
+
+    record_double = new OptionRecordDouble(
+        "mip_heuristic_proximity_delta",
+        "Strict improvement fraction of the proximity cutoff over the "
+        "incumbent (cutoff = UB - delta*max(1,|UB|))",
+        advanced, &mip_heuristic_proximity_delta, 0.0, 0.01, 1.0);
+    records.push_back(record_double);
 
     record_bool = new OptionRecordBool(
         "mip_lagrangian",

@@ -51,6 +51,21 @@ class HighsPrimalHeuristics {
   void localBranching(HighsMipWorker& worker,
                       const std::vector<double>& relaxationsol);
 
+  // Hamming-ball neighbourhood search (SCIP localbranching-style,
+  // clean-room): restrict the neighbourhood of the incumbent and solve
+  // the restricted sub-MIP. Binaries enter an L1 ball row (every k-flip
+  // combination explored); general integers get a box tightening around
+  // the incumbent. Deliberately no auxiliary columns, so sub-MIP
+  // dimensions match the parent. Bounded by sub-MIP caps; opt-in.
+  void hammingSearch(HighsMipWorker& worker);
+
+  // Proximity search (SCIP proximity-style, clean-room): minimize the
+  // binary Hamming distance to the incumbent subject to a strict
+  // objective cutoff, and solve the restricted sub-MIP. Forces strict
+  // improvement nearby; iterates implicitly as the incumbent improves
+  // across node visits. No auxiliary columns; opt-in.
+  void proximitySearch(HighsMipWorker& worker);
+
   void RENS(HighsMipWorker& worker, const std::vector<double>& relaxationsol);
 
   void RINS(HighsMipWorker& worker, const std::vector<double>& relaxationsol);
