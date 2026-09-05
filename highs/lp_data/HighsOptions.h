@@ -539,6 +539,7 @@ struct HighsOptionsStruct {
   HighsInt mip_benders_max_iterations;
   HighsInt mip_benders_max_coupling_cols;
   HighsInt mip_benders_min_block_cols;
+  bool mip_benders_feas_aux;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -725,7 +726,8 @@ struct HighsOptionsStruct {
         mip_lagrangian_max_time(5.0),
         mip_benders_max_iterations(100),
         mip_benders_max_coupling_cols(16),
-        mip_benders_min_block_cols(10) {};
+        mip_benders_min_block_cols(10),
+        mip_benders_feas_aux(true) {};
   // clang-format on
 };
 
@@ -1403,6 +1405,14 @@ class HighsOptions : public HighsOptionsStruct {
         "into the master problem",
         advanced, &mip_benders_min_block_cols, 1, 10, kHighsIInf);
     records.push_back(record_int);
+
+    record_bool = new OptionRecordBool(
+        "mip_benders_feas_aux",
+        "Whether Benders builds an auxiliary always-feasible LP to recover "
+        "a feasibility cut when an infeasible block yields no usable Farkas "
+        "ray (falls back to normal MIP if the auxiliary also fails)",
+        advanced, &mip_benders_feas_aux, true);
+    records.push_back(record_bool);
 
     record_bool = new OptionRecordBool(
         "mip_lagrangian",

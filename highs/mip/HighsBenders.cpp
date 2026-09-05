@@ -23,6 +23,10 @@
 // - cuts are only added after a tightness/violation gate at the
 //   generating point; any gate failure aborts Benders silently and the
 //   normal MIP path continues with nothing fixed;
+// - when an infeasible block yields no usable Farkas ray, an
+//   always-feasible auxiliary LP (artificials relaxing the shifted block
+//   rows) is solved and a feasibility cut is built from its optimal
+//   duals instead; auxiliary failure also falls back silently;
 // - the final composed solution is verified against the full presolved
 //   model before any coupling column is fixed;
 // - fixing is via bounds (dimensions preserved, postsolve consistent),
@@ -750,6 +754,7 @@ bool HighsMipSolverData::runBenders() {
   struct BendCut {
     HighsInt block;  // -1 = feasibility cut (no theta)
     bool le = false;  // true: a*y <= rhs; false: [theta +] a*y >= rhs
+    bool aux = false;  // true: from the auxiliary LP, not a Farkas ray
     std::vector<double> ay;
     double rhs;
   };
@@ -925,6 +930,159 @@ bool HighsMipSolverData::runBenders() {
     std::vector<std::vector<double>> blockSol(nB);
     std::vector<double> blockObj(nB, kHighsInf);
     const double cutTol = 1e-6;
+    // Auxiliary feasibility-cut fallback (SCIP feasalt-style, clean-room):
+    // an always-feasible LP minimizing the sum of artificials that relax
+    // the shifted block rows. Its minimum q* > 0 proves the block
+    // infeasible, and its optimal duals yield a valid >= cut (same shape
+    // as an optimality cut but with no theta): ay*y >= rhs with
+    // ay = pi*C, rhs = pi*(base bounds) + pi*(bound-row bounds), since
+    // weak duality gives 0 >= D(y) for every y with a feasible block.
+    // Returns true iff a violated cut was pushed; any failure returns
+    // false so the caller falls back exactly as if no ray existed.
+    auto pushAuxFeasCut = [&](HighsInt kk, const BendBlock& bblk,
+                              const HighsLp& ssublp) -> bool {
+      if (!mipsolver.options_mip_->mip_benders_feas_aux) return false;
+      const HighsInt nbC = (HighsInt)bblk.cols.size();
+      const HighsInt nbR = (HighsInt)bblk.rows.size();
+      const HighsInt nSubR = ssublp.num_row_;
+      for (HighsInt j = 0; j != nbC; ++j) {
+        if (bblk.lb[j] > bblk.ub[j]) return false;
+      }
+      // One artificial per finite block-row side: -1 on upper-relaxed
+      // rows (a*x - v <= hi), +1 on lower-relaxed rows (a*x + v >= lo).
+      // Bound rows need none: any x within [lb, ub] satisfies them, so
+      // the auxiliary LP below is always feasible (and bounded by 0).
+      std::vector<HighsInt> artRow;
+      std::vector<double> artCoef;
+      for (HighsInt i = 0; i != nbR; ++i) {
+        if (ssublp.row_upper_[i] != kHighsInf) {
+          artRow.push_back(i);
+          artCoef.push_back(-1.0);
+        }
+        if (ssublp.row_lower_[i] != -kHighsInf) {
+          artRow.push_back(i);
+          artCoef.push_back(1.0);
+        }
+      }
+      const HighsInt nArt = (HighsInt)artRow.size();
+      if (nArt == 0) return false;
+      HighsLp auxlp;
+      auxlp.num_col_ = nbC + nArt;
+      auxlp.num_row_ = nSubR;
+      auxlp.sense_ = ObjSense::kMinimize;
+      auxlp.offset_ = 0.0;
+      auxlp.a_matrix_.format_ = MatrixFormat::kColwise;
+      auxlp.a_matrix_.start_.assign(auxlp.num_col_ + 1, 0);
+      auxlp.col_cost_.assign(auxlp.num_col_, 0.0);
+      auxlp.col_lower_.assign(auxlp.num_col_, -kHighsInf);
+      auxlp.col_upper_.assign(auxlp.num_col_, kHighsInf);
+      auxlp.integrality_.assign(auxlp.num_col_, HighsVarType::kContinuous);
+      auxlp.row_lower_ = ssublp.row_lower_;
+      auxlp.row_upper_ = ssublp.row_upper_;
+      for (HighsInt j = 0; j != nbC; ++j) {
+        for (HighsInt el = ssublp.a_matrix_.start_[j];
+             el != ssublp.a_matrix_.start_[j + 1]; ++el) {
+          auxlp.a_matrix_.index_.push_back(ssublp.a_matrix_.index_[el]);
+          auxlp.a_matrix_.value_.push_back(ssublp.a_matrix_.value_[el]);
+        }
+        auxlp.a_matrix_.start_[j + 1] =
+            (HighsInt)auxlp.a_matrix_.index_.size();
+      }
+      for (HighsInt a = 0; a != nArt; ++a) {
+        auxlp.col_cost_[nbC + a] = 1.0;
+        auxlp.col_lower_[nbC + a] = 0.0;
+        auxlp.col_upper_[nbC + a] = kHighsInf;
+        auxlp.a_matrix_.index_.push_back(artRow[a]);
+        auxlp.a_matrix_.value_.push_back(artCoef[a]);
+        auxlp.a_matrix_.start_[nbC + a + 1] =
+            (HighsInt)auxlp.a_matrix_.index_.size();
+      }
+      double remaining =
+          mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
+      HighsSubLpResult aux =
+          solveSubLp(auxlp, std::min(10.0, remaining));
+      if (aux.status != HighsModelStatus::kOptimal) return false;
+      if (!aux.dualValid || (HighsInt)aux.colSol.size() != auxlp.num_col_ ||
+          (HighsInt)aux.rowDual.size() != nSubR)
+        return false;
+      const double auxTol = 1e-9 * std::max(1.0, std::fabs(aux.obj));
+      if (!(aux.obj > auxTol)) return false;
+      // Tightness gate on the auxiliary duals (same pairing convention
+      // and tolerances as the optimality-cut gate).
+      const std::vector<double>& pi = aux.rowDual;
+      double dualObj = 0.0;
+      bool dualOk = true;
+      for (HighsInt i = 0; i != nSubR; ++i) {
+        if (pi[i] > 0) {
+          if (auxlp.row_lower_[i] == -kHighsInf) {
+            dualOk = false;
+            break;
+          }
+          dualObj += pi[i] * auxlp.row_lower_[i];
+        } else if (pi[i] < 0) {
+          if (auxlp.row_upper_[i] == kHighsInf) {
+            dualOk = false;
+            break;
+          }
+          dualObj += pi[i] * auxlp.row_upper_[i];
+        }
+      }
+      const double dualTol = 1e-6 * std::max(1.0, std::fabs(aux.obj));
+      if (!dualOk || std::fabs(dualObj - aux.obj) > dualTol) return false;
+      BendCut cut;
+      cut.block = -1;
+      cut.le = false;
+      cut.aux = true;
+      cut.ay.assign(nY, 0.0);
+      for (HighsInt i = 0; i != nbR; ++i) {
+        if (pi[i] == 0.0) continue;
+        for (const auto& e : bblk.coupling[i])
+          cut.ay[e.first] += pi[i] * e.second;
+      }
+      double rhs = 0.0;
+      bool rhsOk = true;
+      for (HighsInt i = 0; i != nbR; ++i) {
+        if (pi[i] > 0) {
+          if (bblk.baseLo[i] == -kHighsInf) {
+            rhsOk = false;
+            break;
+          }
+          rhs += pi[i] * bblk.baseLo[i];
+        } else if (pi[i] < 0) {
+          if (bblk.baseHi[i] == kHighsInf) {
+            rhsOk = false;
+            break;
+          }
+          rhs += pi[i] * bblk.baseHi[i];
+        }
+      }
+      if (!rhsOk) return false;
+      for (HighsInt i = nbR; i != nSubR; ++i) {
+        if (pi[i] > 0)
+          rhs += pi[i] * ssublp.row_lower_[i];
+        else if (pi[i] < 0)
+          rhs += pi[i] * ssublp.row_upper_[i];
+      }
+      for (HighsInt i = 0; i != nY; ++i)
+        if (std::fabs(cut.ay[i]) <= 1e-12) cut.ay[i] = 0.0;
+      cut.rhs = rhs;
+      double lhs = 0.0;
+      for (HighsInt i = 0; i != nY; ++i) lhs += cut.ay[i] * y[i];
+      const double violTol = cutTol * std::max(1.0, std::fabs(rhs));
+      if (!(rhs - lhs > violTol)) return false;
+      cuts.push_back(std::move(cut));
+      anyCut = true;
+      if (logBend) {
+        HighsInt nnz = 0;
+        for (HighsInt i = 0; i != nY; ++i)
+          if (cuts.back().ay[i] != 0.0) ++nnz;
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[Benders] block %d aux feasibility cut: nnz=%d rhs=%.6g "
+                     "viol=%.4g\n",
+                     (int)kk, (int)nnz, cuts.back().rhs, rhs - lhs);
+      }
+      return true;
+    };
     for (HighsInt k = 0; k != nB; ++k) {
       const BendBlock& blk = blocks[k];
       const HighsInt nbC = (HighsInt)blk.cols.size();
@@ -1240,6 +1398,9 @@ bool HighsMipSolverData::runBenders() {
              !hasRay))
           rayUsable = false;
         if (!rayUsable) {
+          // No ray: try the auxiliary fallback before giving up (a pushed
+          // aux cut continues with the next block via continue).
+          if (pushAuxFeasCut(k, blk, sublp)) continue;
           if (logBend)
             highsLogUser(logOptions, HighsLogType::kInfo,
                          "[Benders] block %d infeasible but no dual ray -> "
@@ -1260,7 +1421,9 @@ bool HighsMipSolverData::runBenders() {
             viol += w * sublp.row_lower_[i];
         }
         if (!(viol < -1e-7 * std::max(1.0, std::fabs(viol)))) {
-          // Ray does not prove infeasibility at this point: unusable.
+          // Ray does not prove infeasibility at this point: try the
+          // auxiliary fallback before giving up.
+          if (pushAuxFeasCut(k, blk, sublp)) continue;
           if (logBend)
             highsLogUser(logOptions, HighsLogType::kInfo,
                          "[Benders] block %d ray violation %g not negative "
@@ -1293,6 +1456,7 @@ bool HighsMipSolverData::runBenders() {
           }
         }
         if (!feasRhsOk) {
+          if (pushAuxFeasCut(k, blk, sublp)) continue;
           if (logBend)
             highsLogUser(logOptions, HighsLogType::kInfo,
                          "[Benders] block %d feasibility cut needs infinite "
@@ -1337,6 +1501,7 @@ bool HighsMipSolverData::runBenders() {
                          aydbg.c_str());
           }
         } else {
+          if (pushAuxFeasCut(k, blk, sublp)) continue;
           if (logBend)
             highsLogUser(logOptions, HighsLogType::kInfo,
                          "[Benders] block %d feasibility cut not violated "
@@ -1371,9 +1536,11 @@ bool HighsMipSolverData::runBenders() {
       }
     }
     if (logBend) {
-      HighsInt nFeas = 0, nOpt = 0, nNoGood = 0;
+      HighsInt nFeas = 0, nOpt = 0, nNoGood = 0, nAux = 0;
       for (const BendCut& cut : cuts) {
-        if (cut.block >= 0)
+        if (cut.aux)
+          ++nAux;
+        else if (cut.block >= 0)
           ++nOpt;
         else if (cut.le)
           ++nFeas;
@@ -1382,9 +1549,9 @@ bool HighsMipSolverData::runBenders() {
       }
       highsLogUser(logOptions, HighsLogType::kInfo,
                    "[Benders] iter %d: master=%.6g LB=%.6g UB=%.6g cuts=%d "
-                   "(feas=%d opt=%d nogood=%d)\n",
+                   "(feas=%d opt=%d nogood=%d aux=%d)\n",
                    (int)iter, LB, LB, UB, (int)cuts.size(), (int)nFeas,
-                   (int)nOpt, (int)nNoGood);
+                   (int)nOpt, (int)nNoGood, (int)nAux);
     }
     // Post-subsolve gap check with a FRESH tolerance from the current
     // UB (gapTol above predates this iteration's UB update and may still
