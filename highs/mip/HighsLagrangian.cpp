@@ -554,6 +554,17 @@ bool HighsMipSolverData::runLagrangian() {
   std::vector<double> sigma(nA, 1.0);
   for (HighsInt a = 0; a != nA; ++a)
     sigma[a] = (arcs[a].dir < 0) ? -1.0 : 1.0;
+  // Single-evaluation probe (dual-shape mapping): start all multipliers
+  // at the fixed value instead of zero.
+  const double fixedLambda =
+      mipsolver.options_mip_->mip_lagrangian_fixed_lambda;
+  if (fixedLambda >= 0.0) {
+    std::fill(lambda.begin(), lambda.end(), fixedLambda);
+    if (logLag)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[Lag] fixed-lambda probe at %.6g (all %d arcs)\n",
+                   fixedLambda, (int)nA);
+  }
   double bestLB = -kHighsInf;  // internal space
   double bestUB = kHighsInf;
   std::vector<double> bestSol;
@@ -561,6 +572,25 @@ bool HighsMipSolverData::runLagrangian() {
   HighsInt numIter = 0;
   bool converged = false;
   const double lagStart = mipsolver.timer_.getWallTime();
+  // Auto price sweep (primal Lagrangian): fixed_lambda < 0 selects it.
+  // The first iterations evaluate a small price set instead of ascending
+  // from zero; the winner (best feasible composition, else best bound)
+  // seeds the ascent below. Motivation: prices coordinate blocks into
+  // coupling-feasible compositions (Salihli 5/5 Optimal at root from the
+  // 0.5 leg), while ascent from zero sits flat on integer blocks.
+  // Initial pass only (like the repair solves): post-restart models are
+  // LP relaxations plus cuts, where the separator may be a cut artifact,
+  // and the sweep costs an evaluation per leg.
+  const bool autoSweep = fixedLambda < 0.0 &&
+                         mipsolver.options_mip_->mip_lagrangian_auto_lambda &&
+                         numRestarts == 0;
+  const double sweepLams[3] = {0.0, 0.5, 2.0};
+  std::vector<double> sweepUBLam = lambda;
+  std::vector<double> sweepLBLam = lambda;
+  double sweepBestUB = kHighsInf;
+  double sweepBestLB = -kHighsInf;
+  bool sweepHasUB = false;
+  bool sweepDone = !autoSweep;
   std::vector<std::vector<double>> blockSol(nB);
   for (HighsInt iter = 0; iter != maxIter; ++iter) {
     if (mipsolver.options_mip_->time_limit < kHighsInf &&
@@ -576,6 +606,25 @@ bool HighsMipSolverData::runLagrangian() {
     if (maxTime < kHighsInf &&
         mipsolver.timer_.getWallTime() - lagStart >= maxTime)
       break;
+    // Sweep legs override the multipliers; afterwards the winner seeds
+    // the ascent (restored once, on the first non-sweep iteration).
+    if (!sweepDone) {
+      if (iter < 3) {
+        std::fill(lambda.begin(), lambda.end(), sweepLams[(int)iter]);
+        if (logLag)
+          highsLogUser(logOptions, HighsLogType::kInfo,
+                       "[Lag] auto-lambda sweep %d/3 at %.6g\n", (int)iter + 1,
+                       sweepLams[(int)iter]);
+      } else {
+        lambda = sweepHasUB ? sweepUBLam : sweepLBLam;
+        sweepDone = true;
+        if (logLag)
+          highsLogUser(logOptions, HighsLogType::kInfo,
+                       "[Lag] auto-lambda winner (%s %.6g), ascending\n",
+                       sweepHasUB ? "UB" : "LB",
+                       sweepHasUB ? sweepBestUB : sweepBestLB);
+      }
+    }
     // Modified costs for this multiplier vector.
     double lagLB = 0.0;
     bool allFresh = true;  // every block supplied a usable solution
@@ -758,6 +807,19 @@ bool HighsMipSolverData::runLagrangian() {
         lagLB += -lambda[a] * arcs[a].bound;
     }
     if (lagLB > bestLB) bestLB = lagLB;
+    // Sweep bookkeeping: snapshot the multipliers behind the best
+    // feasible composition (else best bound) for the ascent seed.
+    if (!sweepDone) {
+      if (hasUB && bestUB < sweepBestUB) {
+        sweepBestUB = bestUB;
+        sweepUBLam = lambda;
+        sweepHasUB = true;
+      }
+      if (!sweepHasUB && bestLB > sweepBestLB) {
+        sweepBestLB = bestLB;
+        sweepLBLam = lambda;
+      }
+    }
     // Subgradient = coupling-row violations at the block solutions.
     // Blocks without a fresh solution reuse their last one for the step
     // direction (better than zero, still heuristic: bound validity never
@@ -867,9 +929,26 @@ bool HighsMipSolverData::runLagrangian() {
     }
   }
 
+  // Parent-space bound for the log lines below (validity harness reads
+  // them); the actual B&B injection is gated separately.
   const double parentLB = sign * bestLB + model.offset_;
-  if (std::isfinite(parentLB)) {
-    updateLowerBound(parentLB);
+  // Dual-bound injection, gated exactly like the Benders master bound:
+  // weak bounds must never overwrite good ones (observed on Salihli: a
+  // post-restart pass injecting -13751 over the tree's 3830, report-only
+  // poison that makes proof-by-tolerance unreachable). Min-only (frame),
+  // eps-shrunk, below-incumbent, strictly improving; direct assignment.
+  if (numIter > 0 && std::isfinite(bestLB) &&
+      model.sense_ == ObjSense::kMinimize) {
+    const double parentLagLB = sign * bestLB + model.offset_;
+    const double boundEps = 1e-7 * std::max(1.0, std::fabs(parentLagLB));
+    const double injectLB = parentLagLB - boundEps;
+    if (std::isfinite(injectLB) && injectLB <= upper_bound &&
+        injectLB > lower_bound) {
+      lower_bound = injectLB;
+      if (logLag)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[Lag] injected dual bound %.6g\n", injectLB);
+    }
   }
   if (!hasUB) {
     if (logLag)

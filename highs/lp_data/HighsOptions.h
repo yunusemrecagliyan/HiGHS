@@ -544,6 +544,8 @@ struct HighsOptionsStruct {
   HighsInt mip_lagrangian_scan_cap;
   HighsInt mip_lagrangian_max_row_degree;
   bool mip_lagrangian_subproblem_mip;
+  bool mip_lagrangian_auto_lambda;
+  double mip_lagrangian_fixed_lambda;
   bool mip_lagrangian_repair;
   double mip_lagrangian_repair_max_time;
   HighsInt mip_lagrangian_repair_max_cols;
@@ -763,6 +765,8 @@ struct HighsOptionsStruct {
         mip_lagrangian_scan_cap(0),
         mip_lagrangian_max_row_degree(2000),
         mip_lagrangian_subproblem_mip(true),
+        mip_lagrangian_auto_lambda(false),
+        mip_lagrangian_fixed_lambda(-1.0),
         mip_lagrangian_repair(true),
         mip_lagrangian_repair_max_time(30.0),
         mip_lagrangian_repair_max_cols(1000),
@@ -1676,6 +1680,23 @@ class HighsOptions : public HighsOptionsStruct {
         "mip_lagrangian_subproblem_mip",
         "Solve discrete Lagrangian subproblems as MIPs to generate integer compositions",
         advanced, &mip_lagrangian_subproblem_mip, true);
+    records.push_back(record_bool);
+
+    record_double = new OptionRecordDouble(
+        "mip_lagrangian_fixed_lambda",
+        "Single-evaluation probe: start all coupling multipliers at this "
+        "value instead of zero (negative = off). Used to map the dual "
+        "function shape before investing in an ascent method",
+        advanced, &mip_lagrangian_fixed_lambda, -1.0, -1.0, kHighsInf);
+    records.push_back(record_double);
+
+    record_bool = new OptionRecordBool(
+        "mip_lagrangian_auto_lambda",
+        "Evaluate a small price set (0, 0.5, 2) in the first Lagrangian "
+        "iterations and continue ascent from the winner (best feasible "
+        "composition, else best bound). Initial presolve pass only; "
+        "ignored when fixed_lambda is set",
+        advanced, &mip_lagrangian_auto_lambda, false);
     records.push_back(record_bool);
 
     record_bool = new OptionRecordBool(
