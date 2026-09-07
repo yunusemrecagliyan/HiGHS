@@ -323,6 +323,11 @@ struct HighsMipSolverData {
     std::vector<double> colSol;
     std::vector<double> rowDual;
     double obj = kHighsInf;
+    // Solver's dual bound in problem sense (MIP: valid lower/upper bound
+    // on the subproblem optimum for min/max). Only harvested by callers
+    // whose frame matches (e.g. the Lagrangian loop builds min-frame
+    // subproblems); stale when the solve never started (-/+inf).
+    double dualBound = kHighsInf;
     bool dualValid = false;
   };
   // Incumbent progress collected from a sub-MIP solve (solver threads

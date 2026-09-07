@@ -578,6 +578,7 @@ bool HighsMipSolverData::runLagrangian() {
       break;
     // Modified costs for this multiplier vector.
     double lagLB = 0.0;
+    bool allFresh = true;  // every block supplied a usable solution
     for (HighsInt k = 0; k != nB; ++k) {
       const LagBlock& blk = blocks[k];
       const HighsInt nbC = (HighsInt)blk.cols.size();
@@ -662,7 +663,25 @@ bool HighsMipSolverData::runLagrangian() {
           mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
       HighsSubLpResult res;
       if (hasDiscrete) {
-        res = solveSubMip(sublp, std::min(2.0, remaining));
+        // Share this iteration's budget across blocks: with dozens of
+        // blocks, per-block optimality is unaffordable, and capped
+        // sub-MIPs still contribute VALID dual bounds below (optimality
+        // is not required for the bound, only for the primal solution).
+        // Parent gaps stop blocks once good enough for the parent.
+        const HighsInt itersLeft = std::max<HighsInt>(1, maxIter - iter);
+        const double loopLeft =
+            (maxTime < kHighsInf)
+                ? std::max(0.0, maxTime -
+                                    (mipsolver.timer_.getWallTime() - lagStart))
+                : kHighsInf;
+        const double iterBudget =
+            std::min(remaining, loopLeft) / (double)itersLeft;
+        const HighsInt blocksLeft = nB - k;
+        const double blockCap = std::max(
+            0.02, std::min(2.0, iterBudget / std::max<HighsInt>(1, blocksLeft)));
+        res = solveSubMip(sublp, std::min(blockCap, remaining),
+                          mipsolver.options_mip_->mip_rel_gap,
+                          mipsolver.options_mip_->mip_abs_gap);
       } else {
         res = solveSubLp(sublp, std::min(iterLpCap, remaining));
       }
@@ -696,6 +715,7 @@ bool HighsMipSolverData::runLagrangian() {
       if (res.status == HighsModelStatus::kOptimal) {
         if ((HighsInt)res.colSol.size() != nbC) return true;
         blockSol[k] = res.colSol;
+        if (!std::isfinite(res.obj)) return true;
         lagLB += res.obj;
       } else if (res.status == HighsModelStatus::kInfeasible) {
         // Block rows alone infeasible: the relaxation is infeasible, so
@@ -707,6 +727,23 @@ bool HighsMipSolverData::runLagrangian() {
                        "globally infeasible\n",
                        (int)k);
         return true;
+      } else if (hasDiscrete && std::isfinite(res.dualBound)) {
+        // Capped (non-optimal) MIP block: the solver's dual bound is a
+        // valid lower bound on this block's minimum, so it contributes
+        // to lagLB without proven block optimality. Proven optimality
+        // was previously required only because no bound was harvested.
+        // Validity rests solely on the harvested bound, never on the
+        // multipliers or the step rule. Tripwire: dual > incumbent is
+        // impossible and falls back instead of trusting anything.
+        if ((HighsInt)res.colSol.size() == nbC) {
+          if (res.dualBound >
+              res.obj + 1e-6 * std::max(1.0, std::fabs(res.obj)) + 1e-9)
+            return true;
+          blockSol[k] = res.colSol;
+        } else {
+          allFresh = false;  // subgradient misses this block (step only)
+        }
+        lagLB += res.dualBound;
       } else {
         return true;  // unbounded subproblem or solver trouble: fallback
       }
@@ -722,8 +759,17 @@ bool HighsMipSolverData::runLagrangian() {
     }
     if (lagLB > bestLB) bestLB = lagLB;
     // Subgradient = coupling-row violations at the block solutions.
+    // Blocks without a fresh solution reuse their last one for the step
+    // direction (better than zero, still heuristic: bound validity never
+    // depends on it), while allFresh gates the primal composition below
+    // against stale mixing. Never-solved blocks are skipped by the size
+    // check (their vectors are empty).
     std::vector<double> activity(numRow, 0.0);
     for (HighsInt k = 0; k != nB; ++k) {
+      if ((HighsInt)blockSol[k].size() != (HighsInt)blocks[k].cols.size()) {
+        allFresh = false;
+        continue;
+      }
       for (size_t j = 0; j != blocks[k].cols.size(); ++j) {
         HighsInt c = blocks[k].cols[j];
         const double v = blockSol[k][j];
@@ -754,8 +800,9 @@ bool HighsMipSolverData::runLagrangian() {
     }
     // Primal attempt: the composition may already satisfy the coupling
     // rows (e.g. loose coupling); only then is there anything to inject.
-    bool couplingOk = true;
-    for (HighsInt a = 0; a != nA; ++a) {
+    // Requires fresh solutions in every block (no stale mixing).
+    bool couplingOk = allFresh;
+    for (HighsInt a = 0; couplingOk && a != nA; ++a) {
       const double tol = feastol * std::max(1.0, std::fabs(arcs[a].bound));
       if (arcs[a].dir > 0) {
         if (grad[a] > tol) {
@@ -796,8 +843,8 @@ bool HighsMipSolverData::runLagrangian() {
     ++numIter;
     if (logLag)
       highsLogUser(logOptions, HighsLogType::kInfo,
-                   "[Lag] iter %d: LB=%.6g UB=%.6g gnorm=%.3g\n", (int)iter,
-                   bestLB, bestUB, std::sqrt(gnorm2));
+                   "[Lag] iter %d: lit=%.6g best=%.6g UB=%.6g gnorm=%.3g\n",
+                   (int)iter, lagLB, bestLB, bestUB, std::sqrt(gnorm2));
     const double gapTol = 1e-7 * std::max(1.0, std::fabs(bestUB));
     if (hasUB && bestUB - bestLB <= gapTol) {
       converged = true;
@@ -805,7 +852,10 @@ bool HighsMipSolverData::runLagrangian() {
     }
     if (gnorm2 < 1e-24) break;  // stationary: gap decides fix vs fallback
     // Multiplier step: Polyak when a UB exists, else normalized
-    // diminishing (heuristic step length, documented).
+    // diminishing. (A scale-aware variant diverged via its C(|lambda|)
+    // feedback loop on Salihli: lit 928 -> -1710 accelerating. The dual
+    // needs a bundle method, not a step tweak; until then stay flat and
+    // harmless. Documented, Salihli traj 2026-09-07.)
     double step;
     if (hasUB && bestUB - bestLB > 0)
       step = (bestUB - bestLB) / gnorm2;

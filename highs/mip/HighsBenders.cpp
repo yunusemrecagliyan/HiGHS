@@ -237,6 +237,9 @@ HighsMipSolverData::HighsSubLpResult HighsMipSolverData::solveSubMip(
   if (mipsolver.passModel(submip) != HighsStatus::kOk) return res;
   mipsolver.run();
   res.status = mipsolver.getModelStatus();
+  // Dual bound for capped solves (the Lagrangian loop harvests it as a
+  // valid block-minimum lower bound in its min-frame subproblems).
+  res.dualBound = mipsolver.getInfo().mip_dual_bound;
   // A solution is only taken when the solver claims proven optimality or
   // a feasible primal point (a bare TimeLimit/SolutionLimit status with
   // no incumbent leaves a meaningless, uninitialized-looking vector).
