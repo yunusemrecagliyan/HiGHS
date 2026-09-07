@@ -544,6 +544,8 @@ struct HighsOptionsStruct {
   HighsInt mip_lagrangian_repair_max_cols;
   HighsInt mip_lagrangian_repair_max_blocks;
   HighsInt mip_lagrangian_repair_max_union_pct;
+  HighsInt mip_lagrangian_repair_stall_nodes;
+  double mip_lagrangian_repair_stall_seconds;
   double mip_decomposition_submip_time_limit;
   HighsInt mip_benders_max_iterations;
   HighsInt mip_benders_max_coupling_cols;
@@ -758,6 +760,8 @@ struct HighsOptionsStruct {
         mip_lagrangian_repair_max_cols(1000),
         mip_lagrangian_repair_max_blocks(200),
         mip_lagrangian_repair_max_union_pct(50),
+        mip_lagrangian_repair_stall_nodes(0),
+        mip_lagrangian_repair_stall_seconds(10.0),
         mip_decomposition_submip_time_limit(10.0),
         mip_benders_max_iterations(100),
         mip_benders_max_coupling_cols(16),
@@ -1683,6 +1687,21 @@ class HighsOptions : public HighsOptionsStruct {
         "unions fall back to normal MIP)",
         advanced, &mip_lagrangian_repair_max_union_pct, 1, 50, 100);
     records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_lagrangian_repair_stall_nodes",
+        "Min sub-MIP nodes before repair stagnation logic arms (0 = "
+        "armed everywhere past an incumbent; degenerate joints with "
+        "slow nodes need 0, tiny test solves never span stall-seconds)",
+        advanced, &mip_lagrangian_repair_stall_nodes, 0, 0, kHighsIInf);
+    records.push_back(record_int);
+
+    record_double = new OptionRecordDouble(
+        "mip_lagrangian_repair_stall_seconds",
+        "Abort a repair joint with an incumbent but no improvement for "
+        "this long (0 disables; good-enough abort needs no option)",
+        advanced, &mip_lagrangian_repair_stall_seconds, 0.0, 10.0, kHighsInf);
+    records.push_back(record_double);
 
     record_double = new OptionRecordDouble(
         "mip_decomposition_submip_time_limit",

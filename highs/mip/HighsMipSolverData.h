@@ -327,11 +327,22 @@ struct HighsMipSolverData {
   };
   // Incumbent progress collected from a sub-MIP solve (solver threads
   // append under lock; the caller logs single-threaded afterwards).
-  // Purely diagnostic: a null progress disables callbacks entirely.
+  // Auto-exit tripwires (repair joints): the interrupt callback fires
+  // when an incumbent is good enough (bound <= targetBound, minimize
+  // side) or stagnant (no improvement for stallSeconds once at least
+  // minStallNodes sub-MIP nodes ran). The node floor keeps tiny solves
+  // (and all unit tests) deterministic; wall-clock only matters past it.
+  // Disabled tripwires: targetBound -inf, stallSeconds <= 0.
   struct HighsSubMipProgress {
     std::mutex mutex;
     // (sub-solver running time, objective) per improving incumbent.
     std::vector<std::pair<double, double>> events;
+    double targetBound = -kHighsInf;
+    int64_t minStallNodes = 0;
+    double stallSeconds = 0.0;
+    int64_t lastImproveNodes = 0;
+    double lastImproveTime = 0.0;
+    double lastImproveBound = kHighsInf;
   };
   static HighsSubLpResult solveSubLp(const HighsLp& sublp, double timeLimit);
   static HighsSubLpResult solveSubMip(const HighsLp& submip,

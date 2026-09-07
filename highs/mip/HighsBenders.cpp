@@ -170,24 +170,57 @@ HighsMipSolverData::HighsSubLpResult HighsMipSolverData::solveSubMip(
   if (progress) {
     // Heartbeat for long joint solves: the sub-solver is otherwise
     // silent (output off), which reads as a hang. Events are collected
-    // under lock and logged single-threaded by the caller; strictly
-    // diagnostic.
+    // under lock and logged single-threaded by the caller.
+    // Auto-exit lives here too: improving events refresh the
+    // stagnation clock, while kCallbackMipInterrupt polls (the only
+    // supported interrupt source; setting it from improving-solution
+    // callbacks trips a debug assert) evaluate the tripwires. Both use
+    // the sub-solver's own clock/frame, so single-threaded runs stay
+    // deterministic; the node floor keeps tiny solves untouched.
     mipsolver.setCallback(
         [](int callback_type, const std::string& message,
            const HighsCallbackOutput* data_out, HighsCallbackInput* data_in,
            void* user_data) {
-          if (callback_type != kCallbackMipImprovingSolution || !data_out ||
-              !user_data)
-            return;
+          if (!user_data) return;
           HighsSubMipProgress* progress =
               static_cast<HighsSubMipProgress*>(user_data);
           std::lock_guard<std::mutex> guard(progress->mutex);
-          if (progress->events.size() >= 64) return;
-          progress->events.emplace_back(data_out->running_time,
-                                         data_out->mip_primal_bound);
+          if (callback_type == kCallbackMipImprovingSolution) {
+            if (!data_out) return;
+            if (progress->events.size() < 64)
+              progress->events.emplace_back(data_out->running_time,
+                                            data_out->mip_primal_bound);
+            // Stagnation clock: strictly improving incumbents only (equal
+            // re-reports must not reset it, or flat tails never trip).
+            const double eb = data_out->mip_primal_bound;
+            const double egap =
+                1e-9 * std::max(1.0, std::fabs(progress->lastImproveBound));
+            if (progress->lastImproveBound >= 0.5 * kHighsInf ||
+                eb < progress->lastImproveBound - egap) {
+              progress->lastImproveNodes = data_out->mip_node_count;
+              progress->lastImproveTime = data_out->running_time;
+              progress->lastImproveBound = eb;
+            }
+            return;
+          }
+          if (callback_type != kCallbackMipInterrupt || !data_in) return;
+          if (progress->lastImproveBound <= progress->targetBound) {
+            data_in->user_interrupt = true;
+            return;
+          }
+          // Stagnation needs a banked incumbent (never kill hope) plus
+          // enough nodes (determinism floor for tiny solves).
+          if (progress->lastImproveBound >= kHighsInf) return;
+          if (progress->stallSeconds > 0.0 && data_out &&
+              data_out->mip_node_count >= progress->minStallNodes &&
+              data_out->running_time - progress->lastImproveTime >=
+                  progress->stallSeconds) {
+            data_in->user_interrupt = true;
+          }
         },
         progress);
     mipsolver.startCallback(kCallbackMipImprovingSolution);
+    mipsolver.startCallback(kCallbackMipInterrupt);
   }
   if (mipsolver.passModel(submip) != HighsStatus::kOk) return res;
   mipsolver.run();
@@ -195,6 +228,10 @@ HighsMipSolverData::HighsSubLpResult HighsMipSolverData::solveSubMip(
   // A solution is only taken when the solver claims proven optimality or
   // a feasible primal point (a bare TimeLimit/SolutionLimit status with
   // no incumbent leaves a meaningless, uninitialized-looking vector).
+  // An interrupted solve with a feasible point arrives through the same
+  // primal_solution_status gate (repair tripwires only fire after an
+  // incumbent exists); dual callers still require proven optimality at
+  // their own site.
   if (res.status == HighsModelStatus::kOptimal ||
       res.status == HighsModelStatus::kObjectiveTarget ||
       mipsolver.getInfo().primal_solution_status == 2) {

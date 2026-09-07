@@ -3485,9 +3485,11 @@ bool HighsMipSolverData::checkLimits(int64_t nodeOffset) const {
   if (terminatorActive())
     if (this->terminatorTerminated()) return true;
 
-  // Possible user interrupt
-  if (!mipsolver.submip && !parallelLockActive() &&
-      mipsolver.callback_->user_callback) {
+  // Possible user interrupt. Sub-MIP solves poll it too when they carry
+  // a user callback (repair joints with progress tripwires); every other
+  // sub-MIP has none and skips exactly as before (the !submip clause this
+  // replaces only ever mattered alongside an active user callback).
+  if (!parallelLockActive() && mipsolver.callback_->user_callback) {
     mipsolver.callback_->clearHighsCallbackOutput();
     if (interruptFromCallbackWithData(kCallbackMipInterrupt,
                                       mipsolver.solution_objective_,

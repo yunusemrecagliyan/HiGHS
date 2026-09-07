@@ -1418,10 +1418,24 @@ bool HighsMipSolverData::runLagRepair() {
       joint.col_lower_[c] = joint.col_upper_[c] = composed[c];
     }
     HighsSubMipProgress progress;
+    // Auto-exit tripwires: good-enough needs no option (abort when the
+    // incumbent is within parent gap tolerance of the dual bound; dead
+    // when no dual bound exists yet). Stagnation is configured. Both
+    // interrupt mid-solve; banked incumbents harvest as usual.
+    if (model.sense_ == ObjSense::kMinimize &&
+        std::isfinite(lower_bound)) {
+      const double rTol = mipsolver.options_mip_->mip_rel_gap;
+      const double aTol = mipsolver.options_mip_->mip_abs_gap;
+      progress.targetBound =
+          lower_bound + std::max(aTol, rTol * std::fabs(lower_bound));
+    }
+    progress.minStallNodes = std::max<int64_t>(
+        0, mipsolver.options_mip_->mip_lagrangian_repair_stall_nodes);
+    progress.stallSeconds =
+        mipsolver.options_mip_->mip_lagrangian_repair_stall_seconds;
     HighsSubLpResult res =
         solveSubMip(joint, timeLeft(), mipsolver.options_mip_->mip_rel_gap,
-                    mipsolver.options_mip_->mip_abs_gap,
-                    logRep ? &progress : nullptr);
+                    mipsolver.options_mip_->mip_abs_gap, &progress);
     const double jointDone = mipsolver.timer_.read();
     if (logRep) {
       std::lock_guard<std::mutex> guard(progress.mutex);
@@ -1437,6 +1451,11 @@ bool HighsMipSolverData::runLagRepair() {
                    (int)res.status, res.obj, (int)res.colSol.size(),
                    (int)numCol, jointDone - jointBudgetStart,
                    jointDone - repStart);
+    // Interrupted joints (auto-exit tripwire or external) still harvest
+    // whatever the callback banked; the gates below decide.
+    if (logRep && res.status == HighsModelStatus::kInterrupt)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[LagRepair] joint interrupted -> harvested\n");
     if ((HighsInt)res.colSol.size() == numCol) {
       if (verifyBendersSolution(model, res.colSol)) {
         // Scale sanity: the joint result must sit within an order of
