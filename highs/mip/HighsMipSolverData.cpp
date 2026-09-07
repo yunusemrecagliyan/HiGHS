@@ -1050,6 +1050,16 @@ void HighsMipSolverData::runMipPresolve(
       !mipsolver.submip &&
       mipsolver.options_mip_->presolve != kHighsOffString)
     runLagrangian();
+
+  // Ruin-and-recreate repair on coupling-row structure: independently
+  // solved blocks are composed, and blocks touching violated coupling
+  // rows are re-optimized jointly with all other columns fixed. Only a
+  // verified feasible composition is ever injected as MIP-start
+  // incumbent; the parent model is never modified.
+  if (mipsolver.modelstatus_ == HighsModelStatus::kNotset &&
+      !mipsolver.submip &&
+      mipsolver.options_mip_->presolve != kHighsOffString)
+    runLagRepair();
 }
 
 void HighsMipSolverData::solveComponents() {

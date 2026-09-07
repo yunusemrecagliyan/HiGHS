@@ -38,7 +38,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <cctype>
 #include <fstream>
 #include <sstream>
@@ -136,21 +138,71 @@ HighsMipSolverData::HighsSubLpResult HighsMipSolverData::solveSubLp(
 }
 
 HighsMipSolverData::HighsSubLpResult HighsMipSolverData::solveSubMip(
-    const HighsLp& submip, double timeLimit) {
+    const HighsLp& submip, double timeLimit, double relGap, double absGap,
+    HighsSubMipProgress* progress) {
   HighsSubLpResult res;
   Highs mipsolver;
   mipsolver.setOptionValue("output_flag", false);
-  mipsolver.setOptionValue("threads", 1);
+  // No threads override: a fresh Highs with threads=1 fails to run when the
+  // global scheduler was already initialized with the parent's thread count
+  // (multi-threaded MIP), turning every sub-MIP into an instant silent
+  // fallback. Inheriting the scheduler is correct here (the parent is idle
+  // in presolve while the subsolver runs).
   mipsolver.setOptionValue("time_limit", timeLimit);
+  // Hierarchical ruin-and-recreate only pays off on large joints that
+  // cannot be solved directly: small subproblems skip it (nested levels
+  // would only delay the direct solve), while larger ones keep drilling
+  // down toward an exactly-solvable core.
+  if (submip.num_col_ < 500)
+    mipsolver.setOptionValue("mip_lagrangian_repair", false);
+  // NOTE: run()'s return is ignored on purpose. A Warning (time or
+  // solution limit) still yields a valid model status, and a feasible
+  // incumbent when one was found; only callers decide whether
+  // non-optimal outcomes are usable (dual purposes must still require
+  // proven optimality).
+  // Gap propagation (primal purposes only): when the caller passes the
+  // parent's gap tolerances, the subsolver stops once the incumbent is
+  // good enough for the parent instead of grinding toward its own tight
+  // defaults. Non-positive values keep the defaults (proven-optimal
+  // behavior for dual purposes, e.g. the Lagrangian loop).
+  if (relGap > 0.0) mipsolver.setOptionValue("mip_rel_gap", relGap);
+  if (absGap > 0.0) mipsolver.setOptionValue("mip_abs_gap", absGap);
+  if (progress) {
+    // Heartbeat for long joint solves: the sub-solver is otherwise
+    // silent (output off), which reads as a hang. Events are collected
+    // under lock and logged single-threaded by the caller; strictly
+    // diagnostic.
+    mipsolver.setCallback(
+        [](int callback_type, const std::string& message,
+           const HighsCallbackOutput* data_out, HighsCallbackInput* data_in,
+           void* user_data) {
+          if (callback_type != kCallbackMipImprovingSolution || !data_out ||
+              !user_data)
+            return;
+          HighsSubMipProgress* progress =
+              static_cast<HighsSubMipProgress*>(user_data);
+          std::lock_guard<std::mutex> guard(progress->mutex);
+          if (progress->events.size() >= 64) return;
+          progress->events.emplace_back(data_out->running_time,
+                                         data_out->mip_primal_bound);
+        },
+        progress);
+    mipsolver.startCallback(kCallbackMipImprovingSolution);
+  }
   if (mipsolver.passModel(submip) != HighsStatus::kOk) return res;
-  if (mipsolver.run() != HighsStatus::kOk) return res;
+  mipsolver.run();
   res.status = mipsolver.getModelStatus();
+  // A solution is only taken when the solver claims proven optimality or
+  // a feasible primal point (a bare TimeLimit/SolutionLimit status with
+  // no incumbent leaves a meaningless, uninitialized-looking vector).
   if (res.status == HighsModelStatus::kOptimal ||
       res.status == HighsModelStatus::kObjectiveTarget ||
       mipsolver.getInfo().primal_solution_status == 2) {
     const HighsSolution& sol = mipsolver.getSolution();
-    res.colSol = sol.col_value;
-    res.obj = mipsolver.getInfo().objective_function_value;
+    if ((HighsInt)sol.col_value.size() == submip.num_col_) {
+      res.colSol = sol.col_value;
+      res.obj = mipsolver.getInfo().objective_function_value;
+    }
   }
   return res;
 }
@@ -821,15 +873,17 @@ struct BendersTimeGuard {
 };
 
 bool HighsMipSolverData::runBenders() {
-  bendersCoupling.clear();
   // Initial presolve only: post-restart models are LP relaxations plus
   // cuts, where arrowhead structure is a cut artifact. Re-running the
   // fixing loop there drives fix-restart churn (each fix collapses
   // integer activity, triggering another restart and another loop)
   // while the initial pass plus its rescued incumbent carry the value.
   // (The stored coupling hint is intentionally kept across restarts:
-  // column indices are stable and it is soft branching guidance.)
+  // column indices are stable and it is soft branching guidance, so the
+  // clear below only runs on the initial pass. Repair publishes its own
+  // row-coupling columns into the same vector afterwards.)
   if (numRestarts > 0) return true;
+  bendersCoupling.clear();
   HighsLp& model = presolvedModel;
   const HighsInt numCol = model.num_col_;
   const HighsInt numRow = model.num_row_;

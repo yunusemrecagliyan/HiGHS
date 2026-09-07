@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -850,6 +851,665 @@ bool HighsMipSolverData::runLagrangian() {
                  "[Lag] postsolved incumbent infeasible (%.2g, %.2g, %.2g) "
                  "-> dropped\n",
                  boundViol, rowViol, intViol);
+  }
+  return true;
+}
+
+bool HighsMipSolverData::runLagRepair() {
+  HighsLp& model = presolvedModel;
+  const HighsInt numCol = model.num_col_;
+  const HighsInt numRow = model.num_row_;
+  if (numCol == 0 || numRow == 0) return true;
+  if (numCol < 100) return true;
+  if (!mipsolver.options_mip_->mip_decomposition) return true;
+  // Detection serves the presolve repair below, the branching hint, and
+  // the search-time ruin-and-recreate heuristic; it re-runs on every
+  // presolve pass because restarts rebuild the model (dimensions may
+  // shrink, which would strand a stored candidate). The expensive solves
+  // only run on the initial pass.
+  const bool runRepair = mipsolver.options_mip_->mip_lagrangian_repair;
+  if (!runRepair &&
+      !mipsolver.options_mip_->mip_heuristic_run_lagrepair)
+    return true;
+  if (model.a_matrix_.format_ != MatrixFormat::kColwise)
+    model.a_matrix_.ensureColwise();
+  const bool logRep = mipsolver.options_mip_->mip_decomposition_logging;
+  const HighsLogOptions& logOptions = mipsolver.options_mip_->log_options;
+  const double feastol = mipsolver.options_mip_->mip_feasibility_tolerance;
+  const double maxTime = mipsolver.options_mip_->mip_lagrangian_repair_max_time;
+  const HighsInt maxUnion = std::max<HighsInt>(
+      1, mipsolver.options_mip_->mip_lagrangian_repair_max_cols);
+  const double repStart = mipsolver.timer_.read();
+  auto timeLeft = [&]() {
+    double tl = kHighsInf;
+    if (maxTime < kHighsInf)
+      tl = maxTime - (mipsolver.timer_.read() - repStart);
+    if (mipsolver.options_mip_->time_limit < kHighsInf)
+      tl = std::min(
+          tl, mipsolver.options_mip_->time_limit - mipsolver.timer_.read());
+    return tl;
+  };
+
+  HighsLagCandidate cand;
+  if (!findLagSeparator(model, cand)) {
+    if (logRep)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[LagRepair] no candidate (%s) -> normal MIP\n",
+                   cand.reason.c_str());
+    return true;
+  }
+  // Share the decomposition with the search-time heuristic (validity is
+  // rechecked at every use).
+  lagRepairCand = cand;
+  lagRepairCandValid = true;
+  const double sepDone = mipsolver.timer_.read();
+  const HighsInt nB = (HighsInt)cand.blockCols.size();
+  const HighsInt maxBlocks = std::max<HighsInt>(
+      2, mipsolver.options_mip_->mip_lagrangian_repair_max_blocks);
+  if (nB > maxBlocks) {
+    if (logRep)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[LagRepair] %d blocks (cap %d) -> normal MIP\n", (int)nB,
+                   (int)maxBlocks);
+    return true;
+  }
+  // Internal minimization (same single-convention pattern as Benders and
+  // Lagrangian).
+  const double sign = (model.sense_ == ObjSense::kMaximize) ? -1.0 : 1.0;
+
+  std::vector<char> colFixed(numCol, 0);
+  for (HighsInt c = 0; c != numCol; ++c) {
+    if (model.col_lower_[c] == model.col_upper_[c]) {
+      if (!std::isfinite(model.col_lower_[c])) return true;
+      colFixed[c] = 1;
+    }
+  }
+  // Branching priority (branch-on-bridges): publish unfixed columns
+  // touching coupling rows into the shared coupling hint read by
+  // structure-aware branching (OR-merged with any Benders separator
+  // published earlier in this pass; cleared only by Benders entry and
+  // convergence-and-fix). Fixing these columns disconnects the model,
+  // so branching them first rediscovers the block structure in-tree.
+  // Published before any solve so the hint exists even when every
+  // subproblem below falls back. Initial pass only: post-restart models
+  // are LP relaxations plus cuts, where the separator would be a cut
+  // artifact.
+  if (numRestarts == 0) {
+    std::vector<char> inRc(numRow, 0);
+    for (HighsInt r : cand.couplingRows) inRc[r] = 1;
+    if ((HighsInt)bendersCoupling.size() != numCol)
+      bendersCoupling.assign(numCol, 0);
+    const HighsInt pubCap = 512;
+    HighsInt numPub = 0;
+    for (HighsInt c = 0; c != numCol && numPub < pubCap; ++c) {
+      if (colFixed[c] || bendersCoupling[c]) continue;
+      for (HighsInt el = model.a_matrix_.start_[c];
+           el != model.a_matrix_.start_[c + 1]; ++el) {
+        if (inRc[model.a_matrix_.index_[el]]) {
+          bendersCoupling[c] = 1;
+          ++numPub;
+          break;
+        }
+      }
+    }
+    if (logRep)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[LagRepair] published %d coupling columns for branching "
+                   "priority\n",
+                   (int)numPub);
+  }
+  // Solves run on the initial pass with the presolve repair enabled;
+  // detection above (candidate store, and the branching hint on the
+  // initial pass) already ran for the search-time heuristic.
+  if (numRestarts > 0 || !runRepair) return true;
+  // Fixed-column activity shifted out of every row (exact: lb == ub).
+  std::vector<double> rowShift(numRow, 0.0);
+  for (HighsInt c = 0; c != numCol; ++c) {
+    if (!colFixed[c]) continue;
+    const double fixval = model.col_lower_[c];
+    for (HighsInt el = model.a_matrix_.start_[c];
+         el != model.a_matrix_.start_[c + 1]; ++el)
+      rowShift[model.a_matrix_.index_[el]] +=
+          model.a_matrix_.value_[el] * fixval;
+  }
+  // Fully-determined rows must hold (same check as runLagrangian).
+  {
+    std::vector<char> rowTouched(numRow, 0);
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (colFixed[c]) continue;
+      for (HighsInt el = model.a_matrix_.start_[c];
+           el != model.a_matrix_.start_[c + 1]; ++el)
+        rowTouched[model.a_matrix_.index_[el]] = 1;
+    }
+    for (HighsInt r = 0; r != numRow; ++r) {
+      if (rowTouched[r]) continue;
+      if (rowShift[r] < model.row_lower_[r] - feastol ||
+          rowShift[r] > model.row_upper_[r] + feastol) {
+        mipsolver.modelstatus_ = HighsModelStatus::kInfeasible;
+        return true;
+      }
+    }
+  }
+
+  // Directed coupling arcs (same frame as runLagrangian): free rows can
+  // never be violated and carry no arc.
+  struct RepArc {
+    HighsInt row;
+    HighsInt dir;  // +1: <= part, -1: >= part, 0: equality
+    double bound;  // shifted U / L / b
+  };
+  std::vector<RepArc> arcs;
+  for (HighsInt r : cand.couplingRows) {
+    const double lo = model.row_lower_[r] == -kHighsInf
+                          ? -kHighsInf
+                          : model.row_lower_[r] - rowShift[r];
+    const double hi = model.row_upper_[r] == kHighsInf
+                          ? kHighsInf
+                          : model.row_upper_[r] - rowShift[r];
+    const bool hasLo = lo != -kHighsInf;
+    const bool hasHi = hi != kHighsInf;
+    if (!hasLo && !hasHi) continue;
+    if (hasLo && hasHi && lo == hi) {
+      arcs.push_back({r, 0, lo});
+    } else {
+      if (hasHi) arcs.push_back({r, +1, hi});
+      if (hasLo) arcs.push_back({r, -1, lo});
+    }
+  }
+
+  // Native MIP-start injection (same channel as runLagrangian: postsolve
+  // to original space, re-check, publish only if feasible there).
+  auto injectRepair = [&](const std::vector<double>& sol) -> bool {
+    HighsSolution injsol;
+    injsol.col_value = sol;
+    injsol.value_valid = true;
+    injsol.dual_valid = false;
+    HighsBasis injbasis;
+    injbasis.valid = false;
+    postSolveStack.undo(*mipsolver.options_mip_, injsol, injbasis, -1, false);
+    double boundViol = kHighsInf, rowViol = kHighsInf, intViol = kHighsInf;
+    HighsCDouble injObj = 0.0;
+    mipsolver.solutionFeasible(mipsolver.orig_model_, injsol.col_value,
+                               nullptr, boundViol, rowViol, intViol, injObj);
+    if (boundViol <= feastol && rowViol <= feastol && intViol <= feastol) {
+      mipsolver.solution_ = injsol.col_value;
+      mipsolver.solution_objective_ = double(injObj);
+      mipsolver.bound_violation_ = boundViol;
+      mipsolver.row_violation_ = rowViol;
+      mipsolver.integrality_violation_ = intViol;
+      if (logRep)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[LagRepair] injected incumbent (obj %.6g)\n",
+                     double(injObj));
+      return true;
+    }
+    if (logRep)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[LagRepair] postsolved incumbent infeasible (%.2g, %.2g, "
+                   "%.2g) -> dropped\n",
+                   boundViol, rowViol, intViol);
+    return false;
+  };
+
+  // Standalone block subproblems (no multipliers: pure ruin step).
+  // A usable solution only needs feasibility (primal UB purposes); only
+  // a relaxation-proof infeasibility carries a global verdict.
+  std::vector<std::vector<double>> blockSol(nB);
+  std::vector<char> blockUsable(nB, 0);
+  std::vector<char> blockFailed(nB, 0);
+  HighsInt numFailed = 0;
+  HighsInt numBlockOptimal = 0;
+  // Internal-min-space sum of usable block objectives: a rough scale for
+  // the joint result below ( orders of magnitude above it signal a
+  // penalty corner, not a useful incumbent). Invalid when any block is
+  // unsolved.
+  double refInternal = 0.0;
+  bool refValid = true;
+  const double blocksStart = mipsolver.timer_.read();
+  for (HighsInt k = 0; k != nB; ++k) {
+    if (timeLeft() <= 0) return true;
+    const std::vector<HighsInt>& cols = cand.blockCols[k];
+    const std::vector<HighsInt>& rows = cand.blockRows[k];
+    const HighsInt nbC = (HighsInt)cols.size();
+    const HighsInt nbR = (HighsInt)rows.size();
+    if (nbR == 0) {
+      // Rowless block: analytic box minimum over internal-min costs.
+      std::vector<double> sol(nbC, 0.0);
+      bool bounded = true;
+      for (HighsInt j = 0; j != nbC; ++j) {
+        HighsInt c = cols[j];
+        const double cj = sign * model.col_cost_[c];
+        if (cj > 0) {
+          if (!std::isfinite(model.col_lower_[c])) {
+            bounded = false;
+            break;
+          }
+          sol[j] = model.col_lower_[c];
+        } else if (cj < 0) {
+          if (!std::isfinite(model.col_upper_[c])) {
+            bounded = false;
+            break;
+          }
+          sol[j] = model.col_upper_[c];
+        } else {
+          sol[j] = std::isfinite(model.col_lower_[c])
+                       ? model.col_lower_[c]
+                       : 0.0;
+        }
+      }
+      if (!bounded) return true;
+      for (HighsInt j = 0; j != nbC; ++j) {
+        const HighsInt c = cols[j];
+        refInternal += (sign * model.col_cost_[c]) * sol[j];
+      }
+      blockSol[k] = std::move(sol);
+      blockUsable[k] = 1;
+      continue;
+    }
+    HighsLp sublp;
+    sublp.num_col_ = nbC;
+    sublp.num_row_ = nbR;
+    sublp.sense_ = ObjSense::kMinimize;
+    sublp.offset_ = 0.0;
+    sublp.a_matrix_.format_ = MatrixFormat::kColwise;
+    sublp.a_matrix_.start_.assign(nbC + 1, 0);
+    sublp.col_cost_.resize(nbC);
+    sublp.col_lower_.resize(nbC);
+    sublp.col_upper_.resize(nbC);
+    sublp.integrality_.resize(nbC);
+    bool hasDiscrete = false;
+    for (HighsInt j = 0; j != nbC; ++j) {
+      HighsInt c = cols[j];
+      sublp.col_cost_[j] = sign * model.col_cost_[c];
+      sublp.col_lower_[j] = model.col_lower_[c];
+      sublp.col_upper_[j] = model.col_upper_[c];
+      sublp.integrality_[j] = model.integrality_[c];
+      if (sublp.integrality_[j] != HighsVarType::kContinuous)
+        hasDiscrete = true;
+    }
+    if (hasDiscrete && !mipsolver.options_mip_->mip_lagrangian_subproblem_mip)
+      sublp.integrality_.assign(nbC, HighsVarType::kContinuous);
+    sublp.row_lower_.resize(nbR);
+    sublp.row_upper_.resize(nbR);
+    for (HighsInt i = 0; i != nbR; ++i) {
+      HighsInt r = rows[i];
+      sublp.row_lower_[i] = model.row_lower_[r] == -kHighsInf
+                                ? -kHighsInf
+                                : model.row_lower_[r] - rowShift[r];
+      sublp.row_upper_[i] = model.row_upper_[r] == kHighsInf
+                                ? kHighsInf
+                                : model.row_upper_[r] - rowShift[r];
+    }
+    std::vector<HighsInt> rowPos(numRow, -1);
+    for (HighsInt i = 0; i != nbR; ++i) rowPos[rows[i]] = i;
+    for (HighsInt j = 0; j != nbC; ++j) {
+      HighsInt c = cols[j];
+      for (HighsInt el = model.a_matrix_.start_[c];
+           el != model.a_matrix_.start_[c + 1]; ++el) {
+        HighsInt sr = rowPos[model.a_matrix_.index_[el]];
+        if (sr < 0) continue;  // separator-row entry (dropped in ruin step)
+        sublp.a_matrix_.index_.push_back(sr);
+        sublp.a_matrix_.value_.push_back(model.a_matrix_.value_[el]);
+      }
+      sublp.a_matrix_.start_[j + 1] = (HighsInt)sublp.a_matrix_.index_.size();
+    }
+    const double tl = timeLeft();
+    // Parent gap tolerances: block solutions serve primal purposes only
+    // (verified before any use), so incumbents good enough for the
+    // parent stop the subsolver early instead of burning the budget.
+    const double parentRelGap = mipsolver.options_mip_->mip_rel_gap;
+    const double parentAbsGap = mipsolver.options_mip_->mip_abs_gap;
+    HighsSubLpResult res =
+        (hasDiscrete &&
+         mipsolver.options_mip_->mip_lagrangian_subproblem_mip)
+            ? solveSubMip(sublp, std::min(1.0, tl), parentRelGap,
+                          parentAbsGap)
+            : solveSubLp(sublp, std::min(10.0, tl));
+    if (res.status == HighsModelStatus::kInfeasible) {
+      // Block rows alone infeasible: the relaxation is infeasible, so the
+      // whole model is infeasible.
+      mipsolver.modelstatus_ = HighsModelStatus::kInfeasible;
+      if (logRep)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[LagRepair] block %d infeasible without coupling -> "
+                     "globally infeasible\n",
+                     (int)k);
+      return true;
+    }
+    // Usability (not optimality) decides: solved blocks compose, while
+    // unsolved ones join the recreate union below instead of aborting.
+    // No bound is ever derived here, so suboptimality is harmless.
+    if ((HighsInt)res.colSol.size() != nbC) {
+      blockFailed[k] = 1;
+      ++numFailed;
+      refValid = false;
+      continue;
+    }
+    refInternal += res.obj;
+    blockSol[k] = res.colSol;
+    blockUsable[k] = 1;
+    if (res.status == HighsModelStatus::kOptimal) ++numBlockOptimal;
+  }
+  if (logRep)
+    highsLogUser(logOptions, HighsLogType::kInfo,
+                 "[LagRepair] %d blocks solved (%d optimal, %d failed) in "
+                 "%.1fs\n",
+                 (int)nB, (int)numBlockOptimal, (int)numFailed,
+                 mipsolver.timer_.read() - blocksStart);
+
+  // Compose the ruin solution (fixed cols at bounds, solved blocks at
+  // their solutions; unsolved blocks keep lower-bound placeholders and
+  // always join the union below, so placeholders are never fixed).
+  std::vector<double> composed(numCol, 0.0);
+  for (HighsInt c = 0; c != numCol; ++c) composed[c] = model.col_lower_[c];
+  for (HighsInt k = 0; k != nB; ++k) {
+    if (!blockUsable[k]) continue;
+    for (size_t j = 0; j != cand.blockCols[k].size(); ++j)
+      composed[cand.blockCols[k][j]] = blockSol[k][j];
+  }
+  // Block membership for the recreate step.
+  std::vector<HighsInt> blockOf(numCol, -1);
+  for (HighsInt k = 0; k != nB; ++k)
+    for (HighsInt c : cand.blockCols[k]) blockOf[c] = k;
+  // Coupling violation at the composition (shifted frame: fixed activity
+  // already removed from bounds). Per-block activities on coupling rows
+  // double as ruin scores below.
+  std::vector<HighsInt> rowCoupPos(numRow, -1);
+  for (size_t i = 0; i != cand.couplingRows.size(); ++i)
+    rowCoupPos[cand.couplingRows[i]] = (HighsInt)i;
+  const HighsInt nRC = (HighsInt)cand.couplingRows.size();
+  std::vector<double> activity(numRow, 0.0);
+  std::vector<std::vector<double>> blockAct(nB,
+                                            std::vector<double>(nRC, 0.0));
+  for (HighsInt c = 0; c != numCol; ++c) {
+    if (colFixed[c]) continue;
+    const double v = composed[c];
+    const HighsInt b = blockOf[c];
+    for (HighsInt el = model.a_matrix_.start_[c];
+         el != model.a_matrix_.start_[c + 1]; ++el) {
+      const HighsInt r = model.a_matrix_.index_[el];
+      const double add = model.a_matrix_.value_[el] * v;
+      activity[r] += add;
+      const HighsInt p = rowCoupPos[r];
+      if (b >= 0 && p >= 0) blockAct[b][p] += add;
+    }
+  }
+  auto arcViolated = [&](const RepArc& a) -> bool {
+    const double tol = feastol * std::max(1.0, std::fabs(a.bound));
+    const double act = activity[a.row];
+    if (a.dir > 0) return act - a.bound > tol;
+    if (a.dir < 0) return a.bound - act > tol;
+    return std::fabs(act - a.bound) > tol;
+  };
+  std::vector<char> rowViolated(numRow, 0);
+  bool anyViolated = false;
+  for (const RepArc& a : arcs) {
+    // One flag per row (ranged rows own two arcs).
+    if (!rowViolated[a.row] && arcViolated(a)) {
+      rowViolated[a.row] = 1;
+      anyViolated = true;
+    }
+  }
+  if (logRep)
+    highsLogUser(logOptions, HighsLogType::kInfo,
+                 "[LagRepair] candidate: %d coupling rows, %d blocks "
+                 "(detect %.1fs); composition %s\n",
+                 (int)cand.couplingRows.size(), (int)nB, sepDone - repStart,
+                 anyViolated ? "violates coupling -> recreate"
+                             : "coupling-feasible");
+  if (!anyViolated && numFailed == 0) {
+    // Nothing to recreate: offer the verified composition directly.
+    // (With failed blocks the composition is incomplete, so the union
+    // below always runs.)
+    if (verifyBendersSolution(model, composed)) injectRepair(composed);
+    return true;
+  }
+  // Recreate: union of blocks touching violated rows (row entries come
+  // from the row-wise column lists built below); everything else stays
+  // fixed at the composition. The union is a ranked prefix (failed blocks
+  // first, then ruin scores) within the column cap, with one expansion to
+  // twice the cap if the first joint proves infeasible. Cost is bounded
+  // by the caps either way.
+  // Row-wise column lists over unfixed columns for the union scan.
+  std::vector<char> blockTouch(nB, 0);
+  {
+    std::vector<HighsInt> cnt(numRow, 0);
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (colFixed[c]) continue;
+      for (HighsInt el = model.a_matrix_.start_[c];
+           el != model.a_matrix_.start_[c + 1]; ++el)
+        ++cnt[model.a_matrix_.index_[el]];
+    }
+    std::vector<HighsInt> start(numRow + 1, 0);
+    for (HighsInt r = 0; r != numRow; ++r) start[r + 1] = start[r] + cnt[r];
+    std::vector<HighsInt> cols(start[numRow], -1);
+    std::vector<HighsInt> fill(numRow, 0);
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (colFixed[c]) continue;
+      for (HighsInt el = model.a_matrix_.start_[c];
+           el != model.a_matrix_.start_[c + 1]; ++el) {
+        HighsInt r = model.a_matrix_.index_[el];
+        cols[start[r] + fill[r]++] = c;
+      }
+    }
+    for (HighsInt r = 0; r != numRow; ++r) {
+      if (!rowViolated[r]) continue;
+      for (HighsInt e = start[r]; e != start[r + 1]; ++e) {
+        HighsInt b = blockOf[cols[e]];
+        if (b >= 0) blockTouch[b] = 1;
+      }
+    }
+  }
+  // Unsolved blocks always join: their columns were never fixed, so
+  // only the joint problem can place them.
+  for (HighsInt k = 0; k != nB; ++k)
+    if (blockFailed[k]) blockTouch[k] = 1;
+  // Ranked order of touching blocks: unsolved blocks first (no scores
+  // and no fixing values), then ruin scores (per-block activity in the
+  // direction of the needed movement). Heuristic order only.
+  std::vector<double> score(nB, 0.0);
+  for (HighsInt i = 0; i != nRC; ++i) {
+    HighsInt r = cand.couplingRows[i];
+    if (!rowViolated[r]) continue;
+    const double act = activity[r];
+    const double lo = model.row_lower_[r] == -kHighsInf
+                          ? -kHighsInf
+                          : model.row_lower_[r] - rowShift[r];
+    const double hi = model.row_upper_[r] == kHighsInf
+                          ? kHighsInf
+                          : model.row_upper_[r] - rowShift[r];
+    const bool hasHi = hi != kHighsInf;
+    // The row is violated, so act sits strictly outside [lo, hi]:
+    // rank the side that must move (largest users first when the
+    // activity must come down, smallest first when it must go up).
+    const double dir = (hasHi && act > hi) ? 1.0 : -1.0;
+    for (HighsInt k = 0; k != nB; ++k) score[k] += dir * blockAct[k][i];
+  }
+  std::vector<HighsInt> orderFailed;
+  std::vector<HighsInt> order;
+  for (HighsInt k = 0; k != nB; ++k) {
+    if (!blockTouch[k]) continue;
+    // Unsolved blocks have no scores and no fixing values: place them
+    // first so a tight cap drops scored blocks instead of stranding
+    // unfixable columns outside the union.
+    if (blockFailed[k])
+      orderFailed.push_back(k);
+    else
+      order.push_back(k);
+  }
+  std::stable_sort(order.begin(), order.end(), [&](HighsInt a, HighsInt b) {
+    return score[a] > score[b];
+  });
+  std::vector<HighsInt> ranked;
+  ranked.insert(ranked.end(), orderFailed.begin(), orderFailed.end());
+  ranked.insert(ranked.end(), order.begin(), order.end());
+  HighsInt numUnfixed = 0;
+  for (HighsInt c = 0; c != numCol; ++c)
+    if (!colFixed[c]) ++numUnfixed;
+  // Up to two attempts: the ranked prefix within the column cap, then
+  // (only on a proven-infeasible joint, where strictly more freedom is
+  // the only thing that can help) one expansion to twice the cap.
+  HighsInt cap = maxUnion;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    std::vector<char> blockInU(nB, 0);
+    std::vector<char> inU(numCol, 0);
+    HighsInt numU = 0;
+    HighsInt numFilled = 0;
+    {
+      HighsInt used = 0;
+      for (HighsInt k : ranked) {
+        const HighsInt sz = (HighsInt)cand.blockCols[k].size();
+        if (used + sz > cap) continue;
+        blockInU[k] = 1;
+        used += sz;
+        ++numFilled;
+      }
+    }
+    for (HighsInt k = 0; k != nB; ++k) {
+      if (!blockInU[k]) continue;
+      for (HighsInt c : cand.blockCols[k]) {
+        if (!inU[c]) {
+          inU[c] = 1;
+          ++numU;
+        }
+      }
+    }
+    if (numU == 0) {
+      if (logRep)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[LagRepair] recreate union empty -> normal MIP\n");
+      return true;
+    }
+    // A union holding more than the configured share of the unfixed
+    // columns is a focused recreate only when the model itself is
+    // large enough that branch-and-bound does not trivially own it;
+    // on small models the same situation aborts (the parent search
+    // owns that solve, and the joint budget would only delay it).
+    const HighsInt maxUnionPct = std::max<HighsInt>(
+        1, std::min<HighsInt>(
+               100, mipsolver.options_mip_->mip_lagrangian_repair_max_union_pct));
+    if (numUnfixed > 0 && numUnfixed <= 2 * maxUnion &&
+        numU * 100 > maxUnionPct * numUnfixed) {
+      if (logRep)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[LagRepair] recreate union %d of %d unfixed cols "
+                     "(>%d%%, small model) -> normal MIP\n",
+                     (int)numU, (int)numUnfixed, (int)maxUnionPct);
+      return true;
+    }
+    HighsInt numUBlocks = 0;
+    for (HighsInt k = 0; k != nB; ++k)
+      if (blockInU[k]) ++numUBlocks;
+    const double jointBudget = timeLeft();
+    const double jointBudgetStart = mipsolver.timer_.read();
+    if (jointBudget <= 0) return true;
+    if (logRep)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[LagRepair] recreate union: %d cols from %d blocks, joint "
+                   "budget %.1fs (attempt %d)\n",
+                   (int)numU, (int)numUBlocks, jointBudget, attempt + 1);
+    // Joint sub-MIP: the full presolved model with every column outside
+    // the union fixed to the composition. A joint infeasibility proves
+    // nothing globally (the fixing was our heuristic choice), so only a
+    // verified composition is ever injected.
+    HighsLp joint = model;
+    for (HighsInt c = 0; c != numCol; ++c) {
+      if (colFixed[c] || inU[c]) continue;
+      joint.col_lower_[c] = joint.col_upper_[c] = composed[c];
+    }
+    HighsSubMipProgress progress;
+    HighsSubLpResult res =
+        solveSubMip(joint, timeLeft(), mipsolver.options_mip_->mip_rel_gap,
+                    mipsolver.options_mip_->mip_abs_gap,
+                    logRep ? &progress : nullptr);
+    const double jointDone = mipsolver.timer_.read();
+    if (logRep) {
+      std::lock_guard<std::mutex> guard(progress.mutex);
+      for (const auto& e : progress.events)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[LagRepair-joint] incumbent %.6g at %.1fs\n", e.second,
+                     e.first);
+    }
+    if (logRep)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[LagRepair] joint: status=%d obj=%.6g solsize=%d/%d "
+                   "(solve %.1fs, repair total %.1fs)\n",
+                   (int)res.status, res.obj, (int)res.colSol.size(),
+                   (int)numCol, jointDone - jointBudgetStart,
+                   jointDone - repStart);
+    if ((HighsInt)res.colSol.size() == numCol) {
+      if (verifyBendersSolution(model, res.colSol)) {
+        // Scale sanity: the joint result must sit within an order of
+        // magnitude of the block-objective sum (both in parent space);
+        // far above it signals a penalty corner produced by a wrong
+        // union, not a useful incumbent. Calibrated: legitimate coupling
+        // cost measured 1.0x (Adana) and 17.5x (synthetic), versus 50x+
+        // for penalty corners. Validity is unaffected (verify passed);
+        // only the injection is skipped.
+        bool sane = true;
+        if (refValid && std::isfinite(refInternal)) {
+          const double refParent = sign * refInternal + model.offset_;
+          if (std::isfinite(refParent) &&
+              res.obj > refParent + 30.0 * std::max(1.0, std::fabs(refParent)))
+            sane = false;
+        }
+        if (sane) {
+          injectRepair(res.colSol);
+        } else if (logRep) {
+          highsLogUser(logOptions, HighsLogType::kInfo,
+                       "[LagRepair] joint obj %.6g far above block-ref %.6g "
+                       "-> dropped\n",
+                       res.obj, sign * refInternal + model.offset_);
+        }
+        return true;
+      }
+      if (logRep) {
+        double maxBnd = 0.0, maxRow = 0.0, maxInt = 0.0;
+        for (HighsInt c = 0; c != numCol; ++c) {
+          const double v = res.colSol[c];
+          if (v < model.col_lower_[c])
+            maxBnd = std::max(maxBnd, model.col_lower_[c] - v);
+          if (v > model.col_upper_[c])
+            maxBnd = std::max(maxBnd, v - model.col_upper_[c]);
+          const HighsVarType it = model.integrality_[c];
+          if (it == HighsVarType::kInteger ||
+              it == HighsVarType::kSemiInteger ||
+              it == HighsVarType::kImplicitInteger)
+            maxInt = std::max(maxInt, std::fabs(v - std::round(v)));
+        }
+        if (model.a_matrix_.format_ == MatrixFormat::kColwise) {
+          std::vector<double> act(numRow, 0.0);
+          for (HighsInt c = 0; c != numCol; ++c) {
+            for (HighsInt el = model.a_matrix_.start_[c];
+                 el != model.a_matrix_.start_[c + 1]; ++el)
+              act[model.a_matrix_.index_[el]] +=
+                  model.a_matrix_.value_[el] * res.colSol[c];
+          }
+          for (HighsInt r = 0; r != numRow; ++r) {
+            if (act[r] < model.row_lower_[r])
+              maxRow = std::max(maxRow, model.row_lower_[r] - act[r]);
+            if (act[r] > model.row_upper_[r])
+              maxRow = std::max(maxRow, act[r] - model.row_upper_[r]);
+          }
+        }
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[LagRepair] joint solution failed verification "
+                     "(maxbnd=%.2g maxrow=%.2g maxint=%.2g, feastol=%.2g) -> "
+                     "normal MIP\n",
+                     maxBnd, maxRow, maxInt, feastol);
+      }
+      return true;
+    }
+    if (logRep)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[LagRepair] joint status %d -> %s\n", (int)res.status,
+                   res.status == HighsModelStatus::kInfeasible &&
+                           numFilled < (HighsInt)ranked.size()
+                       ? "expanding union"
+                       : "normal MIP");
+    if (res.status != HighsModelStatus::kInfeasible) return true;
+    if (numFilled >= (HighsInt)ranked.size()) return true;
+    cap = 2 * maxUnion;
   }
   return true;
 }

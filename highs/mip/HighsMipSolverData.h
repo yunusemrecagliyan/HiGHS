@@ -325,8 +325,19 @@ struct HighsMipSolverData {
     double obj = kHighsInf;
     bool dualValid = false;
   };
+  // Incumbent progress collected from a sub-MIP solve (solver threads
+  // append under lock; the caller logs single-threaded afterwards).
+  // Purely diagnostic: a null progress disables callbacks entirely.
+  struct HighsSubMipProgress {
+    std::mutex mutex;
+    // (sub-solver running time, objective) per improving incumbent.
+    std::vector<std::pair<double, double>> events;
+  };
   static HighsSubLpResult solveSubLp(const HighsLp& sublp, double timeLimit);
-  static HighsSubLpResult solveSubMip(const HighsLp& submip, double timeLimit);
+  static HighsSubLpResult solveSubMip(const HighsLp& submip,
+                                        double timeLimit, double relGap = 0.0,
+                                        double absGap = 0.0,
+                                        HighsSubMipProgress* progress = nullptr);
   // Lagrangian decomposition (HighsLagrangian.cpp): row separator whose
   // removal splits the model; coupling rows are dualized (priced) while
   // blocks solve independently. Produces dual bounds (logged) and, when
@@ -341,6 +352,23 @@ struct HighsMipSolverData {
   };
   bool findLagSeparator(const HighsLp& model, HighsLagCandidate& cand) const;
   bool runLagrangian();
+  // Presolve-detected coupling-row decomposition shared with the
+  // search-time ruin-and-recreate heuristic below. Stored when a
+  // candidate is found (even if the presolve repair itself is disabled
+  // or falls back); column indices are stable into the search, and every
+  // use revalidates sizes and bounds before touching anything.
+  HighsLagCandidate lagRepairCand;
+  bool lagRepairCandValid = false;
+  // Ruin-and-recreate repair on coupling-row structure
+  // (HighsLagrangian.cpp): blocks are solved independently (LP or MIP
+  // subproblems, same single-convention pattern as runLagrangian); if the
+  // composed solution violates coupling rows, the blocks touching violated
+  // rows are re-optimized jointly with every other column fixed to the
+  // block solutions, and a verified feasible composition is injected as a
+  // native MIP-start incumbent. Pure primal heuristic: no bounds are
+  // published and no variables are fixed, so any anomaly falls back
+  // silently with the parent model untouched.
+  bool runLagRepair();
   void setupDomainPropagation();
   void saveReportMipSolution(const double new_upper_limit = -kHighsInf);
   void checkAddSolution();

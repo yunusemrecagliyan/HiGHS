@@ -539,6 +539,11 @@ struct HighsOptionsStruct {
   HighsInt mip_lagrangian_scan_cap;
   HighsInt mip_lagrangian_max_row_degree;
   bool mip_lagrangian_subproblem_mip;
+  bool mip_lagrangian_repair;
+  double mip_lagrangian_repair_max_time;
+  HighsInt mip_lagrangian_repair_max_cols;
+  HighsInt mip_lagrangian_repair_max_blocks;
+  HighsInt mip_lagrangian_repair_max_union_pct;
   double mip_decomposition_submip_time_limit;
   HighsInt mip_benders_max_iterations;
   HighsInt mip_benders_max_coupling_cols;
@@ -560,6 +565,7 @@ struct HighsOptionsStruct {
   HighsInt mip_heuristic_hamming_radius;
   bool mip_heuristic_run_proximity;
   double mip_heuristic_proximity_delta;
+  bool mip_heuristic_run_lagrepair;
 
   // Logging callback identifiers
   HighsLogOptions log_options;
@@ -747,6 +753,11 @@ struct HighsOptionsStruct {
         mip_lagrangian_scan_cap(0),
         mip_lagrangian_max_row_degree(2000),
         mip_lagrangian_subproblem_mip(true),
+        mip_lagrangian_repair(true),
+        mip_lagrangian_repair_max_time(30.0),
+        mip_lagrangian_repair_max_cols(1000),
+        mip_lagrangian_repair_max_blocks(200),
+        mip_lagrangian_repair_max_union_pct(50),
         mip_decomposition_submip_time_limit(10.0),
         mip_benders_max_iterations(100),
         mip_benders_max_coupling_cols(16),
@@ -767,7 +778,8 @@ struct HighsOptionsStruct {
         mip_heuristic_run_hamming(false),
         mip_heuristic_hamming_radius(20),
         mip_heuristic_run_proximity(false),
-        mip_heuristic_proximity_delta(0.01) {};
+        mip_heuristic_proximity_delta(0.01),
+        mip_heuristic_run_lagrepair(false) {};
   // clang-format on
 };
 
@@ -1497,9 +1509,10 @@ class HighsOptions : public HighsOptionsStruct {
 
     record_double = new OptionRecordDouble(
         "mip_benders_branch_priority",
-        "Pseudocost-score bonus for Benders coupling columns when "
-        "selecting branching candidates (branch-on-bridges-first); 0 "
-        "disables (bit-identical search)",
+        "Pseudocost-score bonus for coupling columns when selecting "
+        "branching candidates (branch-on-bridges-first; coupling sets are "
+        "published by Benders separators and by Lagrangian repair for "
+        "coupling-row columns); 0 disables (bit-identical search)",
         advanced, &mip_benders_branch_priority, 0.0, 0.0, kHighsInf);
     records.push_back(record_double);
 
@@ -1579,6 +1592,17 @@ class HighsOptions : public HighsOptionsStruct {
     records.push_back(record_double);
 
     record_bool = new OptionRecordBool(
+        "mip_heuristic_run_lagrepair",
+        "Whether block-structured ruin-and-recreate search runs during "
+        "branch-and-bound on the presolve-detected coupling-row "
+        "decomposition: a capped subset of blocks is freed, the rest is "
+        "fixed to the incumbent, and the restricted sub-MIP admits only "
+        "strict improvements via the framework cutoff (opt-in sub-MIP "
+        "heuristic)",
+        advanced, &mip_heuristic_run_lagrepair, false);
+    records.push_back(record_bool);
+
+    record_bool = new OptionRecordBool(
         "mip_lagrangian",
         "Whether Lagrangian decomposition is attempted on models with a "
         "small coupling-row separator (dual bounds plus verified MIP-start "
@@ -1621,6 +1645,44 @@ class HighsOptions : public HighsOptionsStruct {
         "Solve discrete Lagrangian subproblems as MIPs to generate integer compositions",
         advanced, &mip_lagrangian_subproblem_mip, true);
     records.push_back(record_bool);
+
+    record_bool = new OptionRecordBool(
+        "mip_lagrangian_repair",
+        "Whether a ruin-and-recreate repair is attempted on models with a "
+        "small coupling-row separator: blocks are solved independently, "
+        "blocks touching violated coupling rows are re-optimized jointly "
+        "with all other columns fixed, and a verified feasible composition "
+        "is injected as MIP-start incumbent (never fixes variables; falls "
+        "back on any doubt)",
+        advanced, &mip_lagrangian_repair, true);
+    records.push_back(record_bool);
+
+    record_double = new OptionRecordDouble(
+        "mip_lagrangian_repair_max_time",
+        "Max seconds spent in the Lagrangian repair heuristic",
+        advanced, &mip_lagrangian_repair_max_time, 0.0, 30.0, kHighsInf);
+    records.push_back(record_double);
+
+    record_int = new OptionRecordInt(
+        "mip_lagrangian_repair_max_cols",
+        "Max columns of the jointly re-optimized block union in the "
+        "Lagrangian repair heuristic (larger unions fall back)",
+        advanced, &mip_lagrangian_repair_max_cols, 1, 1000, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_lagrangian_repair_max_blocks",
+        "Max blocks of a Lagrangian repair candidate (more blocks fall "
+        "back to normal MIP)",
+        advanced, &mip_lagrangian_repair_max_blocks, 2, 200, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_lagrangian_repair_max_union_pct",
+        "Max recreate union as a percentage of unfixed columns (larger "
+        "unions fall back to normal MIP)",
+        advanced, &mip_lagrangian_repair_max_union_pct, 1, 50, 100);
+    records.push_back(record_int);
 
     record_double = new OptionRecordDouble(
         "mip_decomposition_submip_time_limit",

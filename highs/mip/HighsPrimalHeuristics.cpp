@@ -18,6 +18,9 @@
 #include "mip/HighsDomainChange.h"
 #include "mip/HighsLpRelaxation.h"
 #include "mip/HighsMipSolverData.h"
+
+#include <algorithm>
+#include <cmath>
 #include "mip/MipTimer.h"
 #include "util/HighsHash.h"
 #include "util/HighsIntegers.h"
@@ -927,6 +930,126 @@ void HighsPrimalHeuristics::hammingSearch(HighsMipWorker& worker) {
   const double restrictRate =
       (double)nTouched /
       (double)std::max<HighsInt>(1, (HighsInt)ball.size());
+  solveSubMip(worker, sublp, basis, restrictRate, std::move(subLB),
+              std::move(subUB), 500,
+              200 + mipsolver.mipdata_->num_nodes /
+                        (node_reduction_factor * 20),
+              12);
+}
+
+void HighsPrimalHeuristics::lagRepairSearch(HighsMipWorker& worker) {
+  // Block-structured ruin-and-recreate (LNS) on the presolve-detected
+  // coupling-row decomposition (see HighsMipSolverData::runLagRepair):
+  // free a capped subset of blocks, fix everything else to the
+  // incumbent, and solve the restricted sub-MIP. The framework
+  // objective bound admits only strict improvements and results flow
+  // through the verified incumbent channel, so a failed round costs
+  // only its capped budget. Opt-in; every stored index is revalidated
+  // (the decomposition predates the search and bounds have tightened
+  // since, including across restarts).
+  if (worker.getGlobalDomain().infeasible()) return;
+  const auto& incumbent = mipsolver.mipdata_->incumbent;
+  if (incumbent.empty()) return;
+  if ((HighsInt)incumbent.size() != mipsolver.numCol()) return;
+  if (mipsolver.submip && mipsolver.mipdata_->numImprovingSols != 0) return;
+  const HighsMipSolverData::HighsLagCandidate& cand =
+      mipsolver.mipdata_->lagRepairCand;
+  if (!mipsolver.mipdata_->lagRepairCandValid) return;
+  if (cand.blockCols.size() < 2) return;
+  const HighsDomain& globaldom = worker.getGlobalDomain();
+  const double feastol = mipsolver.mipdata_->feastol;
+  const double ub = mipsolver.mipdata_->upper_bound;
+  if (!std::isfinite(ub) || ub >= 0.5 * kHighsInf) return;
+  const HighsInt numCol = mipsolver.numCol();
+  for (const auto& cols : cand.blockCols) {
+    if (cols.empty()) return;
+    for (HighsInt c : cols)
+      if (c < 0 || c >= numCol) return;
+  }
+  // LP relaxation for fractional guidance and basis (mirrors proximity).
+  HighsLpRelaxation heurlp(mipsolver);
+  heurlp.setMipWorker(worker);
+  heurlp.setProfiling(mipsolver.profiling_);
+  heurlp.loadModel();
+  heurlp.setIterationLimit(
+      std::max(int64_t{10000}, 2 * mipsolver.mipdata_->firstrootlpiters));
+  heurlp.getLpSolver().changeColsBounds(0, mipsolver.numCol() - 1,
+                                        globaldom.col_lower_.data(),
+                                        globaldom.col_upper_.data());
+  heurlp.getLpSolver().setBasis(mipsolver.mipdata_->firstrootbasis,
+                                "HighsPrimalHeuristics::lagRepairSearch");
+  heurlp.removeObsoleteRows(false);
+  HighsLp sublp = heurlp.getLp();
+  if (sublp.a_matrix_.format_ != MatrixFormat::kColwise)
+    sublp.a_matrix_.ensureColwise();
+  if ((HighsInt)sublp.num_col_ != numCol) return;
+  const std::vector<double>& lpsol =
+      heurlp.getLpSolver().getSolution().col_value;
+  const bool haveLp = ((HighsInt)lpsol.size() == numCol);
+  // Union: blocks ordered by LP-fractional integer count (undecided
+  // regions first), filled up to the column cap with unfixed columns.
+  const HighsInt maxUnion = std::max<HighsInt>(
+      1, mipsolver.options_mip_->mip_lagrangian_repair_max_cols);
+  std::vector<HighsInt> fracCount(cand.blockCols.size(), 0);
+  for (size_t k = 0; k != cand.blockCols.size(); ++k) {
+    for (HighsInt c : cand.blockCols[k]) {
+      if (globaldom.isFixed(c)) continue;
+      if (mipsolver.model_->integrality_[c] == HighsVarType::kContinuous)
+        continue;
+      if (!haveLp) continue;
+      const double v = lpsol[c];
+      if (std::isfinite(v) &&
+          std::fabs(v - std::round(v)) > feastol * std::max(1.0, std::fabs(v)))
+        ++fracCount[k];
+    }
+  }
+  std::vector<size_t> order(cand.blockCols.size());
+  for (size_t k = 0; k != order.size(); ++k) order[k] = k;
+  std::stable_sort(order.begin(), order.end(),
+                   [&](size_t a, size_t b) { return fracCount[a] > fracCount[b]; });
+  std::vector<char> inU(numCol, 0);
+  HighsInt numU = 0;
+  for (size_t k : order) {
+    HighsInt add = 0;
+    for (HighsInt c : cand.blockCols[k])
+      if (!globaldom.isFixed(c)) ++add;
+    if (add == 0) continue;
+    if (numU + add > maxUnion) continue;
+    for (HighsInt c : cand.blockCols[k])
+      if (!globaldom.isFixed(c) && !inU[c]) {
+        inU[c] = 1;
+        ++numU;
+      }
+  }
+  if (numU == 0) return;
+  // Fix everything outside the union to the incumbent (clamped into the
+  // current global bounds; a stale value only risks an infeasible
+  // sub-MIP, which falls back silently).
+  std::vector<double> subLB = globaldom.col_lower_;
+  std::vector<double> subUB = globaldom.col_upper_;
+  for (HighsInt c = 0; c != numCol; ++c) {
+    if (inU[c]) continue;
+    double v = incumbent[c];
+    if (!std::isfinite(v)) return;
+    v = std::min(std::max(v, subLB[c]), subUB[c]);
+    subLB[c] = v;
+    subUB[c] = v;
+  }
+  HighsBasis basis = heurlp.getLpSolver().getBasis();
+  if (!((HighsInt)basis.col_status.size() == numCol &&
+        (HighsInt)basis.row_status.size() == sublp.num_row_)) {
+    basis.col_status.assign(numCol, HighsBasisStatus::kNonbasic);
+    basis.row_status.assign(sublp.num_row_, HighsBasisStatus::kBasic);
+    basis.valid = false;
+  }
+  HighsInt node_reduction_factor =
+      mipsolver.mipdata_->parallelLockActive()
+          ? std::max(
+                HighsInt{1},
+                static_cast<HighsInt>(mipsolver.mipdata_->workers.size()) / 4)
+          : 1;
+  const double restrictRate =
+      (double)numU / (double)std::max<HighsInt>(1, numCol);
   solveSubMip(worker, sublp, basis, restrictRate, std::move(subLB),
               std::move(subUB), 500,
               200 + mipsolver.mipdata_->num_nodes /

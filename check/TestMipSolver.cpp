@@ -2485,3 +2485,69 @@ TEST_CASE("MIP-lagrangian-loose", "[highs_test_mip_solver]") {
     highs.resetGlobalScheduler(true);
   }
 }
+
+// Lagrangian repair: sixty two-column integer blocks (above the toy-size
+// guard, and above the components subsolver caps set by the test so the
+// blocks survive to presolve heuristics) joined by one tight coupling
+// row. Block optima violate the row; with the union cap below the total
+// touching size the ranked recreate tier engages. Only the
+// ruin-and-recreate path can compose a feasible incumbent; the proven
+// optimum (6300) must agree either way.
+static HighsLp lagRepairSixtyBlocks() {
+  const HighsInt nb = 60;
+  HighsLp lp;
+  lp.num_col_ = 2 * nb;
+  lp.num_row_ = nb + 1;
+  lp.sense_ = ObjSense::kMinimize;
+  lp.col_cost_.assign(lp.num_col_, 0.0);
+  lp.col_lower_.assign(lp.num_col_, 0.0);
+  lp.col_upper_.assign(lp.num_col_, 10.0);
+  lp.integrality_.assign(lp.num_col_, HighsVarType::kInteger);
+  lp.row_lower_.assign(lp.num_row_, -kHighsInf);
+  lp.row_upper_.assign(lp.num_row_, kHighsInf);
+  lp.a_matrix_.format_ = MatrixFormat::kColwise;
+  lp.a_matrix_.start_.assign(lp.num_col_ + 1, 0);
+  for (HighsInt b = 0; b < nb; ++b) {
+    const HighsInt a = 2 * b;
+    const HighsInt s = 2 * b + 1;
+    lp.col_cost_[a] = 1.0;
+    lp.col_cost_[s] = 100.0;
+    lp.row_lower_[b] = 6.0;  // a + s >= 6
+    lp.a_matrix_.index_.push_back(b);
+    lp.a_matrix_.value_.push_back(1.0);
+    lp.a_matrix_.index_.push_back(nb);
+    lp.a_matrix_.value_.push_back(1.0);
+    lp.a_matrix_.start_[a + 1] = (HighsInt)lp.a_matrix_.index_.size();
+    lp.a_matrix_.index_.push_back(b);
+    lp.a_matrix_.value_.push_back(1.0);
+    lp.a_matrix_.start_[s + 1] = (HighsInt)lp.a_matrix_.index_.size();
+  }
+  lp.row_upper_[nb] = 300.0;  // coupling: sum a <= 300 (optima sum 360)
+  return lp;
+}
+
+TEST_CASE("MIP-lagrepair-tight-row", "[highs_test_mip_solver]") {
+  double objective_on = kHighsInf;
+  for (bool repair : {true, false}) {
+    Highs highs;
+    highs.setOptionValue("output_flag", dev_run);
+    highs.setOptionValue("mip_rel_gap", 0);
+    highs.setOptionValue("mip_abs_gap", 0);
+    highs.setOptionValue("mip_lagrangian", false);
+    highs.setOptionValue("mip_lagrangian_repair", repair);
+    highs.setOptionValue("mip_lagrangian_repair_max_cols", 60);
+    highs.setOptionValue("mip_decomposition_max_comp_cols", 1);
+    highs.setOptionValue("mip_decomposition_max_comp_rows", 1);
+    highs.setOptionValue("mip_decomposition_max_comp_ints", 1);
+    highs.passModel(lagRepairSixtyBlocks());
+    REQUIRE(highs.run() == HighsStatus::kOk);
+    REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+    double objective = highs.getInfo().objective_function_value;
+    REQUIRE(objective == 6300.0);
+    if (repair)
+      objective_on = objective;
+    else
+      REQUIRE(objective == objective_on);
+    highs.resetGlobalScheduler(true);
+  }
+}

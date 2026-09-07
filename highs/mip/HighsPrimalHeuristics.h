@@ -66,6 +66,15 @@ class HighsPrimalHeuristics {
   // across node visits. No auxiliary columns; opt-in.
   void proximitySearch(HighsMipWorker& worker);
 
+  // Block-structured ruin-and-recreate search on the presolve-detected
+  // coupling-row decomposition: free a capped subset of blocks
+  // (LP-fractional blocks first), fix everything else to the incumbent,
+  // and solve the restricted sub-MIP. The framework objective bound
+  // admits only strict improvements and results flow through the
+  // verified incumbent channel, so a failed round costs only its capped
+  // budget. Opt-in.
+  void lagRepairSearch(HighsMipWorker& worker);
+
   void RENS(HighsMipWorker& worker, const std::vector<double>& relaxationsol);
 
   void RINS(HighsMipWorker& worker, const std::vector<double>& relaxationsol);
