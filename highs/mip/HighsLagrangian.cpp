@@ -35,6 +35,18 @@
 
 namespace {
 
+// Decomposition master-switch mode ("on"/"off"/"auto"): off skips, on
+// forces full budgets (historical behavior), auto probes the first
+// iteration cheaply and aborts early on stall. Unknown values fail
+// closed to off (caller logs once).
+enum class LagDecompMode { Off, On, Auto };
+static LagDecompMode parseLagDecompMode(const std::string& value) {
+  if (value == "on") return LagDecompMode::On;
+  if (value == "off") return LagDecompMode::Off;
+  if (value == "auto") return LagDecompMode::Auto;
+  return LagDecompMode::Off;
+}
+
 // Union-find with path halving (local helper, deterministic).
 struct LagDsU {
   std::vector<HighsInt> p;
@@ -339,7 +351,19 @@ bool HighsMipSolverData::runLagrangian() {
   if (numCol == 0 || numRow == 0) return true;
   if (numCol < 100) return true;
   if (!mipsolver.options_mip_->mip_decomposition) return true;
-  if (!mipsolver.options_mip_->mip_lagrangian) return true;
+  const std::string& lagOpt = mipsolver.options_mip_->mip_lagrangian;
+  const LagDecompMode lagMode = parseLagDecompMode(lagOpt);
+  if (lagMode == LagDecompMode::Off) {
+    if (lagOpt != "off")
+      highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kWarning,
+                   "Unknown mip_lagrangian value '%s' (want on/off/auto): "
+                   "Lagrangian disabled\n",
+                   lagOpt.c_str());
+    return true;
+  }
+  const bool lagAuto = (lagMode == LagDecompMode::Auto);
+  const double lagProbe = std::max(
+      0.0, mipsolver.options_mip_->mip_lagrangian_probe_time);
   if (model.a_matrix_.format_ != MatrixFormat::kColwise)
     model.a_matrix_.ensureColwise();
   const bool logLag = mipsolver.options_mip_->mip_decomposition_logging;
@@ -542,6 +566,13 @@ bool HighsMipSolverData::runLagrangian() {
     if (mipsolver.options_mip_->time_limit < kHighsInf &&
         mipsolver.timer_.read() >= mipsolver.options_mip_->time_limit)
       break;
+    // Auto mode probes the first iteration cheaply (later iterations
+    // and "on" mode use full budgets; a zero probe disables probing).
+    // Sub-MIP blocks keep their tight historical 2s cap regardless:
+    // probing targets degenerate LP stalls, not MIP search.
+    const double iterLpCap = (lagAuto && iter == 0 && lagProbe > 0.0)
+                                 ? lagProbe
+                                 : 10.0;
     if (maxTime < kHighsInf &&
         mipsolver.timer_.getWallTime() - lagStart >= maxTime)
       break;
@@ -633,7 +664,7 @@ bool HighsMipSolverData::runLagrangian() {
       if (hasDiscrete) {
         res = solveSubMip(sublp, std::min(2.0, remaining));
       } else {
-        res = solveSubLp(sublp, std::min(10.0, remaining));
+        res = solveSubLp(sublp, std::min(iterLpCap, remaining));
       }
       if (logLag) {
         // Independent box-minimum check (theorem litmus): no row set can

@@ -54,6 +54,18 @@
 
 namespace {
 
+// Decomposition master-switch mode ("on"/"off"/"auto"): off skips, on
+// forces full budgets (historical behavior), auto probes the first
+// iteration cheaply and aborts early on stall. Unknown values fail
+// closed to off (caller logs once).
+enum class DecompMode { Off, On, Auto };
+static DecompMode parseDecompMode(const std::string& value) {
+  if (value == "on") return DecompMode::On;
+  if (value == "off") return DecompMode::Off;
+  if (value == "auto") return DecompMode::Auto;
+  return DecompMode::Off;
+}
+
 // Union-find with path halving (local helper, deterministic).
 struct DsU {
   std::vector<HighsInt> p;
@@ -927,7 +939,19 @@ bool HighsMipSolverData::runBenders() {
   if (numCol == 0 || numRow == 0) return true;
   if (numCol < 100) return true;
   if (!mipsolver.options_mip_->mip_decomposition) return true;
-  if (!mipsolver.options_mip_->mip_benders) return true;
+  const std::string& bendOpt = mipsolver.options_mip_->mip_benders;
+  const DecompMode bendMode = parseDecompMode(bendOpt);
+  if (bendMode == DecompMode::Off) {
+    if (bendOpt != "off")
+      highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kWarning,
+                   "Unknown mip_benders value '%s' (want on/off/auto): "
+                   "Benders disabled\n",
+                   bendOpt.c_str());
+    return true;
+  }
+  const bool bendAuto = (bendMode == DecompMode::Auto);
+  const double bendProbe = std::max(
+      0.0, mipsolver.options_mip_->mip_benders_probe_time);
   if (model.a_matrix_.format_ != MatrixFormat::kColwise)
     model.a_matrix_.ensureColwise();
   const bool logBend = mipsolver.options_mip_->mip_decomposition_logging;
@@ -1306,6 +1330,14 @@ bool HighsMipSolverData::runBenders() {
     if (mipsolver.options_mip_->time_limit < kHighsInf &&
         mipsolver.timer_.read() >= mipsolver.options_mip_->time_limit)
       break;
+    // Auto mode probes the first iteration cheaply: sub-solves that
+    // stall past the probe abort the loop fast instead of burning full
+    // budgets on degenerate blocks. Later iterations (proven progress),
+    // "on" mode, and a zero probe use full budgets; the master solve
+    // always does.
+    const double subCap = (bendAuto && iter == 0 && bendProbe > 0.0)
+                              ? bendProbe
+                              : 10.0;
     // ---- master problem ----
     HighsLp master;
     master.num_col_ = nMasterCol;
@@ -1544,7 +1576,7 @@ bool HighsMipSolverData::runBenders() {
       double remaining =
           mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
       HighsSubLpResult aux =
-          solveSubLp(auxlp, std::min(10.0, remaining));
+          solveSubLp(auxlp, std::min(subCap, remaining));
       if (aux.status != HighsModelStatus::kOptimal) return false;
       if (!aux.dualValid || (HighsInt)aux.colSol.size() != auxlp.num_col_ ||
           (HighsInt)aux.rowDual.size() != nSubR)
@@ -1705,7 +1737,7 @@ bool HighsMipSolverData::runBenders() {
       double remaining =
           mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
       HighsSubLpResult res =
-          solveSubLp(sublp, std::min(10.0, remaining));
+          solveSubLp(sublp, std::min(subCap, remaining));
       if (res.status == HighsModelStatus::kOptimal) {
         if (!res.dualValid ||
             (HighsInt)res.colSol.size() != nbC ||
@@ -1846,7 +1878,7 @@ bool HighsMipSolverData::runBenders() {
           {
             double remaining =
                 mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
-            msuboptions.time_limit = std::min(10.0, remaining);
+            msuboptions.time_limit = std::min(subCap, remaining);
           }
           HighsSolution msolution;
           msolution.value_valid = false;
@@ -2007,10 +2039,18 @@ bool HighsMipSolverData::runBenders() {
       } else if (res.status == HighsModelStatus::kInfeasible) {
         allFeasible = false;
         // Farkas ray -> feasibility cut (same row-only dual source).
+        // Time-capped in both modes: an uncapped re-solve could hang the
+        // loop on a degenerate block; timeout falls back to the aux path.
         Highs lpsolver;
         lpsolver.setOptionValue("output_flag", false);
         lpsolver.setOptionValue("presolve", kHighsOffString);
         lpsolver.setOptionValue("solver", kSimplexString);
+        {
+          double rayRemaining =
+              mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
+          lpsolver.setOptionValue("time_limit",
+                                  std::min(10.0, rayRemaining));
+        }
         bool rayUsable = true;
         if (lpsolver.passModel(sublp) != HighsStatus::kOk) rayUsable = false;
         if (rayUsable && lpsolver.run() != HighsStatus::kOk) rayUsable = false;

@@ -1803,7 +1803,7 @@ static double runBendersOnOff(HighsLp lp, bool decomposition_logging = false,
     highs.setOptionValue("output_flag", dev_run);
     highs.setOptionValue("mip_rel_gap", 0);
     highs.setOptionValue("mip_abs_gap", 0);
-    highs.setOptionValue("mip_benders", benders);
+    highs.setOptionValue("mip_benders", benders ? "on" : "off");
     highs.setOptionValue("mip_decomposition_logging", decomposition_logging);
     if (small_blocks) {
       highs.setOptionValue("mip_decomposition_max_comp_cols", 5);
@@ -1950,7 +1950,7 @@ TEST_CASE("MIP-benders-feasaux", "[highs_test_mip_solver]") {
     highs.setOptionValue("output_flag", dev_run);
     highs.setOptionValue("mip_rel_gap", 0);
     highs.setOptionValue("mip_abs_gap", 0);
-    highs.setOptionValue("mip_benders", cfg != 2);
+    highs.setOptionValue("mip_benders", cfg != 2 ? "on" : "off");
     highs.setOptionValue("mip_benders_feas_aux", cfg == 0);
     highs.setOptionValue("mip_decomposition_max_comp_cols", 5);
     highs.setOptionValue("mip_decomposition_max_comp_rows", 5);
@@ -1983,7 +1983,7 @@ TEST_CASE("MIP-benders-integer-subproblems", "[highs_test_mip_solver]") {
     highs.setOptionValue("output_flag", dev_run);
     highs.setOptionValue("mip_rel_gap", 0);
     highs.setOptionValue("mip_abs_gap", 0);
-    highs.setOptionValue("mip_benders", benders);
+    highs.setOptionValue("mip_benders", benders ? "on" : "off");
     highs.setOptionValue("presolve_rule_off", (HighsInt)1048512);
     highs.readModel(filename);
     REQUIRE(highs.run() == HighsStatus::kOk);
@@ -2013,7 +2013,7 @@ TEST_CASE("MIP-benders-lshaped", "[highs_test_mip_solver]") {
     highs.setOptionValue("output_flag", dev_run);
     highs.setOptionValue("mip_rel_gap", 0);
     highs.setOptionValue("mip_abs_gap", 0);
-    highs.setOptionValue("mip_benders", cfg != 2);
+    highs.setOptionValue("mip_benders", cfg != 2 ? "on" : "off");
     highs.setOptionValue("mip_benders_lshaped", cfg == 0);
     highs.setOptionValue("presolve_rule_off", (HighsInt)1048512);
     highs.readModel(filename);
@@ -2042,7 +2042,7 @@ TEST_CASE("MIP-benders-stall", "[highs_test_mip_solver]") {
     highs.setOptionValue("output_flag", dev_run);
     highs.setOptionValue("mip_rel_gap", 0);
     highs.setOptionValue("mip_abs_gap", 0);
-    highs.setOptionValue("mip_benders", cfg == 0);
+    highs.setOptionValue("mip_benders", cfg == 0 ? "on" : "off");
     highs.setOptionValue("mip_benders_stall_limit", 1);
     highs.setOptionValue("presolve_rule_off", (HighsInt)1048512);
     highs.readModel(filename);
@@ -2071,7 +2071,7 @@ TEST_CASE("MIP-benders-rescue", "[highs_test_mip_solver]") {
     highs.setOptionValue("output_flag", dev_run);
     highs.setOptionValue("mip_rel_gap", 0);
     highs.setOptionValue("mip_abs_gap", 0);
-    highs.setOptionValue("mip_benders", cfg != 2);
+    highs.setOptionValue("mip_benders", cfg != 2 ? "on" : "off");
     highs.setOptionValue("mip_benders_incumbent", cfg == 0);
     highs.setOptionValue("mip_benders_max_iterations", 1);
     highs.setOptionValue("presolve_rule_off", (HighsInt)1048512);
@@ -2108,7 +2108,7 @@ TEST_CASE("MIP-benders-dec", "[highs_test_mip_solver]") {
     highs.setOptionValue("output_flag", dev_run);
     highs.setOptionValue("mip_rel_gap", 0);
     highs.setOptionValue("mip_abs_gap", 0);
-    highs.setOptionValue("mip_benders", cfg != 5);
+    highs.setOptionValue("mip_benders", cfg != 5 ? "on" : "off");
     if (cfg < 5) highs.setOptionValue("mip_benders_dec_file", decFiles[cfg]);
     highs.setOptionValue("presolve_rule_off", (HighsInt)1048512);
     highs.readModel(filename);
@@ -2136,7 +2136,7 @@ TEST_CASE("MIP-benders-maxcuts", "[highs_test_mip_solver]") {
     highs.setOptionValue("output_flag", dev_run);
     highs.setOptionValue("mip_rel_gap", 0);
     highs.setOptionValue("mip_abs_gap", 0);
-    highs.setOptionValue("mip_benders", cfg != 2);
+    highs.setOptionValue("mip_benders", cfg != 2 ? "on" : "off");
     highs.setOptionValue("mip_benders_max_cuts", cfg == 0 ? 2 : 1000000);
     highs.setOptionValue("presolve_rule_off", (HighsInt)1048512);
     highs.readModel(filename);
@@ -2164,7 +2164,7 @@ TEST_CASE("MIP-benders-branchpriority", "[highs_test_mip_solver]") {
     highs.setOptionValue("output_flag", dev_run);
     highs.setOptionValue("mip_rel_gap", 0);
     highs.setOptionValue("mip_abs_gap", 0);
-    highs.setOptionValue("mip_benders", cfg != 2);
+    highs.setOptionValue("mip_benders", cfg != 2 ? "on" : "off");
     highs.setOptionValue("mip_benders_max_iterations", 1);
     highs.setOptionValue("mip_benders_branch_priority", cfg == 0 ? 1e6 : 0.0);
     highs.setOptionValue("presolve_rule_off", (HighsInt)1048512);
@@ -2192,7 +2192,7 @@ TEST_CASE("MIP-benders-dualbound", "[highs_test_mip_solver]") {
     highs.setOptionValue("output_flag", dev_run);
     highs.setOptionValue("mip_rel_gap", 0);
     highs.setOptionValue("mip_abs_gap", 0);
-    highs.setOptionValue("mip_benders", cfg != 2);
+    highs.setOptionValue("mip_benders", cfg != 2 ? "on" : "off");
     highs.setOptionValue("mip_benders_dual_bound", cfg == 0);
     highs.setOptionValue("presolve_rule_off", (HighsInt)1048512);
     highs.readModel(filename);
@@ -2322,6 +2322,23 @@ TEST_CASE("MIP-heuristic-proximity", "[highs_test_mip_solver]") {
   }
 }
 
+TEST_CASE("MIP-benders-auto", "[highs_test_mip_solver]") {
+  // Default path (both switches auto): the L-shaped model converges to
+  // the proven optimum with no explicit decomposition options.
+  std::string filename =
+      std::string(HIGHS_DIR) + "/check/instances/benders-lshaped.lp";
+  Highs highs;
+  highs.setOptionValue("output_flag", dev_run);
+  highs.setOptionValue("mip_rel_gap", 0);
+  highs.setOptionValue("mip_abs_gap", 0);
+  highs.setOptionValue("presolve_rule_off", (HighsInt)1048512);
+  highs.readModel(filename);
+  REQUIRE(highs.run() == HighsStatus::kOk);
+  REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
+  REQUIRE(highs.getInfo().objective_function_value == 216.0);
+  highs.resetGlobalScheduler(true);
+}
+
 TEST_CASE("MIP-decomposition-zero-objective", "[highs_test_mip_solver]") {
   // Zero objective: every feasible point is optimal; decomposition must
   // still agree with the fallback path (objective 0).
@@ -2449,7 +2466,7 @@ TEST_CASE("MIP-lagrangian-binding", "[highs_test_mip_solver]") {
     highs.setOptionValue("output_flag", dev_run);
     highs.setOptionValue("mip_rel_gap", 0);
     highs.setOptionValue("mip_abs_gap", 0);
-    highs.setOptionValue("mip_lagrangian", lagrangian);
+    highs.setOptionValue("mip_lagrangian", lagrangian ? "on" : "off");
     highs.passModel(lagrangianTwoBlocks(60.0));
     REQUIRE(highs.run() == HighsStatus::kOk);
     REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
@@ -2472,7 +2489,7 @@ TEST_CASE("MIP-lagrangian-loose", "[highs_test_mip_solver]") {
     highs.setOptionValue("output_flag", dev_run);
     highs.setOptionValue("mip_rel_gap", 0);
     highs.setOptionValue("mip_abs_gap", 0);
-    highs.setOptionValue("mip_lagrangian", lagrangian);
+    highs.setOptionValue("mip_lagrangian", lagrangian ? "on" : "off");
     highs.passModel(lagrangianTwoBlocks(95.0));
     REQUIRE(highs.run() == HighsStatus::kOk);
     REQUIRE(highs.getModelStatus() == HighsModelStatus::kOptimal);
@@ -2533,7 +2550,7 @@ TEST_CASE("MIP-lagrepair-tight-row", "[highs_test_mip_solver]") {
     highs.setOptionValue("output_flag", dev_run);
     highs.setOptionValue("mip_rel_gap", 0);
     highs.setOptionValue("mip_abs_gap", 0);
-    highs.setOptionValue("mip_lagrangian", false);
+    highs.setOptionValue("mip_lagrangian", "off");
     highs.setOptionValue("mip_lagrangian_repair", repair);
     highs.setOptionValue("mip_lagrangian_repair_max_cols", 60);
     highs.setOptionValue("mip_decomposition_max_comp_cols", 1);

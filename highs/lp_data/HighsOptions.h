@@ -530,10 +530,15 @@ struct HighsOptionsStruct {
   HighsInt mip_decomposition_max_comp_cols;
   HighsInt mip_decomposition_max_comp_rows;
   bool mip_decomposition_logging;
-  bool mip_benders;
+  // Decomposition master switches are tri-state ("on"/"off"/"auto",
+  // default "auto"): off skips, on forces full budgets (historical
+  // behavior), auto probes the first iteration cheaply and aborts
+  // early when subproblems stall (see *_probe_time).
+  std::string mip_benders;
   bool mip_benders_integer_subproblems;
-  bool mip_lagrangian;
+  std::string mip_lagrangian;
   HighsInt mip_lagrangian_max_iterations;
+  double mip_lagrangian_probe_time;
   HighsInt mip_lagrangian_max_coupling_rows;
   double mip_lagrangian_max_time;
   HighsInt mip_lagrangian_scan_cap;
@@ -548,6 +553,7 @@ struct HighsOptionsStruct {
   double mip_lagrangian_repair_stall_seconds;
   double mip_decomposition_submip_time_limit;
   HighsInt mip_benders_max_iterations;
+  double mip_benders_probe_time;
   HighsInt mip_benders_max_coupling_cols;
   HighsInt mip_benders_min_block_cols;
   bool mip_benders_feas_aux;
@@ -746,9 +752,11 @@ struct HighsOptionsStruct {
         mip_decomposition_max_comp_cols(64),
         mip_decomposition_max_comp_rows(64),
         mip_decomposition_logging(false),
-        mip_benders(true),
+        mip_benders("auto"),
         mip_benders_integer_subproblems(true),
-        mip_lagrangian(true),
+        mip_benders_probe_time(2.0),
+        mip_lagrangian("auto"),
+        mip_lagrangian_probe_time(2.0),
         mip_lagrangian_max_iterations(30),
         mip_lagrangian_max_coupling_rows(16),
         mip_lagrangian_max_time(5.0),
@@ -1427,13 +1435,15 @@ class HighsOptions : public HighsOptionsStruct {
         advanced, &mip_decomposition_logging, false);
     records.push_back(record_bool);
 
-    record_bool = new OptionRecordBool(
+    record_string = new OptionRecordString(
         "mip_benders",
         "Whether classical Benders decomposition is attempted on "
-        "suitable weakly-coupled models (small coupling set, LP blocks); "
+        "suitable weakly-coupled models: off skips, on forces full "
+        "budgets (historical behavior), auto (default) probes the first "
+        "iteration cheaply and aborts early when subproblems stall; "
         "falls back to normal MIP on any doubt",
-        advanced, &mip_benders, true);
-    records.push_back(record_bool);
+        advanced, &mip_benders, "auto");
+    records.push_back(record_string);
 
     record_bool = new OptionRecordBool(
         "mip_benders_integer_subproblems",
@@ -1448,6 +1458,14 @@ class HighsOptions : public HighsOptionsStruct {
         "Max master/subproblem iterations of Benders decomposition",
         advanced, &mip_benders_max_iterations, 1, 100, kHighsIInf);
     records.push_back(record_int);
+
+    record_double = new OptionRecordDouble(
+        "mip_benders_probe_time",
+        "Per-subproblem time cap for the first Benders iteration in "
+        "auto mode (later iterations use full budgets; abort on stall; "
+        "0 disables probing)",
+        advanced, &mip_benders_probe_time, 0.0, 2.0, kHighsInf);
+    records.push_back(record_double);
 
     record_int = new OptionRecordInt(
         "mip_benders_max_coupling_cols",
@@ -1606,19 +1624,29 @@ class HighsOptions : public HighsOptionsStruct {
         advanced, &mip_heuristic_run_lagrepair, false);
     records.push_back(record_bool);
 
-    record_bool = new OptionRecordBool(
+    record_string = new OptionRecordString(
         "mip_lagrangian",
         "Whether Lagrangian decomposition is attempted on models with a "
-        "small coupling-row separator (dual bounds plus verified MIP-start "
-        "incumbents; never fixes variables; falls back on any doubt)",
-        advanced, &mip_lagrangian, true);
-    records.push_back(record_bool);
+        "small coupling-row separator: off skips, on forces full budgets "
+        "(historical behavior), auto (default) probes the first iteration "
+        "cheaply and aborts early when subproblems stall "
+        "(dual bounds plus verified MIP-start incumbents; never fixes "
+        "variables; falls back on any doubt)",
+        advanced, &mip_lagrangian, "auto");
+    records.push_back(record_string);
 
     record_int = new OptionRecordInt(
         "mip_lagrangian_max_iterations",
         "Max subgradient iterations of Lagrangian decomposition",
         advanced, &mip_lagrangian_max_iterations, 1, 30, kHighsIInf);
     records.push_back(record_int);
+
+    record_double = new OptionRecordDouble(
+        "mip_lagrangian_probe_time",
+        "Per-subproblem time cap for the first Lagrangian iteration in "
+        "auto mode (later iterations use full budgets; abort on stall)",
+        advanced, &mip_lagrangian_probe_time, 0.0, 2.0, kHighsInf);
+    records.push_back(record_double);
 
     record_int = new OptionRecordInt(
         "mip_lagrangian_max_coupling_rows",
