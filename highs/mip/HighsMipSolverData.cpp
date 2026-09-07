@@ -1427,7 +1427,8 @@ bool HighsMipSolverData::solveComponentPass(const HighsInt pass,
     suboptions.mip_feasibility_tolerance = 1e-9;
     double remaining =
         mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
-    suboptions.time_limit = std::min(10.0, remaining);
+    double submipLimit = mipsolver.options_mip_->mip_decomposition_submip_time_limit;
+    suboptions.time_limit = std::min(submipLimit, remaining);
 
     HighsSolution solution;
     solution.value_valid = false;

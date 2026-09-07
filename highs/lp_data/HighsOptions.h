@@ -536,6 +536,10 @@ struct HighsOptionsStruct {
   HighsInt mip_lagrangian_max_iterations;
   HighsInt mip_lagrangian_max_coupling_rows;
   double mip_lagrangian_max_time;
+  HighsInt mip_lagrangian_scan_cap;
+  HighsInt mip_lagrangian_max_row_degree;
+  bool mip_lagrangian_subproblem_mip;
+  double mip_decomposition_submip_time_limit;
   HighsInt mip_benders_max_iterations;
   HighsInt mip_benders_max_coupling_cols;
   HighsInt mip_benders_min_block_cols;
@@ -740,6 +744,10 @@ struct HighsOptionsStruct {
         mip_lagrangian_max_iterations(30),
         mip_lagrangian_max_coupling_rows(16),
         mip_lagrangian_max_time(5.0),
+        mip_lagrangian_scan_cap(0),
+        mip_lagrangian_max_row_degree(2000),
+        mip_lagrangian_subproblem_mip(true),
+        mip_decomposition_submip_time_limit(10.0),
         mip_benders_max_iterations(100),
         mip_benders_max_coupling_cols(16),
         mip_benders_min_block_cols(10),
@@ -1594,6 +1602,30 @@ class HighsOptions : public HighsOptionsStruct {
         "mip_lagrangian_max_time",
         "Max seconds spent in the Lagrangian subgradient loop",
         advanced, &mip_lagrangian_max_time, 0.0, 5.0, kHighsInf);
+    records.push_back(record_double);
+
+    record_int = new OptionRecordInt(
+        "mip_lagrangian_scan_cap",
+        "Max candidate rows scanned during Lagrangian separator search (0 = all rows)",
+        advanced, &mip_lagrangian_scan_cap, 0, 0, kHighsIInf);
+    records.push_back(record_int);
+
+    record_int = new OptionRecordInt(
+        "mip_lagrangian_max_row_degree",
+        "Max nonzeros in a candidate coupling row for Lagrangian decomposition",
+        advanced, &mip_lagrangian_max_row_degree, 2, 2000, kHighsIInf);
+    records.push_back(record_int);
+
+    record_bool = new OptionRecordBool(
+        "mip_lagrangian_subproblem_mip",
+        "Solve discrete Lagrangian subproblems as MIPs to generate integer compositions",
+        advanced, &mip_lagrangian_subproblem_mip, true);
+    records.push_back(record_bool);
+
+    record_double = new OptionRecordDouble(
+        "mip_decomposition_submip_time_limit",
+        "Max time in seconds per decomposition sub-MIP solve in presolve",
+        advanced, &mip_decomposition_submip_time_limit, 0.1, 10.0, kHighsInf);
     records.push_back(record_double);
 
     record_double = new OptionRecordDouble(

@@ -35,10 +35,10 @@
 namespace {
 
 // Union-find with path halving (local helper, deterministic).
-struct DsU {
+struct LagDsU {
   std::vector<HighsInt> p;
-  DsU() {}
-  explicit DsU(HighsInt n) : p(n) {
+  LagDsU() {}
+  explicit LagDsU(HighsInt n) : p(n) {
     for (HighsInt i = 0; i != n; ++i) p[i] = i;
   }
   HighsInt find(HighsInt a) {
@@ -116,17 +116,17 @@ bool HighsMipSolverData::findLagSeparator(
   for (HighsInt r = 0; r != numRow; ++r)
     rowDeg[r] = rowStart[r + 1] - rowStart[r];
   HighsInt totalNnz = rowStart[numRow];
-  // Candidate cap scales with model size (heuristic): the scan is
-  // O(cap * nnz) per round.
-  const HighsInt scanCap = std::max<HighsInt>(
-      25, std::min<HighsInt>(500, 2000000 / std::max<HighsInt>(1, totalNnz)));
+  HighsInt scanCap = mipsolver.options_mip_->mip_lagrangian_scan_cap;
+  if (scanCap <= 0) {
+    scanCap = numRow;
+  }
 
   std::vector<char> inR(numRow, 0);
   HighsInt numR = 0;
   // Pieces of the graph without R (DSU over columns linked by non-R
   // rows).
   auto computePieces = [&](std::vector<std::vector<HighsInt>>& pieces) {
-    DsU dsu(numCol);
+    LagDsU dsu(numCol);
     for (HighsInt r = 0; r != numRow; ++r) {
       if (inR[r]) continue;
       HighsInt first = -1;
@@ -152,7 +152,7 @@ bool HighsMipSolverData::findLagSeparator(
   };
   // Nontrivial-piece count after additionally removing candidate row.
   auto splitCount = [&](HighsInt excl) -> HighsInt {
-    DsU dsu(numCol);
+    LagDsU dsu(numCol);
     for (HighsInt r = 0; r != numRow; ++r) {
       if (r == excl || inR[r]) continue;
       HighsInt first = -1;
@@ -202,9 +202,10 @@ bool HighsMipSolverData::findLagSeparator(
     HighsInt scanned = 0;
     HighsInt topR[3] = {-1, -1, -1};
     HighsInt topN[3] = {-1, -1, -1};
+    const HighsInt maxRowDeg = mipsolver.options_mip_->mip_lagrangian_max_row_degree;
     for (HighsInt r = 0; r != numRow && scanned < scanCap; ++r) {
       if (inR[r]) continue;
-      if (rowDeg[r] < 2 || rowDeg[r] > 64) continue;
+      if (rowDeg[r] < 2 || rowDeg[r] > maxRowDeg) continue;
       bool touches = false;
       for (HighsInt e = rowStart[r]; e != rowStart[r + 1]; ++e) {
         if (inLargest[rowCols[e]]) {
@@ -249,7 +250,7 @@ bool HighsMipSolverData::findLagSeparator(
   // subproblems are cheap at any size). Rowless columns merge into one
   // trivial analytic block.
   {
-    DsU dsu(numCol);
+    LagDsU dsu(numCol);
     for (HighsInt r = 0; r != numRow; ++r) {
       if (inR[r]) continue;
       HighsInt first = -1;
@@ -559,10 +560,17 @@ bool HighsMipSolverData::runLagrangian() {
       sublp.col_cost_.resize(nbC);
       sublp.col_lower_ = blk.lb;
       sublp.col_upper_ = blk.ub;
-      // MIP blocks solve their LP relaxation here: valid (weaker) dual
-      // bounds at simplex cost. Integrality only matters for primal
-      // compositions, which are verified independently.
-      sublp.integrality_.assign(nbC, HighsVarType::kContinuous);
+      sublp.integrality_.resize(nbC);
+      bool hasDiscrete = false;
+      for (HighsInt j = 0; j != nbC; ++j) {
+        sublp.integrality_[j] = model.integrality_[blk.cols[j]];
+        if (sublp.integrality_[j] != HighsVarType::kContinuous)
+          hasDiscrete = true;
+      }
+      if (!mipsolver.options_mip_->mip_lagrangian_subproblem_mip) {
+        sublp.integrality_.assign(nbC, HighsVarType::kContinuous);
+        hasDiscrete = false;
+      }
       for (HighsInt j = 0; j != nbC; ++j) {
         double cj = blk.cost[j];
         for (const auto& e : blk.colArcs[j])
@@ -620,8 +628,12 @@ bool HighsMipSolverData::runLagrangian() {
       }
       double remaining =
           mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
-      HighsSubLpResult res =
-          solveSubLp(sublp, std::min(10.0, remaining));
+      HighsSubLpResult res;
+      if (hasDiscrete) {
+        res = solveSubMip(sublp, std::min(2.0, remaining));
+      } else {
+        res = solveSubLp(sublp, std::min(10.0, remaining));
+      }
       if (logLag) {
         // Independent box-minimum check (theorem litmus): no row set can
         // push a minimum below the bound-only minimum.
@@ -774,6 +786,9 @@ bool HighsMipSolverData::runLagrangian() {
   }
 
   const double parentLB = sign * bestLB + model.offset_;
+  if (std::isfinite(parentLB)) {
+    updateLowerBound(parentLB);
+  }
   if (!hasUB) {
     if (logLag)
       highsLogUser(logOptions, HighsLogType::kInfo,

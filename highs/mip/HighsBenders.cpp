@@ -135,6 +135,26 @@ HighsMipSolverData::HighsSubLpResult HighsMipSolverData::solveSubLp(
   return res;
 }
 
+HighsMipSolverData::HighsSubLpResult HighsMipSolverData::solveSubMip(
+    const HighsLp& submip, double timeLimit) {
+  HighsSubLpResult res;
+  Highs mipsolver;
+  mipsolver.setOptionValue("output_flag", false);
+  mipsolver.setOptionValue("threads", 1);
+  mipsolver.setOptionValue("time_limit", timeLimit);
+  if (mipsolver.passModel(submip) != HighsStatus::kOk) return res;
+  if (mipsolver.run() != HighsStatus::kOk) return res;
+  res.status = mipsolver.getModelStatus();
+  if (res.status == HighsModelStatus::kOptimal ||
+      res.status == HighsModelStatus::kObjectiveTarget ||
+      mipsolver.getInfo().primal_solution_status == 2) {
+    const HighsSolution& sol = mipsolver.getSolution();
+    res.colSol = sol.col_value;
+    res.obj = mipsolver.getInfo().objective_function_value;
+  }
+  return res;
+}
+
 // Annotation file format (mip_benders_dec_file), SCIP-.dec-inspired but
 // HiGHS-local (clean-room): '#' comments, case-insensitive keywords,
 //   COUPLING: <tokens...>

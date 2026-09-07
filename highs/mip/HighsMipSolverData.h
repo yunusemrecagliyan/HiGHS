@@ -326,6 +326,7 @@ struct HighsMipSolverData {
     bool dualValid = false;
   };
   static HighsSubLpResult solveSubLp(const HighsLp& sublp, double timeLimit);
+  static HighsSubLpResult solveSubMip(const HighsLp& submip, double timeLimit);
   // Lagrangian decomposition (HighsLagrangian.cpp): row separator whose
   // removal splits the model; coupling rows are dualized (priced) while
   // blocks solve independently. Produces dual bounds (logged) and, when
