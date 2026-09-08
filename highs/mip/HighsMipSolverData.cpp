@@ -1476,13 +1476,27 @@ bool HighsMipSolverData::solveComponentPass(const HighsInt pass,
                      1, mipsolver.options_mip_->threads));
     auto solveOne = [&](size_t bi) {
       DecompBlockResult& res = blockRes[bi];
+      // Search reserve: with less than 2s of parent budget left, leave
+      // the component unfixed (normal MIP continues) instead of burning
+      // the search tail; non-optimal outcomes already leave it unfixed.
+      if (mipsolver.options_mip_->time_limit < kHighsInf &&
+          mipsolver.options_mip_->time_limit - mipsolver.timer_.read() <
+              2.0) {
+        res.status = HighsModelStatus::kNotset;
+        return;
+      }
       try {
         HighsSolution solution;
         solution.value_valid = false;
         solution.dual_valid = false;
         HighsLp joint = std::move(storedBlocks[bi].first);
         HighsOptions myOptions = suboptions;
-        myOptions.time_limit = storedBlocks[bi].second;
+        // Live budget (not the build-time snapshot): sibling solves may
+        // have consumed it; non-positive means instant fallback below,
+        // leaving the component unfixed for normal MIP.
+        myOptions.time_limit =
+            std::min(storedBlocks[bi].second,
+                     mipsolver.options_mip_->time_limit - mipsolver.timer_.read());
         HighsCallback workerCallback(nullptr);
         HighsMipSolver subsolver(workerCallback, myOptions, joint, solution,
                                  true, mipsolver.submip_level + 1);

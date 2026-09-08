@@ -198,6 +198,13 @@ bool HighsMipSolverData::findLagSeparator(
   // defensively.)
   // (verifiedSplit merged into splitCount; acceptance uses splitCount.)
   std::vector<std::vector<HighsInt>> pieces;
+  // Wall-clock box on the scan: each candidate costs a full DSU recount,
+  // so huge models (100k+ rows) would grind for minutes finding nothing.
+  // Production shapes complete in milliseconds; only hopeless scans hit
+  // this (measured: bab2-class ~160s without it). Abort means no
+  // candidate (normal MIP continues), never a wrong one.
+  const double sepStart = mipsolver.timer_.read();
+  const double sepBudget = 2.0;
   for (;;) {
     computePieces(pieces);
     HighsInt curCount = 0;
@@ -223,6 +230,11 @@ bool HighsMipSolverData::findLagSeparator(
     for (HighsInt r = 0; r != numRow && scanned < scanCap; ++r) {
       if (inR[r]) continue;
       if (rowDeg[r] < 2 || rowDeg[r] > maxRowDeg) continue;
+      if ((scanned & 15) == 0 &&
+          mipsolver.timer_.read() - sepStart > sepBudget) {
+        cand.reason = "scan time budget";
+        return false;
+      }
       bool touches = false;
       for (HighsInt e = rowStart[r]; e != rowStart[r + 1]; ++e) {
         if (inLargest[rowCols[e]]) {
@@ -627,6 +639,13 @@ bool HighsMipSolverData::runLagrangian() {
     if (mipsolver.options_mip_->time_limit < kHighsInf &&
         mipsolver.timer_.read() >= mipsolver.options_mip_->time_limit)
       break;
+    // Search reserve: do not start an iteration with less than 2s left;
+    // the root/search needs the tail, and a starved iteration only
+    // produces capped scraps (measured: hopeless grinds on hard models
+    // burn the parent limit here). Accumulated bounds still inject below.
+    if (mipsolver.options_mip_->time_limit < kHighsInf &&
+        mipsolver.options_mip_->time_limit - mipsolver.timer_.read() < 2.0)
+      break;
     // Auto mode probes the first iteration cheaply (later iterations
     // and "on" mode use full budgets; a zero probe disables probing).
     // Sub-MIP blocks keep their tight historical 2s cap regardless:
@@ -777,6 +796,15 @@ bool HighsMipSolverData::runLagrangian() {
     auto solveLagJob = [&](HighsInt k) {
       LagBlockJob& job = lagJobs[k];
       HighsSubLpResult res;
+      // Live maxTime enforcement: caps are snapshotted at build, but an
+      // 85-block iteration overruns them for minutes (measured: 14.6s on
+      // a 5s loop budget). Skip remaining solves past the budget; the
+      // harvest below treats missing results as uncapped (step-only).
+      if (maxTime < kHighsInf &&
+          mipsolver.timer_.getWallTime() - lagStart >= maxTime) {
+        blkRes[k] = std::move(res);
+        return;
+      }
       if (job.hasDiscrete) {
         res = solveSubMip(job.sublp, std::min(job.cap, job.rem),
                           mipsolver.options_mip_->mip_rel_gap,
@@ -1471,7 +1499,19 @@ bool HighsMipSolverData::runLagRepair() {
   const double repBlockT0 = mipsolver.timer_.read();
   auto solveRepJob = [&](HighsInt k) {
     RepBlockJob& job = repJobs[k];
-    const double tl = job.tl;
+    // Live budget (same rationale as the loop): the snapshot below may
+    // be stale after dozens of sibling solves; an over-budget block is
+    // left unfixed for the union instead of burning the search tail.
+    const double tl = std::min(job.tl, timeLeft());
+    // Search reserve (same rule as the loop): with less than 2s left,
+    // leave the solve unfixed for the union rather than burning the
+    // search tail; the joint budget below is timeLeft-aware anyway.
+    if (mipsolver.options_mip_->time_limit < kHighsInf &&
+        mipsolver.options_mip_->time_limit - mipsolver.timer_.read() < 2.0) {
+      HighsSubLpResult empty;
+      repRes[k] = std::move(empty);
+      return;
+    }
     HighsSubLpResult res =
         (job.hasDiscrete &&
          mipsolver.options_mip_->mip_lagrangian_subproblem_mip)
@@ -1789,6 +1829,16 @@ bool HighsMipSolverData::runLagRepair() {
         0, mipsolver.options_mip_->mip_lagrangian_repair_stall_nodes);
     progress.stallSeconds =
         mipsolver.options_mip_->mip_lagrangian_repair_stall_seconds;
+    // Search reserve: a joint started with less than 2s left cannot
+    // finish anything useful; fall back to normal MIP immediately.
+    if (mipsolver.options_mip_->time_limit < kHighsInf &&
+        timeLeft() < 2.0) {
+      if (logRep)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[LagRepair] joint skipped (search reserve) -> normal "
+                     "MIP\n");
+      return true;
+    }
     HighsSubLpResult res =
         solveSubMip(joint, timeLeft(), mipsolver.options_mip_->mip_rel_gap,
                     mipsolver.options_mip_->mip_abs_gap, &progress);

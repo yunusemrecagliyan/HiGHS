@@ -624,6 +624,10 @@ bool HighsMipSolverData::findBendersSeparator(
     return nontrivial;
   };
   std::vector<std::vector<HighsInt>> searchPieces;
+  // Wall-clock box on the scan (same rationale as the Lagrangian row
+  // separator: full DSU recounts per candidate grind on huge models).
+  const double sepStart = mipsolver.timer_.read();
+  const double sepBudget = 2.0;
   for (;;) {
     computePieces(searchPieces);
     HighsInt curCount = 0;
@@ -647,6 +651,11 @@ bool HighsMipSolverData::findBendersSeparator(
     for (HighsInt c : searchPieces[largestIdx]) {
       if (degree[c] < 2 || degree[c] > 32) continue;
       if (scanned >= scanCap) break;
+      if ((scanned & 7) == 0 &&
+          mipsolver.timer_.read() - sepStart > sepBudget) {
+        cand.reason = "scan time budget";
+        return false;
+      }
       ++scanned;
       const HighsInt q = splitCount(c);
       for (HighsInt t = 0; t != 3; ++t) {
@@ -1340,6 +1349,11 @@ bool HighsMipSolverData::runBenders() {
     }
     if (mipsolver.options_mip_->time_limit < kHighsInf &&
         mipsolver.timer_.read() >= mipsolver.options_mip_->time_limit)
+      break;
+    // Search reserve: do not start an iteration with less than 2s left
+    // (master + sub-solves would only burn the search tail).
+    if (mipsolver.options_mip_->time_limit < kHighsInf &&
+        mipsolver.options_mip_->time_limit - mipsolver.timer_.read() < 2.0)
       break;
     // Auto mode probes the first iteration cheaply: sub-solves that
     // stall past the probe abort the loop fast instead of burning full
