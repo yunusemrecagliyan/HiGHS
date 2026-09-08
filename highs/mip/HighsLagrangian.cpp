@@ -1357,16 +1357,16 @@ bool HighsMipSolverData::runLagRepair() {
       sublp.a_matrix_.start_[j + 1] = (HighsInt)sublp.a_matrix_.index_.size();
     }
     const double tl = timeLeft();
-    // Parent gap tolerances: block solutions serve primal purposes only
-    // (verified before any use), so incumbents good enough for the
-    // parent stop the subsolver early instead of burning the budget.
-    const double parentRelGap = mipsolver.options_mip_->mip_rel_gap;
-    const double parentAbsGap = mipsolver.options_mip_->mip_abs_gap;
+    // Tight defaults (no parent gaps): block solutions double as fixing
+    // values and union scores downstream, so even small suboptimality
+    // slop measurably degrades the joint (measured: 1%-gap blocks
+    // composed into a 2672-class joint vs 2488-optimal from proven
+    // blocks on the identical union). Blocks are small; proven
+    // optimality here is cheap.
     HighsSubLpResult res =
         (hasDiscrete &&
          mipsolver.options_mip_->mip_lagrangian_subproblem_mip)
-            ? solveSubMip(sublp, std::min(1.0, tl), parentRelGap,
-                          parentAbsGap)
+            ? solveSubMip(sublp, std::min(2.0, tl))
             : solveSubLp(sublp, std::min(10.0, tl));
     if (res.status == HighsModelStatus::kInfeasible) {
       // Block rows alone infeasible: the relaxation is infeasible, so the
@@ -1601,16 +1601,25 @@ bool HighsMipSolverData::runLagRepair() {
       return true;
     }
     HighsInt numUBlocks = 0;
-    for (HighsInt k = 0; k != nB; ++k)
-      if (blockInU[k]) ++numUBlocks;
+    std::string ubdbg;
+    for (HighsInt k = 0; k != nB; ++k) {
+      if (!blockInU[k]) continue;
+      ++numUBlocks;
+      if (ubdbg.size() < 200) {
+        char bbuf[32];
+        snprintf(bbuf, sizeof(bbuf), "%d,", (int)k);
+        ubdbg += bbuf;
+      }
+    }
     const double jointBudget = timeLeft();
     const double jointBudgetStart = mipsolver.timer_.read();
     if (jointBudget <= 0) return true;
     if (logRep)
       highsLogUser(logOptions, HighsLogType::kInfo,
-                   "[LagRepair] recreate union: %d cols from %d blocks, joint "
-                   "budget %.1fs (attempt %d)\n",
-                   (int)numU, (int)numUBlocks, jointBudget, attempt + 1);
+                   "[LagRepair] recreate union: %d cols from %d blocks [%s], "
+                   "joint budget %.1fs (attempt %d)\n",
+                   (int)numU, (int)numUBlocks, ubdbg.c_str(), jointBudget,
+                   attempt + 1);
     // Joint sub-MIP: the full presolved model with every column outside
     // the union fixed to the composition. A joint infeasibility proves
     // nothing globally (the fixing was our heuristic choice), so only a
