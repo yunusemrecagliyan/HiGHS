@@ -37,12 +37,15 @@ namespace {
 
 // Decomposition master-switch mode ("on"/"off"/"auto"): off skips, on
 // forces full budgets (historical behavior), auto probes the first
-// iteration cheaply and aborts early on stall. Unknown values fail
+// iteration cheaply and aborts early on stall. Legacy booleans ("true"
+// behaves as on, "false" as off) keep working; anything else fails
 // closed to off (caller logs once).
 enum class LagDecompMode { Off, On, Auto };
 static LagDecompMode parseLagDecompMode(const std::string& value) {
-  if (value == "on") return LagDecompMode::On;
-  if (value == "off") return LagDecompMode::Off;
+  if (value == "on" || value == "true" || value == "1")
+    return LagDecompMode::On;
+  if (value == "off" || value == "false" || value == "0")
+    return LagDecompMode::Off;
   if (value == "auto") return LagDecompMode::Auto;
   return LagDecompMode::Off;
 }

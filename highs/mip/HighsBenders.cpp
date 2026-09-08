@@ -56,12 +56,14 @@ namespace {
 
 // Decomposition master-switch mode ("on"/"off"/"auto"): off skips, on
 // forces full budgets (historical behavior), auto probes the first
-// iteration cheaply and aborts early on stall. Unknown values fail
+// iteration cheaply and aborts early on stall. Legacy booleans ("true"
+// behaves as on, "false" as off) keep working; anything else fails
 // closed to off (caller logs once).
 enum class DecompMode { Off, On, Auto };
 static DecompMode parseDecompMode(const std::string& value) {
-  if (value == "on") return DecompMode::On;
-  if (value == "off") return DecompMode::Off;
+  if (value == "on" || value == "true" || value == "1") return DecompMode::On;
+  if (value == "off" || value == "false" || value == "0")
+    return DecompMode::Off;
   if (value == "auto") return DecompMode::Auto;
   return DecompMode::Off;
 }
