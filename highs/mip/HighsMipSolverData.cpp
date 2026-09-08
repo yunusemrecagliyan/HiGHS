@@ -11,6 +11,7 @@
 #include <functional>
 #include <random>
 #include <sstream>
+#include <utility>
 #include <unordered_map>
 
 #include "../extern/pdqsort/pdqsort.h"
@@ -1321,6 +1322,11 @@ bool HighsMipSolverData::solveComponentPass(const HighsInt pass,
       mipsolver.options_mip_->mip_decomposition_max_comp_rows;
 
   const double tSolve0 = mipsolver.timer_.getWallTime();
+  // Phase A (sequential, cheap): isolated-cost fixing, caps filter and
+  // time check stay exactly as before. Only sub-MIP-eligible components
+  // are collected for the parallel phase below.
+  std::vector<std::pair<HighsLp, double>> storedBlocks;
+  std::vector<size_t> storedOi;
   for (size_t oi = 0; oi != components.size(); ++oi) {
     const HighsDecompComponent& comp = components[oi];
     if (comp.rows.empty()) {
@@ -1420,6 +1426,23 @@ bool HighsMipSolverData::solveComponentPass(const HighsInt pass,
       sublp.a_matrix_.start_[k + 1] = (HighsInt)sublp.a_matrix_.index_.size();
     }
 
+    double remaining =
+        mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
+    double submipLimit = mipsolver.options_mip_->mip_decomposition_submip_time_limit;
+    storedBlocks.push_back({std::move(sublp), std::min(submipLimit, remaining)});
+    storedOi.push_back(oi);
+  }
+
+  struct DecompBlockResult {
+    HighsModelStatus status = HighsModelStatus::kNotset;
+    std::vector<double> colSol;
+    bool verified = false;
+  };
+  std::vector<DecompBlockResult> blockRes(storedBlocks.size());
+
+  if (!storedBlocks.empty()) {
+    // Shared sub-solver options, built once (per-block time caps were
+    // snapshotted above, exactly as the sequential loop computed them).
     HighsOptions suboptions = *mipsolver.options_mip_;
     suboptions.output_flag = false;
     suboptions.threads = 1;
@@ -1435,73 +1458,117 @@ bool HighsMipSolverData::solveComponentPass(const HighsInt pass,
     // bounds, so subsolver tolerance leaks directly into the reported
     // objective.
     suboptions.mip_feasibility_tolerance = 1e-9;
-    double remaining =
-        mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
-    double submipLimit = mipsolver.options_mip_->mip_decomposition_submip_time_limit;
-    suboptions.time_limit = std::min(submipLimit, remaining);
 
-    HighsSolution solution;
-    solution.value_valid = false;
-    solution.dual_valid = false;
-    HighsMipSolver subsolver(*mipsolver.callback_, suboptions, sublp,
-                             solution, true, mipsolver.submip_level + 1);
-    subsolver.setProfiling(mipsolver.profiling_);
-    subsolver.initialiseTerminator(mipsolver);
-    subsolver.run();
-    if (subsolver.modelstatus_ == HighsModelStatus::kInfeasible) {
-      // The block shares no constraint with the rest of the model, so a
-      // proven-infeasible block proves the whole model infeasible.
-      mipsolver.modelstatus_ = HighsModelStatus::kInfeasible;
-      stats.solveTime += mipsolver.timer_.getWallTime() - tSolve0;
-      return false;
+    // Parallel exact sub-MIPs on the parent scheduler when available.
+    // Components touch disjoint column sets and read a frozen parent
+    // model, so workers share nothing mutable: each owns its callback
+    // shell (the parent callback must never be touched concurrently).
+    // Single-threaded exact solves are deterministic regardless of
+    // worker timing; only a binding wall-clock cap could flip
+    // optimal-vs-left, same exposure as the sequential loop under load.
+    // Without a scheduler (or threads==1) this runs sequentially
+    // inline: identical decisions and log lines.
+    const bool haveScheduler =
+        HighsTaskExecutor::getThisWorkerDeque() != nullptr;
+    const size_t nPar =
+        std::min(storedBlocks.size(),
+                 (size_t)std::max<HighsInt>(
+                     1, mipsolver.options_mip_->threads));
+    auto solveOne = [&](size_t bi) {
+      DecompBlockResult& res = blockRes[bi];
+      try {
+        HighsSolution solution;
+        solution.value_valid = false;
+        solution.dual_valid = false;
+        HighsLp joint = std::move(storedBlocks[bi].first);
+        HighsOptions myOptions = suboptions;
+        myOptions.time_limit = storedBlocks[bi].second;
+        HighsCallback workerCallback(nullptr);
+        HighsMipSolver subsolver(workerCallback, myOptions, joint, solution,
+                                 true, mipsolver.submip_level + 1);
+        subsolver.setProfiling(mipsolver.profiling_);
+        subsolver.initialiseTerminator(mipsolver);
+        subsolver.run();
+        res.status = subsolver.modelstatus_;
+        if (res.status != HighsModelStatus::kOptimal) return;
+        res.colSol = subsolver.solution_;
+        res.verified = verifyComponentSolution(joint, res.colSol);
+      } catch (...) {
+        res.status = HighsModelStatus::kNotset;
+      }
+    };
+    auto solveRange = [&](size_t begin, size_t end) {
+      for (size_t bi = begin; bi != end; ++bi) solveOne(bi);
+    };
+    if (!haveScheduler || nPar <= 1 || storedBlocks.size() <= 1) {
+      solveRange(0, blockRes.size());
+    } else {
+      highs::parallel::for_each(
+          (HighsInt)0, (HighsInt)blockRes.size(),
+          [&](HighsInt begin, HighsInt end) {
+            solveRange((size_t)begin, (size_t)end);
+          },
+          /*grainSize=*/1);
     }
-    if (subsolver.modelstatus_ != HighsModelStatus::kOptimal) {
+
+    // Apply in original order: identical decisions and log lines.
+    for (size_t bi = 0; bi != blockRes.size(); ++bi) {
+      const size_t oi = storedOi[bi];
+      const HighsDecompComponent& comp = components[oi];
+      const DecompBlockResult& res = blockRes[bi];
+      if (res.status == HighsModelStatus::kInfeasible) {
+        // The block shares no constraint with the rest of the model, so a
+        // proven-infeasible block proves the whole model infeasible.
+        mipsolver.modelstatus_ = HighsModelStatus::kInfeasible;
+        stats.solveTime += mipsolver.timer_.getWallTime() - tSolve0;
+        return false;
+      }
+      if (res.status != HighsModelStatus::kOptimal) {
+        if (logDecomp)
+          highsLogUser(mipsolver.options_mip_->log_options,
+                       HighsLogType::kInfo,
+                       "[Decomp] pass %d block %d: rows=%d cols=%d int=%d "
+                       "nnz=%d: subsolver status %d, left to parent\n",
+                       (int)pass, (int)oi, (int)comp.rows.size(),
+                       (int)comp.cols.size(), (int)comp.numInt, (int)comp.numNz,
+                       (int)res.status);
+        continue;
+      }
+      if (!res.verified) {
+        if (logDecomp)
+          highsLogUser(mipsolver.options_mip_->log_options,
+                       HighsLogType::kInfo,
+                       "[Decomp] pass %d block %d: subsolver optimal but "
+                       "verification failed, left to parent\n",
+                       (int)pass, (int)oi);
+        continue;
+      }
+      const std::vector<double>& subcol = res.colSol;
+      bool allFixed = true;
+      for (size_t k = 0; k != comp.cols.size(); ++k) {
+        HighsInt c = comp.cols[k];
+        double fixval = subcol[k];
+        if (!std::isfinite(fixval)) {
+          allFixed = false;
+          break;
+        }
+        if (model.integrality_[c] == HighsVarType::kInteger)
+          fixval = std::round(fixval);
+        fixval = std::min(std::max(fixval, model.col_lower_[c]),
+                          model.col_upper_[c]);
+        model.col_lower_[c] = model.col_upper_[c] = fixval;
+        ++stats.numFixed;
+      }
+      if (!allFixed) continue;
+      ++stats.numSolved;
       if (logDecomp)
-        highsLogUser(mipsolver.options_mip_->log_options,
-                     HighsLogType::kInfo,
+        highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
                      "[Decomp] pass %d block %d: rows=%d cols=%d int=%d "
-                     "nnz=%d: subsolver status %d, left to parent\n",
+                     "nnz=%d solved optimal, fixed %d columns\n",
                      (int)pass, (int)oi, (int)comp.rows.size(),
                      (int)comp.cols.size(), (int)comp.numInt, (int)comp.numNz,
-                     (int)subsolver.modelstatus_);
-      continue;
+                     (int)comp.cols.size());
     }
-    const std::vector<double>& subcol = subsolver.solution_;
-    // Independently re-verify before baking values into parent bounds;
-    // an unverified fixing is silently dropped (safe fallback).
-    if (!verifyComponentSolution(sublp, subcol)) {
-      if (logDecomp)
-        highsLogUser(mipsolver.options_mip_->log_options,
-                     HighsLogType::kInfo,
-                     "[Decomp] pass %d block %d: subsolver optimal but "
-                     "verification failed, left to parent\n",
-                     (int)pass, (int)oi);
-      continue;
-    }
-    bool allFixed = true;
-    for (size_t k = 0; k != comp.cols.size(); ++k) {
-      HighsInt c = comp.cols[k];
-      double fixval = subcol[k];
-      if (!std::isfinite(fixval)) {
-        allFixed = false;
-        break;
-      }
-      if (model.integrality_[c] == HighsVarType::kInteger)
-        fixval = std::round(fixval);
-      fixval = std::min(std::max(fixval, model.col_lower_[c]),
-                        model.col_upper_[c]);
-      model.col_lower_[c] = model.col_upper_[c] = fixval;
-      ++stats.numFixed;
-    }
-    if (!allFixed) continue;
-    ++stats.numSolved;
-    if (logDecomp)
-      highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kInfo,
-                   "[Decomp] pass %d block %d: rows=%d cols=%d int=%d "
-                   "nnz=%d solved optimal, fixed %d columns\n",
-                   (int)pass, (int)oi, (int)comp.rows.size(),
-                   (int)comp.cols.size(), (int)comp.numInt, (int)comp.numNz,
-                   (int)comp.cols.size());
   }
   stats.solveTime += mipsolver.timer_.getWallTime() - tSolve0;
   return true;
