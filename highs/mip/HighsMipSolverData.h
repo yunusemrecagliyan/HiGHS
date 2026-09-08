@@ -375,6 +375,11 @@ struct HighsMipSolverData {
   // use revalidates sizes and bounds before touching anything.
   HighsLagCandidate lagRepairCand;
   bool lagRepairCandValid = false;
+  // Auto-mode probe verdict, persisted across restarts: once the first
+  // iteration shows the blocks do not solve to proven optimality (wrong
+  // shape for Lagrangian ascent, e.g. hard MIP blocks that only time
+  // out), later passes skip the loop instead of re-burning the budget.
+  bool lagProbeFailed = false;
   // Ruin-and-recreate repair on coupling-row structure
   // (HighsLagrangian.cpp): blocks are solved independently (LP or MIP
   // subproblems, same single-convention pattern as runLagrangian); if the

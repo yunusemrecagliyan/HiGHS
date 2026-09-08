@@ -365,6 +365,7 @@ bool HighsMipSolverData::runLagrangian() {
     return true;
   }
   const bool lagAuto = (lagMode == LagDecompMode::Auto);
+  if (lagAuto && lagProbeFailed) return true;
   const double lagProbe = std::max(
       0.0, mipsolver.options_mip_->mip_lagrangian_probe_time);
   if (model.a_matrix_.format_ != MatrixFormat::kColwise)
@@ -596,6 +597,10 @@ bool HighsMipSolverData::runLagrangian() {
   bool sweepDone = !autoSweep;
   std::vector<std::vector<double>> blockSol(nB);
   for (HighsInt iter = 0; iter != maxIter; ++iter) {
+    // Auto-probe verdict counters, reset every iteration (only iter 0
+    // is judged).
+    HighsInt numAttempted = 0;  // solver-backed blocks this iteration
+    HighsInt numOptimal = 0;    // ... proven optimal
     if (mipsolver.options_mip_->time_limit < kHighsInf &&
         mipsolver.timer_.read() >= mipsolver.options_mip_->time_limit)
       break;
@@ -764,11 +769,13 @@ bool HighsMipSolverData::runLagrangian() {
                      (boxbounded && res.obj < boxmin - 1e-6 * fabs(boxmin) - 1e-9)
                          ? " VIOLATION" : "");
       }
+      ++numAttempted;
       if (res.status == HighsModelStatus::kOptimal) {
         if ((HighsInt)res.colSol.size() != nbC) return true;
         blockSol[k] = res.colSol;
         if (!std::isfinite(res.obj)) return true;
         lagLB += res.obj;
+        ++numOptimal;
       } else if (res.status == HighsModelStatus::kInfeasible) {
         // Block rows alone infeasible: the relaxation is infeasible, so
         // the true block (and hence the whole model) is infeasible.
@@ -799,6 +806,21 @@ bool HighsMipSolverData::runLagrangian() {
       } else {
         return true;  // unbounded subproblem or solver trouble: fallback
       }
+    }
+    // Auto-probe verdict (first iteration only): Lagrangian ascent needs
+    // blocks that solve to proven optimality; mostly-timed-out blocks
+    // mean the wrong shape, so abort instead of sweeping/ascenting.
+    // Measured split: 100% optimal proceeds (Salihli), ~2% aborts
+    // (Adana). Remembered across restarts.
+    if (lagAuto && iter == 0 && numAttempted > 0 &&
+        numOptimal * 5 < numAttempted * 4) {
+      if (logLag)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[Lag] auto probe: only %d/%d blocks optimal -> normal "
+                     "MIP\n",
+                     (int)numOptimal, (int)numAttempted);
+      lagProbeFailed = true;
+      return true;
     }
     // Penalty constants complete the dual bound.
     for (HighsInt a = 0; a != nA; ++a) {
