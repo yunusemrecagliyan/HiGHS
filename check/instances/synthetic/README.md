@@ -1,6 +1,6 @@
 # Synthetic block-structured MIPs
 
-Same sizes as the YemYap production models, with matching block
+Same sizes as production feed-formulation models, with matching block
 structure (per-formula blocks + 1-3 coupling rows) and planted feasible
 solutions. Used for fork-vs-stock-vs-SCIP benchmarking (see bench logs).
 
