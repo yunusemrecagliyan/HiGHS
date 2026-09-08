@@ -366,6 +366,12 @@ bool HighsMipSolverData::runLagrangian() {
   }
   const bool lagAuto = (lagMode == LagDecompMode::Auto);
   if (lagAuto && lagProbeFailed) return true;
+  // Single pass per solve (same scope rule as Benders and repair):
+  // post-restart models are LP relaxations plus cuts, and the loop
+  // would merely re-run the full sweep for the same incumbent (measured:
+  // identical re-injection after restart) while burning sub-MIP budgets
+  // on every restart.
+  if (numRestarts > 0) return true;
   const double lagProbe = std::max(
       0.0, mipsolver.options_mip_->mip_lagrangian_probe_time);
   if (model.a_matrix_.format_ != MatrixFormat::kColwise)
