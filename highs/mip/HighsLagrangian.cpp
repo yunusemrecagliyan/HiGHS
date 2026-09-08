@@ -23,6 +23,7 @@
 // prune. Only integer-subproblem duals (Benders side) can beat it.
 
 #include "mip/HighsMipSolverData.h"
+#include "parallel/HighsParallel.h"
 
 #include <algorithm>
 #include <cmath>
@@ -648,6 +649,17 @@ bool HighsMipSolverData::runLagrangian() {
     // Modified costs for this multiplier vector.
     double lagLB = 0.0;
     bool allFresh = true;  // every block supplied a usable solution
+    // Phase-A storage for parallel block solves (solve deferred to
+    // phase B below; harvest reassembled in order in phase C).
+    struct LagBlockJob {
+      HighsLp sublp;
+      double cap = 0.0;
+      double rem = 0.0;
+      bool hasDiscrete = false;
+      bool solve = false;
+    };
+    std::vector<LagBlockJob> lagJobs(nB);
+    std::vector<HighsSubLpResult> blkRes(nB);
     for (HighsInt k = 0; k != nB; ++k) {
       const LagBlock& blk = blocks[k];
       const HighsInt nbC = (HighsInt)blk.cols.size();
@@ -730,22 +742,58 @@ bool HighsMipSolverData::runLagrangian() {
       }
       double remaining =
           mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
+      // Defer the solve to phase B; snapshot the exact cap the
+      // sequential loop would use.
+      const double blockCap = std::min(2.0, remaining);
+      lagJobs[k].sublp = std::move(sublp);
+      lagJobs[k].cap = std::min(blockCap, remaining);
+      lagJobs[k].rem = remaining;
+      lagJobs[k].hasDiscrete = hasDiscrete;
+      lagJobs[k].solve = true;
+    }
+    // Phase B: solve deferred blocks. Sub-solves inherit the parent
+    // thread count (a fresh threads=1 instance fails under an
+    // initialized scheduler), so oversubscription is possible, but every
+    // solve is independent and results assemble in order. Without a
+    // scheduler (or threads==1) this runs sequentially inline:
+    // identical decisions and log lines.
+    const bool lagSched =
+        HighsTaskExecutor::getThisWorkerDeque() != nullptr;
+    const bool lagPar =
+        lagSched && mipsolver.options_mip_->threads > 1;
+    auto solveLagJob = [&](HighsInt k) {
+      LagBlockJob& job = lagJobs[k];
       HighsSubLpResult res;
-      if (hasDiscrete) {
-        // Flat per-block caps (historical behavior): budget-sharing
-        // micro-caps time blocks out, and timeout incumbents then
-        // poison the ascent (garbage compositions -> absurd Polyak
-        // steps -> lit divergence, measured -1.6e3 on iter 1). Small
-        // blocks solve in ms; the loop's own maxTime/maxIter bounds
-        // total cost. Parent gaps stop blocks once good enough.
-        const double blockCap = std::min(2.0, remaining);
-        res = solveSubMip(sublp, std::min(blockCap, remaining),
+      if (job.hasDiscrete) {
+        res = solveSubMip(job.sublp, std::min(job.cap, job.rem),
                           mipsolver.options_mip_->mip_rel_gap,
                           mipsolver.options_mip_->mip_abs_gap, nullptr,
                           blockSol[k]);
       } else {
-        res = solveSubLp(sublp, std::min(iterLpCap, remaining));
+        res = solveSubLp(job.sublp, std::min(iterLpCap, job.rem));
       }
+      blkRes[k] = std::move(res);
+    };
+    if (!lagPar) {
+      for (HighsInt k = 0; k != nB; ++k)
+        if (lagJobs[k].solve) solveLagJob(k);
+    } else {
+      highs::parallel::for_each(
+          (HighsInt)0, nB,
+          [&](HighsInt begin, HighsInt end) {
+            for (HighsInt k = begin; k != end; ++k)
+              if (lagJobs[k].solve) solveLagJob(k);
+          },
+          /*grainSize=*/1);
+    }
+    // Phase C: harvest in original order.
+    for (HighsInt k = 0; k != nB; ++k) {
+      if (!lagJobs[k].solve) continue;
+      HighsSubLpResult res = std::move(blkRes[k]);
+      HighsLp& sublp = lagJobs[k].sublp;
+      const HighsInt nbC = (HighsInt)sublp.num_col_;
+      const bool hasDiscrete = lagJobs[k].hasDiscrete;
+
       if (logLag) {
         // Independent box-minimum check (theorem litmus): no row set can
         // push a minimum below the bound-only minimum.
@@ -1290,6 +1338,17 @@ bool HighsMipSolverData::runLagRepair() {
   double refInternal = 0.0;
   bool refValid = true;
   const double blocksStart = mipsolver.timer_.read();
+  // Repair phase-A storage (solve deferred to phase B below).
+  struct RepBlockJob {
+    HighsLp sublp;
+    double tl = 0.0;
+    bool hasDiscrete = false;
+    bool solve = false;
+  };
+  std::vector<RepBlockJob> repJobs(nB);
+  std::vector<HighsSubLpResult> repRes(nB);
+  const double parentRelGap = mipsolver.options_mip_->mip_rel_gap;
+  const double parentAbsGap = mipsolver.options_mip_->mip_abs_gap;
   for (HighsInt k = 0; k != nB; ++k) {
     if (timeLeft() <= 0) return true;
     const std::vector<HighsInt>& cols = cand.blockCols[k];
@@ -1386,14 +1445,50 @@ bool HighsMipSolverData::runLagRepair() {
     // different vertices, and the sloppy ones happen to fix better.
     // Short per-block caps keep the block phase from eating the joint
     // budget; unsolved blocks join the union via fallback.
-    const double parentRelGap = mipsolver.options_mip_->mip_rel_gap;
-    const double parentAbsGap = mipsolver.options_mip_->mip_abs_gap;
+    // Defer the solve to phase B; snapshot caps exactly.
+    repJobs[k].sublp = std::move(sublp);
+    repJobs[k].tl = tl;
+    repJobs[k].hasDiscrete = hasDiscrete;
+    repJobs[k].solve = true;
+  }
+  // Phase B: parallel repair-block solves (same scheduler rules as
+  // the loop: sequential inline without scheduler or at threads==1).
+  auto solveRepJob = [&](HighsInt k) {
+    RepBlockJob& job = repJobs[k];
+    const double tl = job.tl;
     HighsSubLpResult res =
-        (hasDiscrete &&
+        (job.hasDiscrete &&
          mipsolver.options_mip_->mip_lagrangian_subproblem_mip)
-            ? solveSubMip(sublp, std::min(1.0, tl), parentRelGap,
+            ? solveSubMip(job.sublp, std::min(1.0, tl), parentRelGap,
                           parentAbsGap)
-            : solveSubLp(sublp, std::min(10.0, tl));
+            : solveSubLp(job.sublp, std::min(10.0, tl));
+    repRes[k] = std::move(res);
+  };
+  {
+    const bool repSched =
+        HighsTaskExecutor::getThisWorkerDeque() != nullptr;
+    const bool repPar =
+        repSched && mipsolver.options_mip_->threads > 1;
+    if (!repPar) {
+      for (HighsInt k = 0; k != nB; ++k)
+        if (repJobs[k].solve) solveRepJob(k);
+    } else {
+      highs::parallel::for_each(
+          (HighsInt)0, nB,
+          [&](HighsInt begin, HighsInt end) {
+            for (HighsInt k = begin; k != end; ++k)
+              if (repJobs[k].solve) solveRepJob(k);
+          },
+          /*grainSize=*/1);
+    }
+  }
+  // Phase C: harvest in original order.
+  for (HighsInt k = 0; k != nB; ++k) {
+    if (!repJobs[k].solve) continue;
+    HighsSubLpResult res = std::move(repRes[k]);
+    HighsLp& sublp = repJobs[k].sublp;
+    const bool hasDiscrete = repJobs[k].hasDiscrete;
+    const HighsInt nbC = (HighsInt)sublp.num_col_;
     if (res.status == HighsModelStatus::kInfeasible) {
       // Block rows alone infeasible: the relaxation is infeasible, so the
       // whole model is infeasible.
