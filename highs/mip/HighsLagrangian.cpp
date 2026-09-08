@@ -357,7 +357,7 @@ bool HighsMipSolverData::runLagrangian() {
   const std::string& lagOpt = mipsolver.options_mip_->mip_lagrangian;
   const LagDecompMode lagMode = parseLagDecompMode(lagOpt);
   if (lagMode == LagDecompMode::Off) {
-    if (lagOpt != "off")
+    if (lagOpt != "off" && lagOpt != "false" && lagOpt != "0")
       highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kWarning,
                    "Unknown mip_lagrangian value '%s' (want on/off/auto): "
                    "Lagrangian disabled\n",
@@ -928,6 +928,18 @@ bool HighsMipSolverData::runLagrangian() {
       }
     }
     ++numIter;
+    // Auto mode without any feasible composition once the sweep legs
+    // are done: further ascent can only produce dual bounds (never above
+    // the root LP with relaxed blocks) and no incumbent, so stop burning
+    // budget instead of ascending. Measured: Salihli finds its UB inside
+    // the sweep legs; Adana never composes feasible at any price.
+    if (lagAuto && sweepDone && !sweepHasUB && !hasUB) {
+      if (logLag)
+        highsLogUser(logOptions, HighsLogType::kInfo,
+                     "[Lag] auto: no feasible composition after sweep -> "
+                     "normal MIP\n");
+      return true;
+    }
     if (logLag)
       highsLogUser(logOptions, HighsLogType::kInfo,
                    "[Lag] iter %d: lit=%.6g best=%.6g UB=%.6g gnorm=%.3g\n",

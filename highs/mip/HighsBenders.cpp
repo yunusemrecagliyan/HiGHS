@@ -947,7 +947,7 @@ bool HighsMipSolverData::runBenders() {
   const std::string& bendOpt = mipsolver.options_mip_->mip_benders;
   const DecompMode bendMode = parseDecompMode(bendOpt);
   if (bendMode == DecompMode::Off) {
-    if (bendOpt != "off")
+    if (bendOpt != "off" && bendOpt != "false" && bendOpt != "0")
       highsLogUser(mipsolver.options_mip_->log_options, HighsLogType::kWarning,
                    "Unknown mip_benders value '%s' (want on/off/auto): "
                    "Benders disabled\n",
