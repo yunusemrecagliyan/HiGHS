@@ -1007,6 +1007,19 @@ bool HighsMipSolverData::runBenders() {
   // convergence-and-fix below, when S is fixed away).
   bendersCoupling.assign(numCol, 0);
   for (HighsInt c : cand.couplingCols) bendersCoupling[c] = 1;
+  // Retract-on-fallback: hints that never earn a cut misguide branching
+  // for the whole search (measured: mzzv42z 10.6s Optimal -> 30s timeout
+  // on a dual-mismatch fallback with 16 published cols). Disarmed below
+  // once any cut is added (structure demonstrated).
+  struct BendersHintGuard {
+    HighsMipSolverData& d;
+    bool armed;
+    explicit BendersHintGuard(HighsMipSolverData& d_) : d(d_), armed(true) {}
+    ~BendersHintGuard() {
+      if (armed) d.bendersCoupling.clear();
+    }
+  };
+  BendersHintGuard bendersHintGuard(*this);
   // Internal minimization: negate costs for maximization parents so all
   // dual reasoning below uses a single convention.
   const double sign =
@@ -2267,7 +2280,10 @@ bool HighsMipSolverData::runBenders() {
         }
         cuts.push_back(std::move(nc));
       }
-      if ((HighsInt)cuts.size() > before) anyCut = true;
+      if ((HighsInt)cuts.size() > before) {
+        anyCut = true;
+        bendersHintGuard.armed = false;
+      }
       if (logBend && dropped > 0)
         highsLogUser(logOptions, HighsLogType::kInfo,
                      "[Benders] iter %d: dropped %d duplicate/excess cuts\n",
