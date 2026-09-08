@@ -371,10 +371,8 @@ bool HighsMipSolverData::runLagrangian() {
   // post-restart models are LP relaxations plus cuts, and the loop
   // would merely re-run the full sweep for the same incumbent (measured:
   // identical re-injection after restart) while burning sub-MIP budgets
-  // on every restart. The deferred hook bypasses this while it runs
-  // (root-eval restarts bump numRestarts too, so without the bypass the
-  // very first hook run would be blocked).
-  if (numRestarts > 0 && !decompPostRootActive) return true;
+  // on every restart.
+  if (numRestarts > 0) return true;
   const double lagProbe = std::max(
       0.0, mipsolver.options_mip_->mip_lagrangian_probe_time);
   if (model.a_matrix_.format_ != MatrixFormat::kColwise)
@@ -593,11 +591,10 @@ bool HighsMipSolverData::runLagrangian() {
   // 0.5 leg), while ascent from zero sits flat on integer blocks.
   // Initial pass only (like the repair solves): post-restart models are
   // LP relaxations plus cuts, where the separator may be a cut artifact,
-  // and the sweep costs an evaluation per leg. The deferred hook bypasses
-  // this for its first run (root-eval restarts bump numRestarts too).
+  // and the sweep costs an evaluation per leg.
   const bool autoSweep = fixedLambda < 0.0 &&
                          mipsolver.options_mip_->mip_lagrangian_auto_lambda &&
-                         (numRestarts == 0 || decompPostRootActive);
+                         numRestarts == 0;
   const double sweepLams[3] = {0.0, 0.5, 2.0};
   std::vector<double> sweepUBLam = lambda;
   std::vector<double> sweepLBLam = lambda;
@@ -756,8 +753,11 @@ bool HighsMipSolverData::runLagrangian() {
       double remaining =
           mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
       // Defer the solve to phase B; snapshot the exact cap the
-      // sequential loop would use.
-      const double blockCap = std::min(2.0, remaining);
+      // sequential loop would use. Short universal caps: sloppy blocks
+      // compose better and finish in ms on fast machines, and cap-bounded
+      // worst cases stay usable on weak ones (multi-model evidence:
+      // Adana/onlyadana/Salihli faster-or-equal, suite green).
+      const double blockCap = std::min(0.25, remaining);
       lagJobs[k].sublp = std::move(sublp);
       lagJobs[k].cap = std::min(blockCap, remaining);
       lagJobs[k].rem = remaining;
@@ -1098,23 +1098,44 @@ bool HighsMipSolverData::runLagrangian() {
                    "[Lag] gap open after %d iters; offering incumbent\n",
                    (int)numIter);
   }
-  // Publish the best verified composition via addIncumbent (presolved
-  // space solution, presolved-space objective exactly like the RENS
-  // channel; verified again and transformed inside). The bodies run only
-  // post-root (lazy), so the presolve solution_ channel is gone.
-  if ((HighsInt)bestSol.size() == numCol &&
-      verifyBendersSolution(model, bestSol)) {
-    double parentObj = 0.0;
-    for (HighsInt c = 0; c != numCol; ++c)
-      parentObj += mipsolver.colCost(c) * bestSol[c];
-    if (addIncumbent(bestSol, parentObj, kSolutionSourceHeuristic) &&
-        logLag)
+  // Inject the best verified composition through the native MIP-start
+  // channel: postsolve to original space, re-check against the original
+  // model, and publish only if feasible there. checkAddSolution picks it
+  // up in runSetup; infeasible candidates are silently dropped.
+  //
+  // NOTE: pass nullptr (not hand-built row values) as pass_row_value:
+  // solutionFeasible trusts a provided row vector verbatim, and only a
+  // freshly recomputed activity vector is valid after postsolve.
+  HighsSolution injsol;
+  injsol.col_value = bestSol;
+  injsol.value_valid = true;
+  injsol.dual_valid = false;
+  HighsBasis injbasis;
+  injbasis.valid = false;
+  // NOTE: thread_safe=false is the production path (used at every solve
+  // end). Calling it mid-presolve is safe: it resets its cursor and only
+  // reads the stacks, so the final postsolve re-walks identically. Full
+  // ctest (exact solution checks) guards this claim.
+  postSolveStack.undo(*mipsolver.options_mip_, injsol, injbasis, -1, false);
+  double boundViol = kHighsInf, rowViol = kHighsInf, intViol = kHighsInf;
+  HighsCDouble injObj = 0.0;
+  mipsolver.solutionFeasible(mipsolver.orig_model_, injsol.col_value,
+                             nullptr, boundViol, rowViol, intViol, injObj);
+  if (boundViol <= feastol && rowViol <= feastol && intViol <= feastol) {
+    mipsolver.solution_ = injsol.col_value;
+    mipsolver.solution_objective_ = double(injObj);
+    mipsolver.bound_violation_ = boundViol;
+    mipsolver.row_violation_ = rowViol;
+    mipsolver.integrality_violation_ = intViol;
+    if (logLag)
       highsLogUser(logOptions, HighsLogType::kInfo,
                    "[Lag] injected incumbent (obj %.6g, dual bound %.6g)\n",
-                   parentObj, parentLB);
+                   double(injObj), parentLB);
   } else if (logLag) {
     highsLogUser(logOptions, HighsLogType::kInfo,
-                 "[Lag] composition failed verification -> dropped\n");
+                 "[Lag] postsolved incumbent infeasible (%.2g, %.2g, %.2g) "
+                 "-> dropped\n",
+                 boundViol, rowViol, intViol);
   }
   return true;
 }
@@ -1224,10 +1245,8 @@ bool HighsMipSolverData::runLagRepair() {
   }
   // Solves run on the initial pass with the presolve repair enabled;
   // detection above (candidate store, and the branching hint on the
-  // initial pass) already ran for the search-time heuristic. The
-  // deferred hook bypasses the restart gate while it runs (same
-  // root-restart reason as the loop above).
-  if ((numRestarts > 0 && !decompPostRootActive) || !runRepair) return true;
+  // initial pass) already ran for the search-time heuristic.
+  if (numRestarts > 0 || !runRepair) return true;
   // Fixed-column activity shifted out of every row (exact: lb == ub).
   std::vector<double> rowShift(numRow, 0.0);
   for (HighsInt c = 0; c != numCol; ++c) {
@@ -1283,21 +1302,37 @@ bool HighsMipSolverData::runLagRepair() {
     }
   }
 
-  // Primal injection via addIncumbent (same channel as runLagrangian:
-  // presolved-space solution, presolved-space objective; verified again
-  // and transformed inside). Bodies run only post-root (lazy).
+  // Native MIP-start injection (same channel as runLagrangian: postsolve
+  // to original space, re-check, publish only if feasible there).
   auto injectRepair = [&](const std::vector<double>& sol) -> bool {
-    if ((HighsInt)sol.size() != numCol) return false;
-    if (!verifyBendersSolution(model, sol)) return false;
-    double parentObj = 0.0;
-    for (HighsInt c = 0; c != numCol; ++c)
-      parentObj += mipsolver.colCost(c) * sol[c];
-    if (addIncumbent(sol, parentObj, kSolutionSourceHeuristic)) {
+    HighsSolution injsol;
+    injsol.col_value = sol;
+    injsol.value_valid = true;
+    injsol.dual_valid = false;
+    HighsBasis injbasis;
+    injbasis.valid = false;
+    postSolveStack.undo(*mipsolver.options_mip_, injsol, injbasis, -1, false);
+    double boundViol = kHighsInf, rowViol = kHighsInf, intViol = kHighsInf;
+    HighsCDouble injObj = 0.0;
+    mipsolver.solutionFeasible(mipsolver.orig_model_, injsol.col_value,
+                               nullptr, boundViol, rowViol, intViol, injObj);
+    if (boundViol <= feastol && rowViol <= feastol && intViol <= feastol) {
+      mipsolver.solution_ = injsol.col_value;
+      mipsolver.solution_objective_ = double(injObj);
+      mipsolver.bound_violation_ = boundViol;
+      mipsolver.row_violation_ = rowViol;
+      mipsolver.integrality_violation_ = intViol;
       if (logRep)
         highsLogUser(logOptions, HighsLogType::kInfo,
-                     "[LagRepair] injected incumbent (obj %.6g)\n", parentObj);
+                     "[LagRepair] injected incumbent (obj %.6g)\n",
+                     double(injObj));
       return true;
     }
+    if (logRep)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[LagRepair] postsolved incumbent infeasible (%.2g, %.2g, "
+                   "%.2g) -> dropped\n",
+                   boundViol, rowViol, intViol);
     return false;
   };
 
@@ -1421,8 +1456,8 @@ bool HighsMipSolverData::runLagRepair() {
     // (2488) while proven-optimal blocks compose toward a worse one
     // (2672-class) on the identical union size — degeneracy picks
     // different vertices, and the sloppy ones happen to fix better.
-    // Short per-block caps keep the block phase from eating the joint
-    // budget; unsolved blocks join the union via fallback.
+    // Short universal caps (see loop): unsolved blocks join the union
+    // via fallback.
     // Defer the solve to phase B; snapshot caps exactly.
     repJobs[k].sublp = std::move(sublp);
     repJobs[k].tl = tl;
@@ -1440,7 +1475,7 @@ bool HighsMipSolverData::runLagRepair() {
     HighsSubLpResult res =
         (job.hasDiscrete &&
          mipsolver.options_mip_->mip_lagrangian_subproblem_mip)
-            ? solveSubMip(job.sublp, std::min(1.0, tl), parentRelGap,
+            ? solveSubMip(job.sublp, std::min(0.25, tl), parentRelGap,
                           parentAbsGap)
             : solveSubLp(job.sublp, std::min(10.0, tl));
     repRes[k] = std::move(res);

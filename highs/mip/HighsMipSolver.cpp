@@ -266,36 +266,6 @@ restart:
   mipdata_->updateLowerBound(mipdata_->nodequeue.getBestLowerBound());
   mipdata_->printDisplayLine();
 
-  // Deferred decomposition solves (lazy machinery): the Lagrangian loop
-  // and repair bodies run here, once, and only because the root left a
-  // gap open (the check above exits otherwise) -- easy models that prove
-  // at the root never pay. Detection, candidate stores, branching hints
-  // and the search-time LNS store all happen inside, before the tree
-  // dives. Pre-worker and single-threaded, so sub-solves inherit threads
-  // exactly like presolve, and addIncumbent's no-parallel-lock assertion
-  // holds. Pre-tree only (num_leaves == 0): post-restart roots re-run
-  // detection on cut-enriched models, which the single-pass rule
-  // excludes. Root-eval restarts do NOT count (they bump numRestarts
-  // too): the Active flag bypasses the bodies' restart gates while the
-  // hook runs.
-  if (!submip && options_mip_->presolve != kHighsOffString &&
-      !mipdata_->decompPostRootDone && mipdata_->num_leaves == 0) {
-    highsLogUser(options_mip_->log_options, HighsLogType::kInfo,
-                 "[Decomp] deferred hook: running post-root solves\n");
-    mipdata_->decompPostRootDone = true;
-    mipdata_->decompPostRootActive = true;
-    mipdata_->runLagrangian();
-    if (modelstatus_ == HighsModelStatus::kNotset && !terminate())
-      mipdata_->runLagRepair();
-    mipdata_->decompPostRootActive = false;
-    if (modelstatus_ != HighsModelStatus::kNotset ||
-        mipdata_->nodequeue.empty() || mipdata_->checkLimits()) {
-      cleanupSolve();
-      return;
-    }
-    mipdata_->printDisplayLine();
-  }
-
   const HighsInt max_num_workers = getMaxNumWorkers();
   HighsInt num_workers = 1;
   highs::parallel::TaskGroup tg;

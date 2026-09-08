@@ -376,13 +376,6 @@ struct HighsMipSolverData {
   // use revalidates sizes and bounds before touching anything.
   HighsLagCandidate lagRepairCand;
   bool lagRepairCandValid = false;
-  // Lazy machinery gate: the loop/repair bodies run post-root via the
-  // deferred hook (once, gap-gated) -- never in presolve.
-  bool decompPostRootDone = false;
-  // Phase flag bypassing the single-pass numRestarts guards inside the
-  // bodies while the hook runs (root-eval restarts bump numRestarts too,
-  // so the guards alone would block the very first hook run).
-  bool decompPostRootActive = false;
   // Wall-clock accounting for the final Timing block: loop/block/joint
   // solve phases (sub-solver clocks are invisible to the parent timer).
   double decompLagLoopTime = 0.0;
