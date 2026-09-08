@@ -1263,6 +1263,27 @@ bool HighsMipSolverData::runLagRepair() {
   // subproblem below falls back. Initial pass only: post-restart models
   // are LP relaxations plus cuts, where the separator would be a cut
   // artifact.
+  //
+  // Retract-on-no-value (same rule as the Benders hints): published
+  // priorities that never earn an injection misguide branching for the
+  // whole search. The guard tracks exactly the columns published here
+  // (Benders' OR-merged flags are never touched) and retracts them at
+  // scope exit unless an injectRepair success below disarms it.
+  struct LagRepairHintGuard {
+    HighsMipSolverData& d;
+    std::vector<HighsInt> cols;
+    bool armed;
+    explicit LagRepairHintGuard(HighsMipSolverData& d_)
+        : d(d_), armed(false) {}
+    ~LagRepairHintGuard() {
+      if (!armed) return;
+      auto& bc = d.bendersCoupling;
+      for (HighsInt c : cols) {
+        if (c >= 0 && c < (HighsInt)bc.size()) bc[c] = 0;
+      }
+    }
+  };
+  LagRepairHintGuard lagRepairHintGuard(*this);
   if (numRestarts == 0) {
     std::vector<char> inRc(numRow, 0);
     for (HighsInt r : cand.couplingRows) inRc[r] = 1;
@@ -1276,6 +1297,7 @@ bool HighsMipSolverData::runLagRepair() {
            el != model.a_matrix_.start_[c + 1]; ++el) {
         if (inRc[model.a_matrix_.index_[el]]) {
           bendersCoupling[c] = 1;
+          lagRepairHintGuard.cols.push_back(c);
           ++numPub;
           break;
         }
@@ -1286,6 +1308,9 @@ bool HighsMipSolverData::runLagRepair() {
                    "[LagRepair] published %d coupling columns for branching "
                    "priority\n",
                    (int)numPub);
+    // Arm the retract guard: hints stay only if an injection below earns
+    // them (same rule as Benders).
+    lagRepairHintGuard.armed = true;
   }
   // Solves run on the initial pass with the presolve repair enabled;
   // detection above (candidate store, and the branching hint on the
@@ -1366,6 +1391,8 @@ bool HighsMipSolverData::runLagRepair() {
       mipsolver.bound_violation_ = boundViol;
       mipsolver.row_violation_ = rowViol;
       mipsolver.integrality_violation_ = intViol;
+      // Earned: an injection validates the published hints.
+      lagRepairHintGuard.armed = false;
       if (logRep)
         highsLogUser(logOptions, HighsLogType::kInfo,
                      "[LagRepair] injected incumbent (obj %.6g)\n",
