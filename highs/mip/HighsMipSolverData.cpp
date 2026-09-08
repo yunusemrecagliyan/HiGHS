@@ -1045,22 +1045,12 @@ void HighsMipSolverData::runMipPresolve(
       mipsolver.options_mip_->presolve != kHighsOffString)
     runBenders();
 
-  // Lagrangian decomposition on coupling-row structure: dual bounds
-  // plus verified MIP-start incumbents, never any fixing.
-  if (mipsolver.modelstatus_ == HighsModelStatus::kNotset &&
-      !mipsolver.submip &&
-      mipsolver.options_mip_->presolve != kHighsOffString)
-    runLagrangian();
-
-  // Ruin-and-recreate repair on coupling-row structure: independently
-  // solved blocks are composed, and blocks touching violated coupling
-  // rows are re-optimized jointly with all other columns fixed. Only a
-  // verified feasible composition is ever injected as MIP-start
-  // incumbent; the parent model is never modified.
-  if (mipsolver.modelstatus_ == HighsModelStatus::kNotset &&
-      !mipsolver.submip &&
-      mipsolver.options_mip_->presolve != kHighsOffString)
-    runLagRepair();
+  // Lagrangian loop and ruin-and-recreate repair are NOT called here:
+  // their expensive block solves run post-root via the deferred hook in
+  // HighsMipSolver (once, and only if the root left a gap open), so easy
+  // models that prove at the root never pay. Detection, candidate
+  // stores, branching hints and the search-time LNS all happen inside
+  // the deferred call, before the tree dives.
 }
 
 void HighsMipSolverData::solveComponents() {
