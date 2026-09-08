@@ -756,7 +756,7 @@ struct HighsOptionsStruct {
         mip_decomposition_logging(false),
         mip_benders("auto"),
         mip_benders_integer_subproblems(true),
-        mip_benders_probe_time(2.0),
+        mip_benders_probe_time(0.5),
         mip_lagrangian("auto"),
         mip_lagrangian_probe_time(2.0),
         mip_lagrangian_max_iterations(30),
@@ -1467,8 +1467,9 @@ class HighsOptions : public HighsOptionsStruct {
         "mip_benders_probe_time",
         "Per-subproblem time cap for the first Benders iteration in "
         "auto mode (later iterations use full budgets; abort on stall; "
-        "0 disables probing)",
-        advanced, &mip_benders_probe_time, 0.0, 2.0, kHighsInf);
+        "0 disables probing. Small: degenerate blocks must fail fast so "
+        "easy models never fund hopeless Benders loops)",
+        advanced, &mip_benders_probe_time, 0.0, 0.5, kHighsInf);
     records.push_back(record_double);
 
     record_int = new OptionRecordInt(
