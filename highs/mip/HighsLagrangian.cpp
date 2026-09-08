@@ -392,6 +392,14 @@ bool HighsMipSolverData::runLagrangian() {
   const bool logLag = mipsolver.options_mip_->mip_decomposition_logging;
   const HighsLogOptions& logOptions = mipsolver.options_mip_->log_options;
   const double feastol = mipsolver.options_mip_->mip_feasibility_tolerance;
+  // Shared presolve budget (see runMipPresolve): the separator alone can
+  // grind on huge models, so check before it, not just before solves.
+  if (decompBudgetExceeded()) {
+    if (logLag)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[Lag] presolve budget exhausted -> normal MIP\n");
+    return true;
+  }
 
   HighsLagCandidate cand;
   if (!findLagSeparator(model, cand)) {
@@ -1189,6 +1197,14 @@ bool HighsMipSolverData::runLagRepair() {
   const bool logRep = mipsolver.options_mip_->mip_decomposition_logging;
   const HighsLogOptions& logOptions = mipsolver.options_mip_->log_options;
   const double feastol = mipsolver.options_mip_->mip_feasibility_tolerance;
+  // Shared presolve budget (see runMipPresolve): check before the
+  // separator, which can grind on huge models by itself.
+  if (decompBudgetExceeded()) {
+    if (logRep)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[LagRepair] presolve budget exhausted -> normal MIP\n");
+    return true;
+  }
   const double maxTime = mipsolver.options_mip_->mip_lagrangian_repair_max_time;
   const HighsInt maxUnion = std::max<HighsInt>(
       1, mipsolver.options_mip_->mip_lagrangian_repair_max_cols);

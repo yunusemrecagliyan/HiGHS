@@ -976,6 +976,14 @@ bool HighsMipSolverData::runBenders() {
     model.a_matrix_.ensureColwise();
   const bool logBend = mipsolver.options_mip_->mip_decomposition_logging;
   const HighsLogOptions& logOptions = mipsolver.options_mip_->log_options;
+  // Shared presolve budget (see runMipPresolve): skip when earlier phases
+  // already spent it, so the search keeps room to find bounds.
+  if (decompBudgetExceeded()) {
+    if (logBend)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[Benders] presolve budget exhausted -> normal MIP\n");
+    return true;
+  }
   if (logBend) {
     std::string mdbg;
     char mbuf[200];

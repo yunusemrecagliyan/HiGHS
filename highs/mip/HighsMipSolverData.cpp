@@ -1008,9 +1008,13 @@ void HighsMipSolverData::init() {
     dispfreq = 100;
 }
 
+bool HighsMipSolverData::decompBudgetExceeded() const {
+  if (decompBudgetMax >= kHighsInf) return false;
+  return mipsolver.timer_.read() - decompBudgetStart >= decompBudgetMax;
+}
+
 void HighsMipSolverData::runMipPresolve(
-    const HighsInt presolve_reduction_limit) {
-  mipsolver.timer_.start(mipsolver.timer_.presolve_clock);
+    const HighsInt presolve_reduction_limit) {  mipsolver.timer_.start(mipsolver.timer_.presolve_clock);
   presolve::HPresolve presolve;
   if (!presolve.okSetInput(mipsolver, presolve_reduction_limit)) {
     mipsolver.modelstatus_ = HighsModelStatus::kMemoryLimit;
@@ -1032,6 +1036,20 @@ void HighsMipSolverData::runMipPresolve(
   // (the objective separates by definition). Tiny pieces are solved
   // exactly here and their columns fixed, which can collapse wide
   // models that are decomposable in disguise.
+  //
+  // Shared presolve-decomposition budget (see member docs): individually
+  // capped phases can still sum past the parent limit on hard models,
+  // starving the search (measured: 30s gone with nodes=0 and no dual).
+  // Production phases complete in 1-5s everywhere measured; this binds
+  // only hopeless grinds, and skipped phases fall back to normal MIP.
+  {
+    const double tl = mipsolver.options_mip_->time_limit;
+    double budget = 60.0;
+    if (tl < kHighsInf)
+      budget = std::min(60.0, std::max(2.0, 0.3 * tl));
+    decompBudgetStart = mipsolver.timer_.read();
+    decompBudgetMax = budget;
+  }
   if (mipsolver.modelstatus_ == HighsModelStatus::kNotset &&
       !mipsolver.submip &&
       mipsolver.options_mip_->presolve != kHighsOffString)
@@ -1476,6 +1494,12 @@ bool HighsMipSolverData::solveComponentPass(const HighsInt pass,
                      1, mipsolver.options_mip_->threads));
     auto solveOne = [&](size_t bi) {
       DecompBlockResult& res = blockRes[bi];
+      // Shared presolve budget: leave remaining components unfixed (normal
+      // MIP continues) instead of burning the search tail.
+      if (decompBudgetExceeded()) {
+        res.status = HighsModelStatus::kNotset;
+        return;
+      }
       // Search reserve: with less than 2s of parent budget left, leave
       // the component unfixed (normal MIP continues) instead of burning
       // the search tail; non-optimal outcomes already leave it unfixed.

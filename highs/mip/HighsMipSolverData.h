@@ -381,6 +381,13 @@ struct HighsMipSolverData {
   double decompLagLoopTime = 0.0;
   double decompRepairBlockTime = 0.0;
   double decompRepairJointTime = 0.0;
+  // Shared presolve-decomposition budget: individually capped phases can
+  // still sum past the parent limit on hard models (measured: presolve
+  // burns the whole 30s with nodes=0 and no dual while stock finds duals).
+  // Set at section entry; phases skip when exceeded (normal MIP continues).
+  double decompBudgetStart = 0.0;
+  double decompBudgetMax = kHighsInf;
+  bool decompBudgetExceeded() const;
   // Auto-mode probe verdict, persisted across restarts: once the first
   // iteration shows the blocks do not solve to proven optimality (wrong
   // shape for Lagrangian ascent, e.g. hard MIP blocks that only time
