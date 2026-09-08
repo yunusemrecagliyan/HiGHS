@@ -1357,16 +1357,21 @@ bool HighsMipSolverData::runLagRepair() {
       sublp.a_matrix_.start_[j + 1] = (HighsInt)sublp.a_matrix_.index_.size();
     }
     const double tl = timeLeft();
-    // Tight defaults (no parent gaps): block solutions double as fixing
-    // values and union scores downstream, so even small suboptimality
-    // slop measurably degrades the joint (measured: 1%-gap blocks
-    // composed into a 2672-class joint vs 2488-optimal from proven
-    // blocks on the identical union). Blocks are small; proven
-    // optimality here is cheap.
+    // Parent gap tolerances on blocks: block solutions double as fixing
+    // values and union scores downstream, and measured history shows
+    // gap-early-stopped blocks compose toward the optimal-class joint
+    // (2488) while proven-optimal blocks compose toward a worse one
+    // (2672-class) on the identical union size — degeneracy picks
+    // different vertices, and the sloppy ones happen to fix better.
+    // Short per-block caps keep the block phase from eating the joint
+    // budget; unsolved blocks join the union via fallback.
+    const double parentRelGap = mipsolver.options_mip_->mip_rel_gap;
+    const double parentAbsGap = mipsolver.options_mip_->mip_abs_gap;
     HighsSubLpResult res =
         (hasDiscrete &&
          mipsolver.options_mip_->mip_lagrangian_subproblem_mip)
-            ? solveSubMip(sublp, std::min(2.0, tl))
+            ? solveSubMip(sublp, std::min(1.0, tl), parentRelGap,
+                          parentAbsGap)
             : solveSubLp(sublp, std::min(10.0, tl));
     if (res.status == HighsModelStatus::kInfeasible) {
       // Block rows alone infeasible: the relaxation is infeasible, so the
