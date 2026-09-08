@@ -353,7 +353,8 @@ struct HighsMipSolverData {
   static HighsSubLpResult solveSubMip(const HighsLp& submip,
                                         double timeLimit, double relGap = 0.0,
                                         double absGap = 0.0,
-                                        HighsSubMipProgress* progress = nullptr);
+                                        HighsSubMipProgress* progress = nullptr,
+                                        const std::vector<double>& hint = {});
   // Lagrangian decomposition (HighsLagrangian.cpp): row separator whose
   // removal splits the model; coupling rows are dualized (priced) while
   // blocks solve independently. Produces dual bounds (logged) and, when

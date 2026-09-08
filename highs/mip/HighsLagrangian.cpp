@@ -602,6 +602,12 @@ bool HighsMipSolverData::runLagrangian() {
   bool sweepHasUB = false;
   bool sweepDone = !autoSweep;
   std::vector<std::vector<double>> blockSol(nB);
+  // Frozen-state detector: consecutive iterations with identical block
+  // solutions re-solve the same points (measured: sweep legs 2-3 and
+  // ascent iters byte-identical on live models). With no dual progress
+  // either, further rounds cannot change the composition or the bound.
+  std::vector<std::vector<double>> prevBlockSol;
+  double prevBestLB = -kHighsInf;
   for (HighsInt iter = 0; iter != maxIter; ++iter) {
     // Auto-probe verdict counters, reset every iteration (only iter 0
     // is judged).
@@ -735,7 +741,8 @@ bool HighsMipSolverData::runLagrangian() {
         const double blockCap = std::min(2.0, remaining);
         res = solveSubMip(sublp, std::min(blockCap, remaining),
                           mipsolver.options_mip_->mip_rel_gap,
-                          mipsolver.options_mip_->mip_abs_gap);
+                          mipsolver.options_mip_->mip_abs_gap, nullptr,
+                          blockSol[k]);
       } else {
         res = solveSubLp(sublp, std::min(iterLpCap, remaining));
       }
@@ -926,6 +933,28 @@ bool HighsMipSolverData::runLagrangian() {
       }
     }
     ++numIter;
+    // Frozen state: identical block solutions to the previous round and
+    // no dual progress. Same points -> same composition, same gradient
+    // direction, same bound: re-solving is pure waste. Inject best and
+    // exit; the repair joint re-optimizes from there.
+    {
+      bool same = !prevBlockSol.empty() &&
+                  prevBlockSol.size() == blockSol.size();
+      for (HighsInt k = 0; same && k != nB; ++k)
+        same = blockSol[k].size() == prevBlockSol[k].size() &&
+               std::equal(blockSol[k].begin(), blockSol[k].end(),
+                          prevBlockSol[k].begin());
+      if (same && bestLB <= prevBestLB + 1e-12 * std::max(1.0, std::fabs(prevBestLB))) {
+        if (logLag)
+          highsLogUser(logOptions, HighsLogType::kInfo,
+                       "[Lag] frozen block solutions, no dual progress -> "
+                       "injecting best\n");
+        prevBlockSol.clear();
+        break;
+      }
+      prevBlockSol = blockSol;
+      prevBestLB = bestLB;
+    }
     // Auto mode without any feasible composition once the sweep legs
     // are done: fall through to ascent anyway. The sweep samples only
     // three coarse prices and can miss the composing region that the

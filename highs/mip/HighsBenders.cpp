@@ -153,7 +153,7 @@ HighsMipSolverData::HighsSubLpResult HighsMipSolverData::solveSubLp(
 
 HighsMipSolverData::HighsSubLpResult HighsMipSolverData::solveSubMip(
     const HighsLp& submip, double timeLimit, double relGap, double absGap,
-    HighsSubMipProgress* progress) {
+    HighsSubMipProgress* progress, const std::vector<double>& hint) {
   HighsSubLpResult res;
   Highs mipsolver;
   mipsolver.setOptionValue("output_flag", false);
@@ -237,6 +237,12 @@ HighsMipSolverData::HighsSubLpResult HighsMipSolverData::solveSubMip(
     mipsolver.startCallback(kCallbackMipInterrupt);
   }
   if (mipsolver.passModel(submip) != HighsStatus::kOk) return res;
+  // MIP-start hint (loop re-solves across iterations): the previous
+  // block solution stays bound-feasible (only costs change), so it is
+  // a valid start. Advisory only; failures fall back to cold start.
+  // Deterministic: the hint is a pure function of earlier rounds.
+  if ((HighsInt)hint.size() == submip.num_col_)
+    mipsolver.setSolution((HighsInt)hint.size(), nullptr, hint.data());
   mipsolver.run();
   res.status = mipsolver.getModelStatus();
   // Dual bound for capped solves (the Lagrangian loop harvests it as a
