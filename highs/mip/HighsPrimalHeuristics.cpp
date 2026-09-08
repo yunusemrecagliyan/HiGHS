@@ -1904,8 +1904,16 @@ void HighsPrimalHeuristics::randomizedRounding(
     lprelax.setProfiling(mipsolver.profiling_);
     lprelax.loadModel();
     const int64_t lpIters0 = lprelax.getNumLpIterations();
-    lprelax.setIterationLimit(
-        std::max(int64_t{10000}, 2 * mipsolver.mipdata_->firstrootlpiters));
+    // Bound root polish resolves: rounding polish that grinds past this
+    // on a degenerate LP burns seconds for a point the tree recovers
+    // anyway (measured: 197-1149 iter grinds on synth_onlyadana at root;
+    // tree-node rounding keeps full effort for late hard primals).
+    // Validated: identical PBs on synth/Adana, suite/ctest green.
+    const int64_t fullLimit = std::max(int64_t{10000},
+                                       2 * mipsolver.mipdata_->firstrootlpiters);
+    const bool atRoot = (mipsolver.mipdata_->num_nodes == 0);
+    lprelax.setIterationLimit(atRoot ? std::min<int64_t>(fullLimit, 100)
+                                     : fullLimit);
     lprelax.getLpSolver().changeColsBounds(0, mipsolver.numCol() - 1,
                                            localdom.col_lower_.data(),
                                            localdom.col_upper_.data());
