@@ -726,22 +726,13 @@ bool HighsMipSolverData::runLagrangian() {
           mipsolver.options_mip_->time_limit - mipsolver.timer_.read();
       HighsSubLpResult res;
       if (hasDiscrete) {
-        // Share this iteration's budget across blocks: with dozens of
-        // blocks, per-block optimality is unaffordable, and capped
-        // sub-MIPs still contribute VALID dual bounds below (optimality
-        // is not required for the bound, only for the primal solution).
-        // Parent gaps stop blocks once good enough for the parent.
-        const HighsInt itersLeft = std::max<HighsInt>(1, maxIter - iter);
-        const double loopLeft =
-            (maxTime < kHighsInf)
-                ? std::max(0.0, maxTime -
-                                    (mipsolver.timer_.getWallTime() - lagStart))
-                : kHighsInf;
-        const double iterBudget =
-            std::min(remaining, loopLeft) / (double)itersLeft;
-        const HighsInt blocksLeft = nB - k;
-        const double blockCap = std::max(
-            0.02, std::min(2.0, iterBudget / std::max<HighsInt>(1, blocksLeft)));
+        // Flat per-block caps (historical behavior): budget-sharing
+        // micro-caps time blocks out, and timeout incumbents then
+        // poison the ascent (garbage compositions -> absurd Polyak
+        // steps -> lit divergence, measured -1.6e3 on iter 1). Small
+        // blocks solve in ms; the loop's own maxTime/maxIter bounds
+        // total cost. Parent gaps stop blocks once good enough.
+        const double blockCap = std::min(2.0, remaining);
         res = solveSubMip(sublp, std::min(blockCap, remaining),
                           mipsolver.options_mip_->mip_rel_gap,
                           mipsolver.options_mip_->mip_abs_gap);
@@ -800,14 +791,15 @@ bool HighsMipSolverData::runLagrangian() {
         // Validity rests solely on the harvested bound, never on the
         // multipliers or the step rule. Tripwire: dual > incumbent is
         // impossible and falls back instead of trusting anything.
-        if ((HighsInt)res.colSol.size() == nbC) {
-          if (res.dualBound >
-              res.obj + 1e-6 * std::max(1.0, std::fabs(res.obj)) + 1e-9)
-            return true;
-          blockSol[k] = res.colSol;
-        } else {
-          allFresh = false;  // subgradient misses this block (step only)
-        }
+        // The timeout incumbent is NOT stored: stale timeout points
+        // poison the composition (absurd UB -> absurd Polyak step ->
+        // lit divergence) and the gradient. The block keeps its last
+        // proven solution (or stays empty and is skipped).
+        if ((HighsInt)res.colSol.size() == nbC &&
+            res.dualBound >
+                res.obj + 1e-6 * std::max(1.0, std::fabs(res.obj)) + 1e-9)
+          return true;
+        allFresh = false;
         lagLB += res.dualBound;
       } else {
         return true;  // unbounded subproblem or solver trouble: fallback
@@ -935,16 +927,16 @@ bool HighsMipSolverData::runLagrangian() {
     }
     ++numIter;
     // Auto mode without any feasible composition once the sweep legs
-    // are done: further ascent can only produce dual bounds (never above
-    // the root LP with relaxed blocks) and no incumbent, so stop burning
-    // budget instead of ascending. Measured: Salihli finds its UB inside
-    // the sweep legs; Adana never composes feasible at any price.
+    // are done: fall through to ascent anyway. The sweep samples only
+    // three coarse prices and can miss the composing region that the
+    // fine-grained ascent walks into (measured: nested joint composes
+    // at 2488 two ascent iters after a UBl ess sweep, while the abort
+    // left it at 2615+). Cost is bounded by the loop's own maxIter /
+    // maxTime; the iter-0 probe verdict still guards timed-out shapes.
     if (lagAuto && sweepDone && !sweepHasUB && !hasUB) {
       if (logLag)
         highsLogUser(logOptions, HighsLogType::kInfo,
-                     "[Lag] auto: no feasible composition after sweep -> "
-                     "normal MIP\n");
-      return true;
+                     "[Lag] auto: sweep found no UB, ascending anyway\n");
     }
     if (logLag)
       highsLogUser(logOptions, HighsLogType::kInfo,
