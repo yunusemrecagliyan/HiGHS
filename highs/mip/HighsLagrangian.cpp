@@ -1988,6 +1988,13 @@ bool HighsMipSolverData::runLagRepair() {
     // backstop for now.
     progress.stallLpMult = 3.0;
     progress.stallLpFloor = 10000;
+    progress.objSense =
+        (model.sense_ == ObjSense::kMinimize) ? 1 : -1;
+    // Diminishing returns (measured: a restart ticket ground 10k iters
+    // for 0.04%): abort a banked ticket whose trailing stall-sized
+    // window gained only dust. Relative gain => model-scale-free.
+    progress.dimMinGain = 0.002;
+    progress.dimMinSpan = 5000;
     // Search reserve: a joint started with less than 2s left cannot
     // finish anything useful; fall back to normal MIP immediately.
     if (mipsolver.options_mip_->time_limit < kHighsInf &&
@@ -2044,10 +2051,10 @@ bool HighsMipSolverData::runLagRepair() {
                    "[LagRepair] joint interrupted -> harvested\n");
     if (logRep && progress.tripCause > 0) {
       static const char* const tripName[] = {"none", "target", "stall-time",
-                                             "stall-lp"};
+                                             "stall-lp", "diminishing"};
       highsLogUser(logOptions, HighsLogType::kInfo,
                    "[LagRepair] joint auto-exit: %s\n",
-                   tripName[std::min(progress.tripCause, 3)]);
+                   tripName[std::min(progress.tripCause, 4)]);
     }
     if ((HighsInt)res.colSol.size() == numCol) {
       if (verifyBendersSolution(model, res.colSol)) {

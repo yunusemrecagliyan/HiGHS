@@ -358,13 +358,24 @@ struct HighsMipSolverData {
     // improve"). Needs a banked incumbent; never kills hope.
     double stallLpMult = 0.0;
     int64_t stallLpFloor = 0;
+    // Diminishing returns: abort when the trailing work window shows only
+    // dust (relative gain below dimMinGain over at least dimMinSpan LP
+    // iterations of banked history). Catches grinding tickets that stall
+    // patience cannot (they keep banking microscopic improvements).
+    // Disabled when dimMinGain <= 0. Trip cause 4.
+    double dimMinGain = 0.0;
+    int64_t dimMinSpan = 0;
     int64_t lastImproveNodes = 0;
     double lastImproveTime = 0.0;
     double lastImproveBound = kHighsInf;
     int64_t lastImproveLpIters = 0;
     int64_t solveStartLpIters = -1;
+    // Sense for direction-aware rules (+1 minimize, -1 maximize, 0
+    // unknown): gains are signed by it. The legacy clock rules assume
+    // minimization; the work rules refuse to run unknown (0).
+    int objSense = 0;
     // Trip attribution for the last auto-exit (0 none, 1 target, 2 time,
-    // 3 lp-patience). Set in the callback, read by the caller.
+    // 3 lp-patience, 4 diminishing). Set in the callback, read by caller.
     int tripCause = 0;
   };
   static HighsSubLpResult solveSubLp(const HighsLp& sublp, double timeLimit);

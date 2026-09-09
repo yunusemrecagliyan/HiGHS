@@ -247,19 +247,52 @@ HighsMipSolverData::HighsSubLpResult HighsMipSolverData::solveSubMip(
           // since the last improvement exceeds max(stallLpFloor,
           // stallLpMult * workToLastImprove). LP iterations advance in
           // heuristics and B&B alike and ignore machine speed.
-          if (progress->stallLpMult > 0.0) {
+          int64_t stallWindow = 0;
+          if (progress->objSense != 0 && progress->stallLpMult > 0.0) {
             const int64_t sinceImprove =
                 data_out->mip_total_lp_iterations -
                 progress->lastImproveLpIters;
             const int64_t toLast = std::max<int64_t>(
                 1, progress->lastImproveLpIters -
                        progress->solveStartLpIters);
-            const int64_t patience = std::max(
+            stallWindow = std::max(
                 progress->stallLpFloor,
                 int64_t(progress->stallLpMult * double(toLast)));
-            if (sinceImprove > patience) {
+            if (sinceImprove > stallWindow) {
               data_in->user_interrupt = true;
               progress->tripCause = 3;
+              return;
+            }
+          }
+          // Diminishing returns: the last improvement was dust and the
+          // ticket has ripened since (measured: a restart ticket ground
+          // 10k iters for 0.04% after its last bank). Needs two distinct
+          // banks (equal re-reports skipped) and dimMinSpan LP iterations
+          // since the previous one. Relative marginal gain => scale-free.
+          if (progress->dimMinGain > 0.0 && progress->objSense != 0 &&
+              !progress->events.empty()) {
+            const int64_t nowLp = data_out->mip_total_lp_iterations;
+            const double best = progress->lastImproveBound;
+            const double denom = std::max(1.0, std::fabs(best));
+            double prevBound = best;
+            int64_t prevLp = progress->lastImproveLpIters;
+            bool havePrev = false;
+            for (auto it = progress->events.rbegin();
+                 it != progress->events.rend(); ++it) {
+              const double eBound = std::get<1>(*it);
+              if (eBound == best) continue;  // re-report, not a bank
+              prevBound = eBound;
+              prevLp = std::get<3>(*it);
+              havePrev = true;
+              break;
+            }
+            if (havePrev && nowLp - prevLp >= progress->dimMinSpan) {
+              const double marginal =
+                  progress->objSense * (prevBound - best) / denom;
+              if (marginal < progress->dimMinGain) {
+                data_in->user_interrupt = true;
+                progress->tripCause = 4;
+              }
             }
           }
         },
