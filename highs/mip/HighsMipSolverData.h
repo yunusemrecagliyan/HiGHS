@@ -12,6 +12,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <tuple>
 #include <vector>
 
 #include "lp_data/HConst.h"
@@ -334,20 +335,37 @@ struct HighsMipSolverData {
   // append under lock; the caller logs single-threaded afterwards).
   // Auto-exit tripwires (repair joints): the interrupt callback fires
   // when an incumbent is good enough (bound <= targetBound, minimize
-  // side) or stagnant (no improvement for stallSeconds once at least
-  // minStallNodes sub-MIP nodes ran). The node floor keeps tiny solves
-  // (and all unit tests) deterministic; wall-clock only matters past it.
-  // Disabled tripwires: targetBound -inf, stallSeconds <= 0.
+  // side), stagnant by the clock (no improvement for stallSeconds once
+  // at least minStallNodes sub-MIP nodes ran), or stagnant by work (no
+  // improvement for stallLp patience in LP iterations). LP iterations
+  // advance in root heuristics and B&B alike (node counts sit at 0
+  // through heuristics) and are machine-independent (seconds are not).
+  // The node floor keeps tiny solves (and all unit tests) deterministic.
+  // Disabled tripwires: targetBound -inf, stallSeconds <= 0,
+  // stallLpMult <= 0.
   struct HighsSubMipProgress {
     std::mutex mutex;
-    // (sub-solver running time, objective) per improving incumbent.
-    std::vector<std::pair<double, double>> events;
+    // (sub-solver running time, objective, node count, total LP
+    // iterations) per improving incumbent.
+    std::vector<std::tuple<double, double, int64_t, int64_t>> events;
     double targetBound = -kHighsInf;
     int64_t minStallNodes = 0;
     double stallSeconds = 0.0;
+    // Clock-free stall patience: abort when LP iterations since the last
+    // strict improvement exceed max(stallLpFloor, stallLpMult *
+    // itersToLastImprove), where itersToLastImprove counts from the first
+    // callback to the last improvement ("twice the rope it took to
+    // improve"). Needs a banked incumbent; never kills hope.
+    double stallLpMult = 0.0;
+    int64_t stallLpFloor = 0;
     int64_t lastImproveNodes = 0;
     double lastImproveTime = 0.0;
     double lastImproveBound = kHighsInf;
+    int64_t lastImproveLpIters = 0;
+    int64_t solveStartLpIters = -1;
+    // Trip attribution for the last auto-exit (0 none, 1 target, 2 time,
+    // 3 lp-patience). Set in the callback, read by the caller.
+    int tripCause = 0;
   };
   static HighsSubLpResult solveSubLp(const HighsLp& sublp, double timeLimit);
   static HighsSubLpResult solveSubMip(const HighsLp& submip,

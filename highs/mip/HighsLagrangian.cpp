@@ -1982,6 +1982,12 @@ bool HighsMipSolverData::runLagRepair() {
     progress.stallSeconds = std::min(
         mipsolver.options_mip_->mip_lagrangian_repair_stall_seconds,
         std::max(1.0, 0.5 * timeLeft()));
+    // Clock-free patience (calibrated 9-model panel, all Optimal: bank
+    // gaps <= 3.4k iters, ticket totals <= 11k; nothing else banked above
+    // ~1k). Fires only on genuine stalls; the clock rule stays as a
+    // backstop for now.
+    progress.stallLpMult = 3.0;
+    progress.stallLpFloor = 10000;
     // Search reserve: a joint started with less than 2s left cannot
     // finish anything useful; fall back to normal MIP immediately.
     if (mipsolver.options_mip_->time_limit < kHighsInf &&
@@ -2018,8 +2024,11 @@ bool HighsMipSolverData::runLagRepair() {
       std::lock_guard<std::mutex> guard(progress.mutex);
       for (const auto& e : progress.events)
         highsLogUser(logOptions, HighsLogType::kInfo,
-                     "[LagRepair-joint] incumbent %.6g at %.1fs\n", e.second,
-                     e.first);
+                     "[LagRepair-joint] incumbent %.6g at %.1fs (%lld nodes, "
+                     "%lld lp iters)\n",
+                     std::get<1>(e), std::get<0>(e),
+                     static_cast<long long>(std::get<2>(e)),
+                     static_cast<long long>(std::get<3>(e)));
     }
     if (logRep)
       highsLogUser(logOptions, HighsLogType::kInfo,
@@ -2033,6 +2042,13 @@ bool HighsMipSolverData::runLagRepair() {
     if (logRep && res.status == HighsModelStatus::kInterrupt)
       highsLogUser(logOptions, HighsLogType::kInfo,
                    "[LagRepair] joint interrupted -> harvested\n");
+    if (logRep && progress.tripCause > 0) {
+      static const char* const tripName[] = {"none", "target", "stall-time",
+                                             "stall-lp"};
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[LagRepair] joint auto-exit: %s\n",
+                   tripName[std::min(progress.tripCause, 3)]);
+    }
     if ((HighsInt)res.colSol.size() == numCol) {
       if (verifyBendersSolution(model, res.colSol)) {
         // Scale sanity: the joint result must sit within an order of
@@ -2107,8 +2123,11 @@ bool HighsMipSolverData::runLagRepair() {
                 std::lock_guard<std::mutex> guard(rprogress.mutex);
                 for (const auto& e : rprogress.events)
                   highsLogUser(logOptions, HighsLogType::kInfo,
-                               "[LagRepair-RINS] incumbent %.6g at %.1fs\n",
-                               e.second, e.first);
+                               "[LagRepair-RINS] incumbent %.6g at %.1fs "
+                               "(%lld nodes, %lld lp iters)\n",
+                               std::get<1>(e), std::get<0>(e),
+                               static_cast<long long>(std::get<2>(e)),
+                               static_cast<long long>(std::get<3>(e)));
               }
               if (logRep)
                 highsLogUser(logOptions, HighsLogType::kInfo,

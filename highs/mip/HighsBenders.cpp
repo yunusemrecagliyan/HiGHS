@@ -199,11 +199,17 @@ HighsMipSolverData::HighsSubLpResult HighsMipSolverData::solveSubMip(
           HighsSubMipProgress* progress =
               static_cast<HighsSubMipProgress*>(user_data);
           std::lock_guard<std::mutex> guard(progress->mutex);
+          // Work baseline: first callback carrying output anchors the
+          // LP-iteration clock (solveStartLpIters < 0 until then).
+          if (data_out && progress->solveStartLpIters < 0)
+            progress->solveStartLpIters = data_out->mip_total_lp_iterations;
           if (callback_type == kCallbackMipImprovingSolution) {
             if (!data_out) return;
             if (progress->events.size() < 64)
               progress->events.emplace_back(data_out->running_time,
-                                            data_out->mip_primal_bound);
+                                            data_out->mip_primal_bound,
+                                            data_out->mip_node_count,
+                                            data_out->mip_total_lp_iterations);
             // Stagnation clock: strictly improving incumbents only (equal
             // re-reports must not reset it, or flat tails never trip).
             const double eb = data_out->mip_primal_bound;
@@ -214,22 +220,47 @@ HighsMipSolverData::HighsSubLpResult HighsMipSolverData::solveSubMip(
               progress->lastImproveNodes = data_out->mip_node_count;
               progress->lastImproveTime = data_out->running_time;
               progress->lastImproveBound = eb;
+              progress->lastImproveLpIters =
+                  data_out->mip_total_lp_iterations;
             }
             return;
           }
           if (callback_type != kCallbackMipInterrupt || !data_in) return;
           if (progress->lastImproveBound <= progress->targetBound) {
             data_in->user_interrupt = true;
+            progress->tripCause = 1;
             return;
           }
           // Stagnation needs a banked incumbent (never kill hope) plus
           // enough nodes (determinism floor for tiny solves).
           if (progress->lastImproveBound >= kHighsInf) return;
-          if (progress->stallSeconds > 0.0 && data_out &&
+          if (!data_out) return;
+          if (progress->stallSeconds > 0.0 &&
               data_out->mip_node_count >= progress->minStallNodes &&
               data_out->running_time - progress->lastImproveTime >=
                   progress->stallSeconds) {
             data_in->user_interrupt = true;
+            progress->tripCause = 2;
+            return;
+          }
+          // Clock-free patience (LP iterations): abort when the work
+          // since the last improvement exceeds max(stallLpFloor,
+          // stallLpMult * workToLastImprove). LP iterations advance in
+          // heuristics and B&B alike and ignore machine speed.
+          if (progress->stallLpMult > 0.0) {
+            const int64_t sinceImprove =
+                data_out->mip_total_lp_iterations -
+                progress->lastImproveLpIters;
+            const int64_t toLast = std::max<int64_t>(
+                1, progress->lastImproveLpIters -
+                       progress->solveStartLpIters);
+            const int64_t patience = std::max(
+                progress->stallLpFloor,
+                int64_t(progress->stallLpMult * double(toLast)));
+            if (sinceImprove > patience) {
+              data_in->user_interrupt = true;
+              progress->tripCause = 3;
+            }
           }
         },
         progress);
