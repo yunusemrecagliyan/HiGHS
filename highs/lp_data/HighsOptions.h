@@ -770,7 +770,7 @@ struct HighsOptionsStruct {
         mip_lagrangian_fixed_lambda(-1.0),
         mip_lagrangian_repair(true),
         mip_lagrangian_repair_max_time(30.0),
-        mip_lagrangian_repair_restart_time(5.0),
+        mip_lagrangian_repair_restart_time(8.0),
         mip_lagrangian_repair_max_cols(1000),
         mip_lagrangian_repair_max_blocks(200),
         mip_lagrangian_repair_max_union_pct(50),
@@ -1722,8 +1722,9 @@ class HighsOptions : public HighsOptionsStruct {
     record_double = new OptionRecordDouble(
         "mip_lagrangian_repair_restart_time",
         "Max seconds per post-restart Lagrangian repair re-shot (restart "
-        "repairs only run on strict incumbent improvement, at most 3)",
-        advanced, &mip_lagrangian_repair_restart_time, 0.0, 5.0,
+        "repairs only run on strict incumbent improvement, at most 3; "
+        "8s funds a deep first ticket plus a recovery second ticket)",
+        advanced, &mip_lagrangian_repair_restart_time, 0.0, 8.0,
         kHighsInf);
     records.push_back(record_double);
 

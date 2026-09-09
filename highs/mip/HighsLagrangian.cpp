@@ -569,7 +569,24 @@ bool HighsMipSolverData::runLagrangian() {
   }
   const HighsInt maxIter = std::max<HighsInt>(
       1, mipsolver.options_mip_->mip_lagrangian_max_iterations);
-  const double maxTime = mipsolver.options_mip_->mip_lagrangian_max_time;
+  double maxTime = mipsolver.options_mip_->mip_lagrangian_max_time;
+  // Same share guard as repair: the ascent loop must not outlive a short
+  // global limit (see runLagRepair).
+  {
+    const double tLim = mipsolver.options_mip_->time_limit;
+    if (tLim < kHighsInf) {
+      const double remain = tLim - mipsolver.timer_.read();
+      const double shareCap = 0.5 * remain;
+      if (maxTime > shareCap) {
+        maxTime = shareCap;
+        if (logLag)
+          highsLogUser(logOptions, HighsLogType::kInfo,
+                       "[Lag] budget share-capped to %.1fs (50%% of %.1fs "
+                       "remaining)\n",
+                       maxTime, remain);
+      }
+    }
+  }
   if (logLag)
     highsLogUser(logOptions, HighsLogType::kInfo,
                  "[Lag] candidate: %d coupling rows (%d arcs), %d blocks "
@@ -1209,11 +1226,33 @@ bool HighsMipSolverData::runLagRepair() {
       mipsolver.options_mip_->mip_lagrangian_repair_max_time;
   // Post-restart re-shots get their own small cap instead of the full
   // budget (the restarted model is smaller and the shot is speculative).
-  const double maxTime =
+  double maxTime =
       (numRestarts > 0)
           ? std::min(maxTime0, mipsolver.options_mip_
                                  ->mip_lagrangian_repair_restart_time)
           : maxTime0;
+  // Share guard: second-based budgets are meaningless when the global
+  // time_limit is shorter than them (the API passes 20/25% shares of the
+  // limit, but raw CLI/opts can exceed it). Cap repair at half the
+  // REMAINING time: loose enough to never bind sane configs, tight
+  // enough that B&B always keeps at least half. All splits below are
+  // fractions of this (guarded) maxTime, so the whole repair plan
+  // scales with the limit instead of starving the search.
+  {
+    const double tLim = mipsolver.options_mip_->time_limit;
+    if (tLim < kHighsInf) {
+      const double remain = tLim - mipsolver.timer_.read();
+      const double shareCap = 0.5 * remain;
+      if (maxTime > shareCap) {
+        maxTime = shareCap;
+        if (logRep)
+          highsLogUser(logOptions, HighsLogType::kInfo,
+                       "[LagRepair] budget share-capped to %.1fs (50%% of "
+                       "%.1fs remaining)\n",
+                       maxTime, remain);
+      }
+    }
+  }
   const HighsInt maxUnion = std::max<HighsInt>(
       1, mipsolver.options_mip_->mip_lagrangian_repair_max_cols);
   const double repStart = mipsolver.timer_.read();
@@ -1833,6 +1872,14 @@ bool HighsMipSolverData::runLagRepair() {
       used += sz;
     }
   }
+  // Cold (no incumbent yet) vs warm (restart/mid-search) solve. Warm
+  // tickets keep the full union, and so do cold ones: measured on
+  // AdanaHard, a halved cold joint lands a BETTER root (3226 in 3s vs
+  // 3361 in 9s) yet derails the whole search (B&B path diverges, the
+  // restart ticket changes blocks, the 3159-class shot is lost: 60s
+  // timeout at 2.1% vs 0.21% in 24s). Unions shape the downstream path;
+  // only the budget split below is size-dependent.
+  const bool coldSolve = !std::isfinite(mipsolver.solution_objective_);
   for (int attempt = 0; attempt < 2; ++attempt) {
     std::vector<char> blockInU(nB, 0);
     std::vector<char> inU(numCol, 0);
@@ -1928,8 +1975,13 @@ bool HighsMipSolverData::runLagRepair() {
     }
     progress.minStallNodes = std::max<int64_t>(
         0, mipsolver.options_mip_->mip_lagrangian_repair_stall_nodes);
-    progress.stallSeconds =
-        mipsolver.options_mip_->mip_lagrangian_repair_stall_seconds;
+    // Ticket-scaled patience: a stalled ticket must release its budget
+    // for a recovery second ticket instead of burning to the cap (the
+    // configured value still bounds large tickets; improving tickets
+    // reset the clock on every bank so steady progress is never cut).
+    progress.stallSeconds = std::min(
+        mipsolver.options_mip_->mip_lagrangian_repair_stall_seconds,
+        std::max(1.0, 0.5 * timeLeft()));
     // Search reserve: a joint started with less than 2s left cannot
     // finish anything useful; fall back to normal MIP immediately.
     if (mipsolver.options_mip_->time_limit < kHighsInf &&
@@ -1940,12 +1992,22 @@ bool HighsMipSolverData::runLagRepair() {
                      "MIP\n");
       return true;
     }
-    // Attempt-1 budget split: when a polish attempt is possible, cap
-    // the cold joint at ~60% of the repair budget so the hinted polish
-    // gets a guaranteed share instead of leftovers.
+    // Cold attempt-1 keeps 60% (proven path: 9s cold joint, the rest flows
+    // to B&B when no recovery ticket fires). Warm tickets take the FULL
+    // remainder: they either land fast and release via target exit, or
+    // need every second (measured: a 2.5s pre-cap cut a live 3259@1.9s
+    // trajectory heading toward ~3160). Recovery runs only on time T1
+    // itself releases.
     double jointCap = timeLeft();
-    if (attempt == 0 && expandRoom && !havePolishHint)
-      jointCap = std::min(jointCap, std::max(5.0, 0.6 * maxTime));
+    if (attempt == 0 && expandRoom && !havePolishHint && coldSolve) {
+      jointCap = std::min(jointCap,
+                          std::max(std::min(2.0, 0.4 * maxTime),
+                                   0.6 * maxTime));
+    }
+    // Bonus tickets carrying a hint land fast or not at all (measured:
+    // hinted joints bank in ~1-2.5s); cap them so a stalled polish
+    // cannot eat the B&B reserve.
+    if (havePolishHint) jointCap = std::min(jointCap, 4.0);
     HighsSubLpResult res =
         solveSubMip(joint, jointCap, mipsolver.options_mip_->mip_rel_gap,
                     mipsolver.options_mip_->mip_abs_gap, &progress,
@@ -1988,16 +2050,91 @@ bool HighsMipSolverData::runLagRepair() {
             sane = false;
         }
         if (sane) {
-          injectRepair(res.colSol);
-          // Polish shot: expanded union + attempt-1 solution as hint,
-          // when there is room to expand and budget worth spending.
+          const bool improved = injectRepair(res.colSol);
+          // RINS second ticket (warm only): attempt-1 verified but did
+          // not beat the incumbent, so its fixing values were wrong, not
+          // (only) its union. Retry the SAME union fixed to the
+          // incumbent instead: the incumbent is then a feasible MIP
+          // start, so this ticket keeps-or-improves by construction and
+          // either banks fast or stalls out cheaply.
+          if (!improved && !coldSolve && attempt == 0 && !havePolishHint &&
+              (HighsInt)mipsolver.solution_.size() == numCol &&
+              timeLeft() > 1.5) {
+            HighsLp rins = model;
+            bool rinsOk = true;
+            for (HighsInt c = 0; c != numCol; ++c) {
+              if (colFixed[c] || inU[c]) continue;
+              const double v = mipsolver.solution_[c];
+              if (!std::isfinite(v)) {
+                rinsOk = false;
+                break;
+              }
+              rins.col_lower_[c] = rins.col_upper_[c] = v;
+            }
+            if (rinsOk) {
+              HighsSubMipProgress rprogress;
+              if (model.sense_ == ObjSense::kMinimize &&
+                  std::isfinite(lower_bound)) {
+                const double rTol =
+                    mipsolver.options_mip_->mip_rel_gap;
+                const double aTol =
+                    mipsolver.options_mip_->mip_abs_gap;
+                rprogress.targetBound =
+                    lower_bound +
+                    std::max(aTol, rTol * std::fabs(lower_bound));
+              }
+              rprogress.minStallNodes = std::max<int64_t>(
+                  0, mipsolver.options_mip_
+                         ->mip_lagrangian_repair_stall_nodes);
+              rprogress.stallSeconds = std::min(
+                  mipsolver.options_mip_
+                      ->mip_lagrangian_repair_stall_seconds,
+                  std::max(1.0, 0.5 * timeLeft()));
+              const double rinsStart = mipsolver.timer_.read();
+              if (logRep)
+                highsLogUser(logOptions, HighsLogType::kInfo,
+                             "[LagRepair] RINS second ticket (same union, "
+                             "incumbent fixing, %.1fs left)\n",
+                             timeLeft());
+              HighsSubLpResult rres = solveSubMip(
+                  rins, std::min(timeLeft(), 4.0),
+                  mipsolver.options_mip_->mip_rel_gap,
+                  mipsolver.options_mip_->mip_abs_gap, &rprogress,
+                  mipsolver.solution_);
+              const double rinsDone = mipsolver.timer_.read();
+              decompRepairJointTime += rinsDone - rinsStart;
+              if (logRep) {
+                std::lock_guard<std::mutex> guard(rprogress.mutex);
+                for (const auto& e : rprogress.events)
+                  highsLogUser(logOptions, HighsLogType::kInfo,
+                               "[LagRepair-RINS] incumbent %.6g at %.1fs\n",
+                               e.second, e.first);
+              }
+              if (logRep)
+                highsLogUser(logOptions, HighsLogType::kInfo,
+                             "[LagRepair] RINS joint: status=%d obj=%.6g "
+                             "(solve %.1fs, repair total %.1fs)\n",
+                             (int)rres.status, rres.obj,
+                             rinsDone - rinsStart, rinsDone - repStart);
+              if ((HighsInt)rres.colSol.size() == numCol &&
+                  verifyBendersSolution(model, rres.colSol))
+                injectRepair(rres.colSol);
+              return true;
+            }
+          }
+          // Recovery-only second ticket: an improving ticket already proved
+          // its union, and measured 0/2 improving polishes ever helped.
+          // When the incumbent did not move, retry the expanded union
+          // seeded with the attempt-1 solution instead.
           // Skipped when attempt-1 already proved joint-optimal (that
           // union is fully exploited; spend the time in B&B instead).
-          if (attempt == 0 && res.status != HighsModelStatus::kOptimal &&
-              numFilled < (HighsInt)ranked.size() && timeLeft() > 4.0) {
+          if (attempt == 0 && !improved &&
+              res.status != HighsModelStatus::kOptimal &&
+              numFilled < (HighsInt)ranked.size() &&
+              timeLeft() > std::min(4.0, 0.3 * maxTime)) {
             polishHint = res.colSol;
             havePolishHint = true;
-            cap = 2 * maxUnion;
+            cap = 2 * cap;
             if (logRep)
               highsLogUser(logOptions, HighsLogType::kInfo,
                            "[LagRepair] polishing with expanded union + "
@@ -2059,7 +2196,7 @@ bool HighsMipSolverData::runLagRepair() {
                        : "normal MIP");
     if (res.status != HighsModelStatus::kInfeasible) return true;
     if (numFilled >= (HighsInt)ranked.size()) return true;
-    cap = 2 * maxUnion;
+    cap = 2 * cap;
   }
   return true;
 }
