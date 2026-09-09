@@ -376,6 +376,11 @@ struct HighsMipSolverData {
   // use revalidates sizes and bounds before touching anything.
   HighsLagCandidate lagRepairCand;
   bool lagRepairCandValid = false;
+  // Post-restart LagRepair throttle: at most 3 extra shots past the
+  // initial pass, each only after a strictly improved incumbent and
+  // within its own small time cap.
+  int lagRepairRunCount = 0;
+  double lagRepairBestUB = kHighsInf;
   // Wall-clock accounting for the final Timing block: loop/block/joint
   // solve phases (sub-solver clocks are invisible to the parent timer).
   double decompLagLoopTime = 0.0;

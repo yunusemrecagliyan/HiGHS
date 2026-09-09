@@ -548,6 +548,7 @@ struct HighsOptionsStruct {
   double mip_lagrangian_fixed_lambda;
   bool mip_lagrangian_repair;
   double mip_lagrangian_repair_max_time;
+  double mip_lagrangian_repair_restart_time;
   HighsInt mip_lagrangian_repair_max_cols;
   HighsInt mip_lagrangian_repair_max_blocks;
   HighsInt mip_lagrangian_repair_max_union_pct;
@@ -769,6 +770,7 @@ struct HighsOptionsStruct {
         mip_lagrangian_fixed_lambda(-1.0),
         mip_lagrangian_repair(true),
         mip_lagrangian_repair_max_time(30.0),
+        mip_lagrangian_repair_restart_time(5.0),
         mip_lagrangian_repair_max_cols(1000),
         mip_lagrangian_repair_max_blocks(200),
         mip_lagrangian_repair_max_union_pct(50),
@@ -1715,6 +1717,14 @@ class HighsOptions : public HighsOptionsStruct {
         "mip_lagrangian_repair_max_time",
         "Max seconds spent in the Lagrangian repair heuristic",
         advanced, &mip_lagrangian_repair_max_time, 0.0, 30.0, kHighsInf);
+    records.push_back(record_double);
+
+    record_double = new OptionRecordDouble(
+        "mip_lagrangian_repair_restart_time",
+        "Max seconds per post-restart Lagrangian repair re-shot (restart "
+        "repairs only run on strict incumbent improvement, at most 3)",
+        advanced, &mip_lagrangian_repair_restart_time, 0.0, 5.0,
+        kHighsInf);
     records.push_back(record_double);
 
     record_int = new OptionRecordInt(

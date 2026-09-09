@@ -1205,7 +1205,15 @@ bool HighsMipSolverData::runLagRepair() {
                    "[LagRepair] presolve budget exhausted -> normal MIP\n");
     return true;
   }
-  const double maxTime = mipsolver.options_mip_->mip_lagrangian_repair_max_time;
+  const double maxTime0 =
+      mipsolver.options_mip_->mip_lagrangian_repair_max_time;
+  // Post-restart re-shots get their own small cap instead of the full
+  // budget (the restarted model is smaller and the shot is speculative).
+  const double maxTime =
+      (numRestarts > 0)
+          ? std::min(maxTime0, mipsolver.options_mip_
+                                 ->mip_lagrangian_repair_restart_time)
+          : maxTime0;
   const HighsInt maxUnion = std::max<HighsInt>(
       1, mipsolver.options_mip_->mip_lagrangian_repair_max_cols);
   const double repStart = mipsolver.timer_.read();
@@ -1314,8 +1322,22 @@ bool HighsMipSolverData::runLagRepair() {
   }
   // Solves run on the initial pass with the presolve repair enabled;
   // detection above (candidate store, and the branching hint on the
-  // initial pass) already ran for the search-time heuristic.
-  if (numRestarts > 0 || !runRepair) return true;
+  // initial pass) already ran for the search-time heuristic. Post-restart
+  // passes get throttled re-shots: only on strict incumbent improvement
+  // since the last repair, at most 3 extra runs.
+  if (!runRepair) return true;
+  if (numRestarts > 0) {
+    const double eps = 1e-9 * std::max(1.0, std::fabs(lagRepairBestUB));
+    if (!std::isfinite(upper_bound) || upper_bound >= lagRepairBestUB - eps)
+      return true;
+    if (lagRepairRunCount >= 4) return true;
+    if (logRep)
+      highsLogUser(logOptions, HighsLogType::kInfo,
+                   "[LagRepair] post-restart shot %d (incumbent %.6g)\n",
+                   lagRepairRunCount, upper_bound);
+  }
+  ++lagRepairRunCount;
+  lagRepairBestUB = std::min(lagRepairBestUB, upper_bound);
   // Fixed-column activity shifted out of every row (exact: lb == ub).
   std::vector<double> rowShift(numRow, 0.0);
   for (HighsInt c = 0; c != numCol; ++c) {
