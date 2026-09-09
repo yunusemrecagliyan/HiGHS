@@ -1408,6 +1408,20 @@ bool HighsMipSolverData::runLagRepair() {
     mipsolver.solutionFeasible(mipsolver.orig_model_, injsol.col_value,
                                nullptr, boundViol, rowViol, intViol, injObj);
     if (boundViol <= feastol && rowViol <= feastol && intViol <= feastol) {
+      // Keep-best: never let a later injection overwrite a better one
+      // (measured: polish/restart shots can land worse than attempt-1;
+      // reporting and the downstream search must keep the best).
+      const double curBest = mipsolver.solution_objective_;
+      if (std::isfinite(curBest) &&
+          double(injObj) >=
+              curBest - 1e-9 * std::max(1.0, std::fabs(curBest))) {
+        if (logRep)
+          highsLogUser(logOptions, HighsLogType::kInfo,
+                       "[LagRepair] injected incumbent (obj %.6g) not "
+                       "improving on %.6g -> dropped\n",
+                       double(injObj), curBest);
+        return false;
+      }
       mipsolver.solution_ = injsol.col_value;
       mipsolver.solution_objective_ = double(injObj);
       mipsolver.bound_violation_ = boundViol;
@@ -1796,7 +1810,29 @@ bool HighsMipSolverData::runLagRepair() {
   // Up to two attempts: the ranked prefix within the column cap, then
   // (only on a proven-infeasible joint, where strictly more freedom is
   // the only thing that can help) one expansion to twice the cap.
+  // Plus: after a feasible attempt-1 with room to expand and budget to
+  // spend, a polish attempt on the doubled union seeded with the
+  // attempt-1 solution (measured: hinted joints land optimal-class in
+  // ~2s where cold joints stall for 15-35s).
   HighsInt cap = maxUnion;
+  std::vector<double> polishHint;
+  bool havePolishHint = false;
+  // Would the initial cap skip any ranked block? If so, a polish
+  // attempt on the doubled union is possible: reserve ~40% of the
+  // repair budget for it by capping the attempt-1 joint. No-op when
+  // everything fits (single attempt owns the whole budget).
+  bool expandRoom = false;
+  {
+    HighsInt used = 0;
+    for (HighsInt k : ranked) {
+      const HighsInt sz = (HighsInt)cand.blockCols[k].size();
+      if (used + sz > cap) {
+        expandRoom = true;
+        break;
+      }
+      used += sz;
+    }
+  }
   for (int attempt = 0; attempt < 2; ++attempt) {
     std::vector<char> blockInU(nB, 0);
     std::vector<char> inU(numCol, 0);
@@ -1904,10 +1940,16 @@ bool HighsMipSolverData::runLagRepair() {
                      "MIP\n");
       return true;
     }
+    // Attempt-1 budget split: when a polish attempt is possible, cap
+    // the cold joint at ~60% of the repair budget so the hinted polish
+    // gets a guaranteed share instead of leftovers.
+    double jointCap = timeLeft();
+    if (attempt == 0 && expandRoom && !havePolishHint)
+      jointCap = std::min(jointCap, std::max(5.0, 0.6 * maxTime));
     HighsSubLpResult res =
-        solveSubMip(joint, timeLeft(), mipsolver.options_mip_->mip_rel_gap,
+        solveSubMip(joint, jointCap, mipsolver.options_mip_->mip_rel_gap,
                     mipsolver.options_mip_->mip_abs_gap, &progress,
-                    mipsolver.solution_);
+                    havePolishHint ? polishHint : mipsolver.solution_);
     const double jointDone = mipsolver.timer_.read();
     decompRepairJointTime += jointDone - jointBudgetStart;
     if (logRep) {
@@ -1947,6 +1989,22 @@ bool HighsMipSolverData::runLagRepair() {
         }
         if (sane) {
           injectRepair(res.colSol);
+          // Polish shot: expanded union + attempt-1 solution as hint,
+          // when there is room to expand and budget worth spending.
+          // Skipped when attempt-1 already proved joint-optimal (that
+          // union is fully exploited; spend the time in B&B instead).
+          if (attempt == 0 && res.status != HighsModelStatus::kOptimal &&
+              numFilled < (HighsInt)ranked.size() && timeLeft() > 4.0) {
+            polishHint = res.colSol;
+            havePolishHint = true;
+            cap = 2 * maxUnion;
+            if (logRep)
+              highsLogUser(logOptions, HighsLogType::kInfo,
+                           "[LagRepair] polishing with expanded union + "
+                           "hint (%.1fs left)\n",
+                           timeLeft());
+            continue;
+          }
         } else if (logRep) {
           highsLogUser(logOptions, HighsLogType::kInfo,
                        "[LagRepair] joint obj %.6g far above block-ref %.6g "
