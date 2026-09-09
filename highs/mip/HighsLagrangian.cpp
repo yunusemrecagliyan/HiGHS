@@ -1906,7 +1906,8 @@ bool HighsMipSolverData::runLagRepair() {
     }
     HighsSubLpResult res =
         solveSubMip(joint, timeLeft(), mipsolver.options_mip_->mip_rel_gap,
-                    mipsolver.options_mip_->mip_abs_gap, &progress);
+                    mipsolver.options_mip_->mip_abs_gap, &progress,
+                    mipsolver.solution_);
     const double jointDone = mipsolver.timer_.read();
     decompRepairJointTime += jointDone - jointBudgetStart;
     if (logRep) {
